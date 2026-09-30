@@ -1,0 +1,12 @@
+# N-ATLaS laptop client — required Python packages.
+#
+# The laptop never runs the N-ATLaS model; these are the ONLY software
+# dependencies needed besides Python 3.10+.
+#
+#   Python         https://www.python.org/downloads/
+#   openai         official OpenAI Python client (OpenAI-compatible API)
+#   python-dotenv  loads N_ATLAS_* from a local .env file
+
+openai>=1.30.0
+python-dotenv>=1.0.0
+requests>=2.31.0

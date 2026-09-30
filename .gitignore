@@ -1,0 +1,19 @@
+# --- Python -----------------------------------------------------------------
+*.pyc
+__pycache__/
+*.pyo
+
+# --- Secrets -----------------------------------------------------------------
+# Every .env in every folder: confamAi/.env, n_atlas_client/.env,
+# n_atlas_server/.env. They hold the real tunnel URL, the bearer API key and
+# the Hugging Face token. `.env.example` stays tracked on purpose.
+.env
+*.env
+
+# Ephemeral key written by n_atlas_server/apiserver.py when N_ATLAS_API_KEY
+# is unset.
+natlas_api_key.txt
+
+# --- Local data --------------------------------------------------------------
+# Saved chats from both clients (n_atlas_client/, modular and single-file).
+conversations/

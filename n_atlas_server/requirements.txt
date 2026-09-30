@@ -1,0 +1,47 @@
+# =============================================================================
+# N-ATLaS — Stage 1 (Kaggle GPU server) — full dependency set
+# =============================================================================
+# Laptop / fresh environment:
+#     pip install -r requirements.txt
+#
+# KAGGLE (recommended — do NOT run the line above blindly):
+# The image already ships torch and transformers, CUDA-matched to the T4.
+# `pip install -r` will not touch anything already satisfied, so this file is
+# safe to run as-is. To install only what Cell 2 would install, run:
+#     pip install fastapi uvicorn pydantic requests nest_asyncio \
+#                   bitsandbytes accelerate safetensors
+#
+# `kaggle_secrets` is not on PyPI — Kaggle injects it into the image. Do not
+# list it here.
+#
+# Verified on the target GPU stack:
+#   Python 3.12 · torch 2.10.0+cu128 · transformers 5.0.0 · Tesla T4 (sm_75)
+# =============================================================================
+
+# --- Model runtime (Cells 3, 4, 5) ----------------------------------------
+transformers>=5.0.0            # Kaggle ships 5.0.0
+accelerate>=1.0.0              # required by device_map="auto" in Cell 4
+safetensors>=0.4.3             # N-ATLaS weights are safetensors
+huggingface-hub>=0.30.0        # pulled by transformers; pinned here for clarity
+tokenizers>=0.21.0             # pulled by transformers
+bitsandbytes>=0.46.0           # 4-bit NF4 quantisation — NOT preinstalled on Kaggle
+numpy>=1.26.0                  # pulled by torch/transformers
+
+# --- Web server (Cells 2, 8, 9, 10) ----------------------------------------
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0      # [standard] pulls uvloop/httptools/websockets
+pydantic>=2.9.0
+requests>=2.32.0
+nest-asyncio>=1.6.0            # lets uvicorn run inside the notebook kernel
+
+# --- Test and client tooling (verify_offline.py, build_notebook.py) --------
+openai>=1.50.0                  # live SDK round-trip check + laptop client
+httpx>=0.27.0                   # OpenAI SDK transport
+nbformat>=5.10.0                # notebook build/validate tooling
+
+# --- torch: install separately, it must match your CUDA -------------------
+#     pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Kaggle already provides torch 2.10.0+cu128 for the Tesla T4. Reinstalling it
+# from PyPI is the most common way to break the notebook (wrong CUDA build, or
+# a 3 GB download that busts the session disk quota).
+# torch>=2.10.0,<3.0
