@@ -11,6 +11,7 @@ confamAi/
 ├── n_atlas_server/     <- this folder: notebook, engine, FastAPI server
 ├── n_atlas_client/     <- laptop clients: `python -m n_atlas_client`
 │                        and the standalone `n_atlas_client/n_atlas.py`
+├── nafdac_source/      <- the greenbook lookup, shared with the client
 └── conversations/      <- saved chats, written by the clients
 ```
 
@@ -27,15 +28,16 @@ the Cell 16 gate, never before it.
 | File | Purpose |
 |---|---|
 | `requirements.txt` | Full pinned dependency set. Safe to `pip install -r` on Kaggle. |
-| `natlas_notebook.py` | Source of truth. 16 `# %%`-delimited cells, plain sequential Python. |
+| `natlas_notebook.py` | Source of truth. 17 `# %%`-delimited cells, plain sequential Python. |
 | `natlas_kaggle.ipynb` | Built from the above by `build_notebook.py`. **Upload this to Kaggle.** |
 | `build_notebook.py` | Regenerates the `.ipynb`. Run after editing `natlas_notebook.py`. |
 | `validate_notebook.py` | Checks the `.ipynb` parses, every cell compiles, no content is lost. |
-| `verify_offline.py` | Runs Cells 1–16 plus all three scripts, with a mock model + real HTTP. |
+| `verify_offline.py` | Runs Cells 1–17 plus all three scripts, with a mock model + real HTTP. |
+| `verify_nafdac.py` | Checks Cell 17 (the greenbook) on its own. No GPU needed. |
 | `mock_backend.py` | Test doubles for the tokenizer/model (used only by the verifier). |
 | `notebook_cells.py` | Loads/parses the cells. Shared by the scripts and the builder. |
 | `kaggleserver.py` | Script entry point: the **generation engine** (Cells 1–7), no HTTP. |
-| `apiserver.py` | Script entry point: **engine + FastAPI server** (Cells 1–10). |
+| `apiserver.py` | Script entry point: **engine + FastAPI server + greenbook** (Cells 1–10, 17). |
 | `kaggle.py` | Runs the notebook cells as a plain script (`--list`, `--cells 1-10`). |
 
 The scripts contain **no duplicated logic** — they execute the very same cells
@@ -320,17 +322,59 @@ print(reply.choices[0].message.content)
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded. |
+| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status. |
 | `GET /v1/models` | bearer | OpenAI-compatible model list. |
 | `POST /v1/chat/completions` | bearer | Chat completion. Full message history. |
+| `POST /v1/nafdac/verify` | bearer | Check one NAFDAC number against the greenbook. |
+| `POST /v1/nafdac/search` | bearer | Free-text product search. |
+| `GET /v1/nafdac/sources` | bearer | Which greenbook sources are reachable. |
 
 Streaming (`stream=true`) is **not** supported and returns `400`.
+
+### NAFDAC verification (Cell 17)
+
+A chat message carrying a NAFDAC number is verified before generation, and the
+verified record is injected as a system message. The model then writes the
+reply in the user's language from those values, so a product name, status,
+applicant or approval date can only come from the data.
+
+Cell 17 loads the shared `nafdac_source` package and reads, in order:
+
+1. **PostgreSQL** via `NAFDAC_DATABASE_URL`. The only source reachable from
+   Kaggle, and the one carrying superseded, withdrawn and recalled products.
+2. **CSV** via `NAFDAC_CSV_PATH`, or auto-detected.
+3. **XLSX** via `NAFDAC_XLSX_PATH`, or auto-detected. Needs `openpyxl`.
+
+Upload `nafdac_source/` as a Kaggle dataset to make it importable, or set
+`NAFDAC_SOURCE_DIR` to a directory containing it. If it cannot be found the
+cell degrades: the server starts, `/health` reports `nafdac.enabled=false`, and
+chat still works. A missing greenbook never takes the model offline.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `N_ATLAS_NAFDAC_ENABLED` | `true` | master switch for the cell |
+| `NAFDAC_DATABASE_URL` | unset | enables the PostgreSQL source |
+| `NAFDAC_SOURCE_DIR` | unset | where to find `nafdac_source/` |
+| `NAFDAC_CSV_PATH` | auto-detected | greenbook CSV |
+| `NAFDAC_XLSX_PATH` | auto-detected | greenbook workbook |
+| `N_ATLAS_NAFDAC_MAX_CONTEXT_CHARS` | `1800` | cap on the injected block |
+| `N_ATLAS_NAFDAC_MAX_SEARCH_RESULTS` | `10` | cap on `/v1/nafdac/search` |
+
+A number that is not found is a `200` with `found=false`, not a `404`: not
+being in the export is a normal answer, not a client error. A request with no
+number in it at all is a `400`.
+
+Check Cell 17 on its own, without a GPU:
+
+```bash
+python verify_nafdac.py
+```
 
 ### Error mapping
 
 | Code | Cause |
 |---|---|
-| `400` | Malformed JSON, empty/whitespace messages, no user turn, too many messages, stream requested, legacy `/v1/completions`. |
+| `400` | Malformed JSON, empty/whitespace messages, no user turn, too many messages, stream requested, legacy `/v1/completions`, or a NAFDAC request with no number in it. |
 | `401` | Missing or wrong bearer key. Adds `WWW-Authenticate`. |
 | `404` | Unknown model name. |
 | `413` | Body over `N_ATLAS_MAX_REQUEST_BYTES`. |
@@ -366,7 +410,7 @@ and leaves a dangling `user`. Mid-sentence uses of `user:` and numbered lists
 python verify_offline.py
 ```
 
-This runs all 16 cells with `mock_backend.py` substituted for the real model,
+This runs all 17 cells with `mock_backend.py` substituted for the real model,
 boots a real uvicorn server on a free port, and exercises every assertion over
 real HTTP, plus extra assertions the notebook does not make: forced CUDA OOM →
 `507`, forced generation failure → `500`, and a live OpenAI SDK round-trip.
@@ -466,3 +510,10 @@ The laptop client exists already — `../n_atlas_client/` (`python -m
 n_atlas_client`, or the standalone `../n_atlas_client/n_atlas.py`) — and needs
 only `N_ATLAS_BASE_URL` and `N_ATLAS_API_KEY` in a `.env`. Everything else it
 speaks is covered above: `/health`, `/v1/models`, `/v1/chat/completions`.
+
+The client also verifies NAFDAC numbers **on the laptop**, against the local
+greenbook files and its own database connection, before a message is sent here.
+That is deliberate: the data is on the laptop, and it means a product question
+still gets an answer when this server is offline. When the client is configured
+with a hosted `NAFDAC_DATABASE_URL` the same source is reachable from Kaggle,
+so both halves resolve a number identically.

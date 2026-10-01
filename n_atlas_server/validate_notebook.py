@@ -18,9 +18,13 @@ if nb.get("nbformat") != 4:
 if "accelerator" not in json.dumps(nb.get("metadata", {})):
     problems.append("GPU accelerator metadata missing")
 
+EXPECTED_CODE_CELLS = 17  # Cells 1-16 plus Cell 17, the NAFDAC greenbook cell.
+
 code_cells = [c for c in nb["cells"] if c["cell_type"] == "code"]
-if len(code_cells) != 16:
-    problems.append(f"expected 16 code cells, found {len(code_cells)}")
+if len(code_cells) != EXPECTED_CODE_CELLS:
+    problems.append(
+        f"expected {EXPECTED_CODE_CELLS} code cells, found {len(code_cells)}"
+    )
 
 for index, cell in enumerate(nb["cells"], start=1):
     source = cell["source"]
@@ -77,6 +81,7 @@ if problems:
         print(f"  - {problem}")
     sys.exit(1)
 
-print("VALID: 16 code cells compile, nbformat source is newline-terminated,")
+print(f"VALID: {EXPECTED_CODE_CELLS} code cells compile, nbformat source is "
+      "newline-terminated,")
 print("       markdown cell is unwrapped, and the cells reassemble exactly")
 print("       into natlas_notebook.py.")

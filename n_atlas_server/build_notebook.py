@@ -94,7 +94,10 @@ def build():
 
 
 def verify(notebook):
-    expected = 16
+    # Cell 17 is the NAFDAC greenbook cell. Bumping this is deliberate friction:
+    # the count is asserted here and in validate_notebook.py so a new cell
+    # cannot be added without someone confirming the number and the tooling.
+    expected = 17
     code_cells = [c for c in notebook["cells"] if c["cell_type"] == "code"]
     titles = notebook_cells.cell_titles()
     numbers = [int(t.split()[1]) for t in titles if t.startswith("CELL ")]

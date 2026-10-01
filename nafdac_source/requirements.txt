@@ -1,0 +1,30 @@
+# NAFDAC greenbook lookup — optional dependencies.
+#
+# The core lookup works with the standard library alone: the CSV is read with
+# the `csv` module and the NRN is extracted with a regex. Everything below is
+# optional, and each one only adds a source or a convenience.
+#
+#   python -m nafdac_source.tests          run the tests, needs nothing below
+#   python -m nafdac_source.load_postgres  load the CSV into PostgreSQL
+#
+# python-dotenv
+#   Lets load_postgres.py and verify_postgres.py read NAFDAC_DATABASE_URL from a
+#   .env file, so the bare `python -m nafdac_source.load_postgres` works without
+#   repeating the URL on the command line. Optional: without it the tools still
+#   run, using --url or a real environment variable instead.
+#
+# psycopg
+#   Required to load a database and to read one. Without it the CSV and XLSX
+#   sources still work, but a product that has since been withdrawn will not be
+#   distinguishable from one that never existed.
+#
+# openpyxl
+#   Required only to read nafdac_greenbook.xlsx. The CSV holds the same 8930
+#   products, so this is a second view of the same data rather than extra data.
+#   The parsed workbook is cached as a small CSV next to the xlsx, because
+#   openpyxl takes about 40 seconds to read the file and 1.5 seconds to read the
+#   cache.
+
+python-dotenv>=1.0.0
+psycopg[binary]>=3.1
+openpyxl>=3.1

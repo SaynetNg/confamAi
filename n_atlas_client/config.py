@@ -75,6 +75,17 @@ class Config:
     # client prompt is only injected when explicitly configured.
     system_prompt: str = ""       # N_ATLAS_SYSTEM_PROMPT / ..._FILE
 
+    # --- NAFDAC verification ---------------------------------------------
+    # When on, a message that carries a NAFDAC number is answered from the
+    # greenbook data before N-ATLaS is asked, and the verified facts are passed
+    # to the model so it cannot invent a product name or an approval date.
+    nafdac_enabled: bool = True          # NAFDAC_ENABLED
+    nafdac_database_url: str = ""        # NAFDAC_DATABASE_URL
+    nafdac_csv_path: str = ""            # NAFDAC_CSV_PATH
+    nafdac_xlsx_path: str = ""           # NAFDAC_XLSX_PATH
+    nafdac_show_data: bool = True        # NAFDAC_SHOW_DATA
+    nafdac_max_search_results: int = 10  # NAFDAC_MAX_SEARCH_RESULTS
+
     # --- diagnostics ------------------------------------------------------
     debug: bool = False           # --debug flag
 
@@ -128,8 +139,29 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
         save_conversations=_env_bool("N_ATLAS_SAVE_CONVERSATIONS", True),
         conversations_dir=_env_str("N_ATLAS_CONVERSATIONS_DIR", "conversations"),
         system_prompt=system_prompt,
+        nafdac_enabled=_env_bool("NAFDAC_ENABLED", True),
+        nafdac_database_url=_env_str("NAFDAC_DATABASE_URL"),
+        nafdac_csv_path=_env_str("NAFDAC_CSV_PATH"),
+        nafdac_xlsx_path=_env_str("NAFDAC_XLSX_PATH"),
+        nafdac_show_data=_env_bool("NAFDAC_SHOW_DATA", True),
+        nafdac_max_search_results=max(1, _env_int("NAFDAC_MAX_SEARCH_RESULTS", 10)),
         debug=debug,
     )
+
+
+def apply_nafdac_env(cfg: Config) -> None:
+    """Push the NAFDAC settings in `cfg` into the environment.
+
+    `nafdac_source` reads its configuration from the environment, so the same
+    package works identically on the laptop and on Kaggle. Calling this before
+    the first lookup is what lets one set of variables drive both.
+    """
+    if cfg.nafdac_database_url:
+        os.environ["NAFDAC_DATABASE_URL"] = cfg.nafdac_database_url
+    if cfg.nafdac_csv_path:
+        os.environ["NAFDAC_CSV_PATH"] = cfg.nafdac_csv_path
+    if cfg.nafdac_xlsx_path:
+        os.environ["NAFDAC_XLSX_PATH"] = cfg.nafdac_xlsx_path
 
 
 def validate(cfg: Config) -> None:

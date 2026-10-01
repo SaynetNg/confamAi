@@ -6,6 +6,18 @@
 #   Python         https://www.python.org/downloads/
 #   openai         official OpenAI Python client (OpenAI-compatible API)
 #   python-dotenv  loads N_ATLAS_* from a local .env file
+#
+# Optional, for NAFDAC product verification:
+#
+#   openpyxl       reads nafdac_greenbook.xlsx. The CSV needs no dependency at
+#                  all, and both files hold the same rows, so this only speeds
+#                  up a source that is redundant with the CSV.
+#   psycopg        talks to the remote PostgreSQL database. Without it the
+#                  lookup still works from the local files, but superseded and
+#                  withdrawn products become invisible.
+#
+# Install the optional pair only if you want both sources:
+#   pip install "openpyxl>=3.1" "psycopg[binary]>=3.1"
 
 openai>=1.30.0
 python-dotenv>=1.0.0

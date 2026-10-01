@@ -1,8 +1,9 @@
 """Offline verification for the N-ATLaS Kaggle server notebook.
 
-Runs Cells 1-16 of natlas_notebook.py on this machine with mock_backend
+Runs Cells 1-17 of natlas_notebook.py on this machine with mock_backend
 substituted for the real tokenizer/model, boots the real uvicorn server, and
-executes every assertion in Cells 11-16 over real HTTP.
+executes every assertion in Cells 11-16 over real HTTP. Cell 17 (the NAFDAC
+greenbook) runs too, against whatever greenbook data is present locally.
 
 Then it re-runs the whole suite while forcing a CUDA OOM and a generic
 generation failure, to prove the 507 and 500 paths work.
@@ -70,6 +71,11 @@ def run_notebook(port: int) -> dict:
         "__name__": "__natlas_notebook__",
         "__file__": str(NOTEBOOK_SOURCE),
     }
+    # nafdac_source lives at the project root, one level up. Cell 17 finds it
+    # via __file__, but putting the root on the path here too means the offline
+    # run behaves like apiserver.py does rather than like a bare notebook.
+    if str(HERE.parent) not in sys.path:
+        sys.path.insert(0, str(HERE.parent))
     source = NOTEBOOK_SOURCE.read_text(encoding="utf-8")
     code = compile(source, str(NOTEBOOK_SOURCE), "exec")
     exec(code, namespace)
@@ -534,15 +540,15 @@ def verify_legacy_scripts(namespace: dict) -> None:
         "scanned apiserver.py, kaggleserver.py, kaggle.py, natlas_notebook.py",
     )
     record(
-        "cell numbering is sequential 1..16",
-        [int(t.split()[1]) for t in notebook_cells.cell_titles(source)] == list(range(1, 17)),
+        "cell numbering is sequential 1..17",
+        [int(t.split()[1]) for t in notebook_cells.cell_titles(source)] == list(range(1, 18)),
         f"{len(notebook_cells.cell_titles(source))} cells",
     )
 
     listing = _run_script("kaggle.py", ["--list"], free_port())
     record(
-        "kaggle.py --list maps all 16 cells",
-        listing.returncode == 0 and "16. CELL 16" in listing.stdout,
+        "kaggle.py --list maps all 17 cells",
+        listing.returncode == 0 and "17. CELL 17" in listing.stdout,
         f"rc={listing.returncode}",
     )
     if listing.returncode != 0:

@@ -31,12 +31,15 @@ def print_banner(client) -> None:
     print()
     print("Languages: English | Hausa | Igbo | Yoruba")
     print()
+    if getattr(getattr(client, "cfg", None), "nafdac_enabled", False):
+        print("NAFDAC verification: ON")
+    print()
     print("Type /help for commands.")
     print("Type /exit to quit.")
     print("=" * width)
 
 
-def print_help_text() -> None:
+def print_help_text(client=None) -> None:
     lines = [
         "Available commands:",
         "  /help    Show this list",
@@ -44,6 +47,9 @@ def print_help_text() -> None:
         "  /clear   Clear conversation history",
         "  /history Display local conversation history",
         "  /status  Check whether the remote API is reachable",
+        "  /nafdac  Show which NAFDAC data sources are available",
+        "  /verify  Check one NAFDAC number   (/verify A4-100160)",
+        "  /search  Search products           (/search malaria)",
         "  /exit    Exit the client",
         "",
         "Anything else is sent to N-ATLaS.",
@@ -51,6 +57,12 @@ def print_help_text() -> None:
         "N-ATLaS replies naturally in English, Hausa, Igbo or Yoruba and",
         "follows your language switches without resetting the conversation.",
     ]
+    if client is not None and getattr(client, "cfg", None) is not None:
+        if getattr(client.cfg, "nafdac_enabled", False):
+            lines.append("")
+            lines.append("NAFDAC verification is on. Ask about a product in your")
+            lines.append("own words — \"is A4-100160 genuine?\" — and the answer")
+            lines.append("comes from the greenbook data, not from the model's memory.")
     print("\n".join(lines))
 
 
@@ -105,10 +117,18 @@ def run_repl(client) -> int:
         if not user_input:
             continue
 
-        command = user_input[1:].strip().lower() if user_input.startswith("/") else None
+        # The command word, and whatever followed it, are separated before the
+        # bare-command checks above so `/verify A4-100160` reaches the handlers
+        # as ("verify", "A4-100160").
+        command = None
+        argument = ""
+        if user_input.startswith("/"):
+            parts = user_input[1:].split(None, 1)
+            command = parts[0].strip().lower() if parts else ""
+            argument = parts[1].strip() if len(parts) > 1 else ""
 
         if command == "help":
-            print_help_text()
+            print_help_text(client)
             continue
         if command == "new":
             client.clear_conversation()
@@ -123,6 +143,15 @@ def run_repl(client) -> int:
             continue
         if command == "status":
             handle_status(client)
+            continue
+        if command == "nafdac":
+            print(client.nafdac_status())
+            continue
+        if command == "verify":
+            print(client._nafdac().verify_command(argument))
+            continue
+        if command == "search":
+            print(client._nafdac().search_command(argument))
             continue
         if command == "exit":
             print("Bye!")

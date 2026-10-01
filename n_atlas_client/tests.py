@@ -27,12 +27,130 @@ class TestResults:
         return [(name, detail) for name, ok, detail in self.results if not ok]
 
 
+def run_nafdac_tests(cfg, results) -> None:
+    """NAFDAC verification, checked without touching the network.
+
+    These run before the connection tests and do not need the server, because
+    the lookup happens on this machine. That is the point of verifying locally:
+    the answer to "is A4-100160 genuine?" survives the Kaggle session ending.
+    """
+    print("-" * 46)
+    print("NAFDAC verification (local, no server needed)")
+    print("-" * 46)
+
+    try:
+        from .nafdac import NafdacInterceptor
+    except Exception as exc:  # nafdac_source missing from the tree
+        results.record("nafdac package importable", False, str(exc)[:160])
+        return
+
+    interceptor = NafdacInterceptor(cfg, debug=False)
+    results.record("nafdac verification is enabled", interceptor.enabled)
+
+    status = interceptor.status()
+    results.record(
+        "nafdac sources are reported",
+        "NAFDAC data sources" in status,
+        status.splitlines()[2].strip() if len(status.splitlines()) > 2 else "",
+    )
+
+    # A real number from the greenbook export.
+    result = interceptor.verify("A4-100160")
+    results.record(
+        "A4-100160 verifies from the greenbook",
+        result.found,
+        "nrn=%s status=%s" % (result.nrn, result.status),
+    )
+    if result.found:
+        record = result.primary
+        results.record(
+            "the product name comes from the data, not the model",
+            "Spironolactone" in record.product_name,
+            record.product_name,
+        )
+        results.record(
+            "the approval date comes from the data",
+            record.approval_date.startswith("2021-12"),
+            record.approval_date,
+        )
+        results.record(
+            "a hit names the source that confirmed it",
+            bool(record.sources),
+            ",".join(record.sources),
+        )
+
+    # A number the greenbook lists as inactive must not read as authorised.
+    inactive = interceptor.verify("C4-1142")
+    results.record(
+        "an inactive product is reported as not authorised",
+        inactive.found and inactive.authorised is False,
+        "authorised=%s" % inactive.authorised,
+    )
+
+    unknown = interceptor.verify("A4-0000000")
+    results.record("an unknown number is not found", not unknown.found)
+    results.record(
+        "an unknown number claims nothing about authorisation",
+        unknown.authorised is None,
+    )
+
+    # The interception decision: which messages get verified at all.
+    for message, expected, label in [
+        ("Is A4-100160 genuine?", True, "a verification question"),
+        ("verify 04-3877 please", True, "an explicit verify request"),
+        ("A4-100160", True, "a bare known number"),
+        ("Báwo ni? How are you?", False, "ordinary Yoruba conversation"),
+        ("what is the weather in Lagos", False, "an unrelated question"),
+        ("I take 500mg of ibuprofen", False, "a quantity, not a number"),
+    ]:
+        results.record(
+            "interception: %s" % label,
+            interceptor.looks_like_lookup(message) is expected,
+            repr(message[:48]),
+        )
+
+    # The context block handed to the model must forbid invention, which is the
+    # whole reason the verified data is passed rather than a yes/no answer.
+    context = interceptor.context_for("Is A4-100160 genuine?", result)
+    results.record("context block is produced", bool(context))
+    results.record(
+        "context block tells the model not to invent values",
+        "do not" in context.lower() and "nafdac" in context.lower(),
+    )
+
+    found_text = interceptor.verify_command("A4-100160")
+    results.record(
+        "/verify renders a product table",
+        "Spironolactone" in found_text and "Applicant" in found_text,
+    )
+    missing_text = interceptor.verify_command("A4-0000000")
+    results.record(
+        "/verify on a miss does not call the product fake",
+        "not found" in missing_text.lower() and "not proof" in missing_text.lower(),
+    )
+    results.record(
+        "/verify with no argument explains the format",
+        "A4-100160" in interceptor.verify_command(""),
+    )
+
+    try:
+        hits = interceptor.search_command("paracetamol")
+        results.record("/search returns products", "matched" in hits, hits.splitlines()[0])
+    except Exception as exc:
+        results.record("/search returns products", False, str(exc)[:160])
+
+
 def run_tests(cfg):
     results = TestResults()
     print("=" * 46)
     print("N-ATLaS CLIENT TEST SUITE")
     print("=" * 46)
     client = NAtlasClient(cfg, debug=False)
+
+    # NAFDAC first, and unconditionally: it is the one part of the client that
+    # works with the server offline, so a failed connection should not hide a
+    # working or broken lookup.
+    run_nafdac_tests(cfg, results)
 
     # --- connection ----------------------------------------------------
     try:

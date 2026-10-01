@@ -15,8 +15,13 @@
 ```
          LAPTOP
             |
+            |  NAFDAC number in the message?
+            +----> verify_nafdac_product()  ->  PostgreSQL + greenbook CSV/XLSX
+            |                                  (on this machine, no network)
+            |                                        |
+            |                                  verified facts
+            |                                        v
             | HTTPS (OpenAI-compatible API + Bearer key)
-            |
             ▼
    Secure Tunnel URL     <- the real URL goes in .env (N_ATLAS_BASE_URL)
             |
@@ -24,8 +29,8 @@
       KAGGLE SERVER (FastAPI)
             |
             ▼
-         N-ATLaS
-            |
+         N-ATLaS  ---- writes the reply in the user's language, using the
+            |       verified facts rather than its own memory
             ▼
         Tesla T4 GPU
 ```
@@ -33,6 +38,10 @@
 The laptop only needs Python 3.10+ plus a few small libraries.
 It does NOT need torch, transformers, bitsandbytes, CUDA, an NVIDIA GPU,
 or any Hugging Face model download. The entire model stays on Kaggle.
+
+NAFDAC verification is the one part that runs locally. The greenbook data and
+the database connection are on this machine, so the lookup happens here, and
+it keeps working when the Kaggle session has ended. See section 13.
 
 ## 2. Installation
 
@@ -99,7 +108,13 @@ run from**, so run them from the project root to keep one history folder.
 | `/clear`   | Clear conversation history                    |
 | `/history` | Display the local conversation history        |
 | `/status`  | Re-check the remote server (health / models)  |
+| `/nafdac`  | Show which NAFDAC data sources are reachable  |
+| `/verify`  | Check one NAFDAC number (`/verify A4-100160`) |
+| `/search`  | Search products (`/search malaria`)           |
 | `/exit`    | Quit the client                               |
+
+`/verify`, `/search` and `/nafdac` are answered entirely on the laptop. They
+never reach the model, so they work with the server offline.
 
 ## 6. Example multilingual conversation
 
@@ -177,6 +192,11 @@ Runs (against the live server):
 - conversation memory ("My name is Ahmed." then "What is my name?")
 - language switching ("Answer in Hausa." then "Now answer in English.")
 
+It also runs 22 NAFDAC checks first, before the connection test, because those
+need no server. They cover a known product, a known-inactive product, an unknown
+number, which messages get intercepted, and the rule that a miss never claims a
+product is counterfeit.
+
 ## 11. Troubleshooting
 
 | Symptom                                    | Fix                                                    |
@@ -187,6 +207,11 @@ Runs (against the live server):
 | `The remote N-ATLaS GPU ran out of memory` | Shorten the conversation (`/new`), lower `N_ATLAS_MAX_TOKENS`, or ask for a shorter reply. |
 | Works on `--test` but errors in chat       | Check you're sending `/`-free text; test commands are local only. |
 | Picked up the wrong URL after moving files | Two `.env` files exist (project root and this folder). Run from the project root, or delete one. |
+| `/nafdac` shows `csv` as not found | Run from the project root, or set `NAFDAC_CSV_PATH` to the full path. |
+| `/nafdac` shows `postgres not configured` | Expected without a database. Set `NAFDAC_DATABASE_URL` to get superseded products. |
+| `/nafdac` shows `xlsx (openpyxl not installed)` | Expected. `pip install openpyxl`. The CSV holds the same rows. |
+| A product is reported from local files only | The database was unreachable, so a superseding update would not show. Check `NAFDAC_DATABASE_URL`. |
+| `/verify` says a real product is not found | The export may predate the product. Try `/search <product name>`. |
 
 ## 12. Security notes
 
@@ -197,17 +222,111 @@ Runs (against the live server):
 - Conversation history is local. Only the messages needed for the current
   request leave the laptop.
 
-## 13. Files
+## 13. NAFDAC product verification
+
+Ask about a product in your own words. The client extracts the NAFDAC number,
+checks it against the greenbook, and hands N-ATLaS the verified values so the
+reply is built from data rather than memory.
+
+```
+You: Is A4-100160 genuine?
+Assistant: A4-100160 is AG Spironolactone, and it is currently authorised.
+  It was approved on 2021-12-17 and expires on 2026-12-16. The applicant is
+  AnnyGod Pharmaceutical Company Ltd ...
+
+You: Ka A4-100160 babu?
+Assistant: (Yoruba, same verified values)
+```
+
+### Where the answer comes from
+
+Three sources, consulted in this order and **merged**, not raced. The first
+source that has a value wins, later sources only fill gaps:
+
+| Source      | What it adds                                                     |
+|-------------|------------------------------------------------------------------|
+| PostgreSQL  | Current state, plus superseded/withdrawn products. The only source the Kaggle server can reach. |
+| CSV         | `nafdac_scraper/nafdac_greenbook.csv`, 8930 products. No dependency needed. |
+| XLSX        | `nafdac_scraper/nafdac_greenbook.xlsx`, same rows. Needs `openpyxl`. |
+
+Every source is optional. With none of them the client still runs and says the
+number was not found. Check what is reachable with `/nafdac`.
+
+### What it will and will not tell you
+
+- **A hit names its sources.** A result found in both the database and the CSV
+  reports `verified`; one found only in a local file reports `local-file` and
+  warns that a superseding update would not show.
+- **A miss is never a verdict.** Not being in the export is not the same as
+  being counterfeit, and the client says so. The export may be out of date, or
+  the number may be mistyped.
+- **A shared NRN is not hidden.** 257 of the 8930 rows share a number with
+  another row. When that happens you get all of them and a request to say which
+  product you meant.
+- **An inactive product is not a valid one.** The greenbook only publishes
+  `Active` and `Inactive`, and both are shown, so a withdrawn product is never
+  presented as authorised.
+- **Odd formats resolve.** `A4 - 5180`, `a4-5180`, `04-2045` with an en dash,
+  `4/1/9086`, `A1-4924L` and `NA` are all handled. `NA` and `Not available yet`
+  are recognised as "no number was recorded" and never looked up.
+
+### Setting up the database
+
+```bash
+pip install "psycopg[binary]"
+# set NAFDAC_DATABASE_URL in .env, then:
+python -m nafdac_source.load_postgres --dry-run   # read the CSV, write nothing
+python -m nafdac_source.load_postgres             # create the schema and load
+python -m nafdac_source.verify_postgres           # check the round trip
+```
+
+The loader creates `nafdac_products` (current), `nafdac_product_history`
+(superseded/withdrawn) and `nafdac_load_runs` (provenance). Rows that leave the
+CSV are moved to history rather than deleted, so "this used to be registered"
+stays answerable. Re-running is safe: the schema is `IF NOT EXISTS` throughout
+and a row already in history is not re-archived.
+
+Never commit the connection string. It is gitignored in every `.env`, and the
+tools log only the host and database name.
+
+### Configuration
+
+```
+NAFDAC_ENABLED=true                # master switch
+NAFDAC_DATABASE_URL=               # the remote PostgreSQL URL
+NAFDAC_CSV_PATH=                   # defaults to nafdac_scraper/nafdac_greenbook.csv
+NAFDAC_XLSX_PATH=                  # defaults to nafdac_scraper/nafdac_greenbook.xlsx
+NAFDAC_SHOW_DATA=true              # /verify shows the full table
+NAFDAC_MAX_SEARCH_RESULTS=10
+```
+
+### Which messages get verified
+
+A message is verified when it mentions NAFDAC, or when it contains a number the
+greenbook actually knows. So "Is A4-100160 genuine?" and a bare `A4-100160` are
+checked, while "what is the weather", "I take 500mg of ibuprofen" and ordinary
+Hausa/Yoruba/Igbo conversation are left alone. The number is only tested
+against the data, which is what stops a date or a dose from being treated as a
+registration number.
+
+The model is told to report the verified values and to say a field is not
+recorded rather than filling the gap. It is never asked whether a product is
+real, because that is a question about data, not language.
+
+## 14. Files
 
 ```
 confamAi/
 ├── .env                             # shared client configuration
+├── .env.example                     # the same, with placeholders
 ├── n_atlas_client/                  # THIS FOLDER — the laptop client
 │   ├── __init__.py
 │   ├── __main__.py                  # python -m n_atlas_client
 │   ├── main.py                      # entry point
 │   ├── config.py                    # configuration
 │   ├── api.py                       # NAtlasClient (API client)
+│   ├── nafdac.py                    # NAFDAC interception for chat
+│   ├── nafdac_source.py             # locates the shared nafdac_source
 │   ├── conversation.py              # local memory + context trimming
 │   ├── storage.py                   # JSON saving/loading
 │   ├── terminal.py                  # banner, REPL, commands
@@ -216,26 +335,47 @@ confamAi/
 │   ├── requirements.txt
 │   ├── README.md
 │   └── .env                         # gitignored
-├── n_atlas_server/                  # the Kaggle half — not imported here
+├── nafdac_source/                   # the greenbook lookup, shared
+│   ├── __init__.py                  # public API
+│   ├── extract.py                   # NRN extraction and normalisation
+│   ├── records.py                   # the ProductRecord model
+│   ├── sources.py                   # CSV, XLSX and PostgreSQL sources
+│   ├── verify.py                    # verify_nafdac_product()
+│   ├── formatting.py                # terminal and prompt rendering
+│   ├── schema.sql                   # the PostgreSQL schema
+│   ├── load_postgres.py             # CSV -> PostgreSQL loader
+│   ├── verify_postgres.py           # checks the database path
+│   ├── tests.py                     # 109 checks, no network needed
+│   └── requirements.txt
+├── n_atlas_server/                  # the Kaggle half
 │   ├── readme.md
-│   ├── natlas_notebook.py           # single source of truth (16 cells)
+│   ├── natlas_notebook.py           # single source of truth (17 cells)
 │   ├── natlas_kaggle.ipynb          # build artefact — upload this to Kaggle
+│   ├── verify_nafdac.py             # checks Cell 17 without a GPU
 │   ├── requirements.txt
 │   └── kaggleserver.py, apiserver.py, kaggle.py, ...
+├── nafdac_scraper/                  # where the greenbook data comes from
+│   ├── nafdac_greenbook.csv         # 8930 products
+│   └── nafdac_greenbook.xlsx
 └── conversations/                   # saved chats (gitignored)
 ```
 
+`nafdac_source/` sits at the project root rather than inside the client because
+the Kaggle server imports the same package. Keeping one implementation is what
+stops the two from disagreeing about whether a product is authorised.
+
 `n_atlas.py` is a **standalone script, not a package module**. It duplicates
 the client in one file on purpose, imports nothing from this package, and is
-never loaded by `python -m n_atlas_client`. Edit one or the other — they do
-not share code and can drift.
+never loaded by `python -m n_atlas_client`. It does import `nafdac_source`
+from the project root, and degrades to a plain chat client if that is missing.
+Edit one or the other — they do not share code and can drift.
 
 The modular layout keeps the API client, conversation manager, terminal UI,
 configuration and storage separate so a GUI can be added later without
-touching the API layer. `n_atlas_server/` is self-contained: it shares no code
-with the client and must never be imported from the laptop.
+touching the API layer. `n_atlas_server/` shares no code with the client apart
+from `nafdac_source/`, and must never import anything else from the laptop.
 
-## 14. Development rule
+## 15. Development rule
 
 This client only talks to the endpoints the Kaggle server actually exposes:
 `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`. It assumes

@@ -1733,6 +1733,39 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 # =============================================================================
 # CELL 9 — API endpoints
 # =============================================================================
+# NAFDAC lookup is implemented in Cell 17, which runs after this one. The hooks
+# below are declared here so the routes exist from the moment the app is built,
+# and are filled in by Cell 17. Registering the routes here rather than there
+# means a request that arrives before Cell 17 finishes gets a clean 503 instead
+# of a 404, and the app never has routes added to it after uvicorn has started.
+NAFDAC_HOOKS: Dict[str, Any] = {
+    "verify": None,
+    "search": None,
+    "enrich": None,
+    "status": None,
+}
+
+
+class NafdacVerifyRequest(BaseModel):
+    """A request to check one NAFDAC number.
+
+    Accepts a bare number or a whole sentence, because the client forwards
+    whatever the user typed rather than pre-extracting.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    nrn: str = Field(..., min_length=1, max_length=CONFIG.max_chars_per_message)
+    include_history: bool = True
+
+
+class NafdacSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    query: str = Field(..., min_length=1, max_length=200)
+    limit: int = Field(default=10, ge=1, le=50)
+
+
 @app.get("/health")
 def health():
     loaded = MODEL is not None
@@ -1754,6 +1787,56 @@ def health():
         "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
         "context_budget": CONFIG.context_budget,
         "max_new_tokens": CONFIG.max_new_tokens,
+        "nafdac": (
+            NAFDAC_HOOKS["status"]()
+            if callable(NAFDAC_HOOKS["status"])
+            else {"enabled": False, "reason": "greenbook data is not loaded yet"}
+        ),
+    }
+
+
+@app.get("/v1/nafdac/sources", dependencies=[Depends(verify_api_key)])
+def nafdac_sources():
+    """Which greenbook data sources this server can actually reach.
+
+    Exposed because the answer to "is the database connected?" otherwise
+    requires reading the server log, and that is the first question when a
+    verification returns nothing.
+    """
+    if not callable(NAFDAC_HOOKS["status"]):
+        raise ModelUnavailable("The NAFDAC greenbook data is not loaded.")
+    return NAFDAC_HOOKS["status"]()
+
+
+@app.post("/v1/nafdac/verify", dependencies=[Depends(verify_api_key)])
+def nafdac_verify(payload: NafdacVerifyRequest):
+    """Check one NAFDAC number against the greenbook.
+
+    Returns the full record, not a verdict, so a caller can decide how to
+    present it. A number that is not found is a 200 with found=false rather
+    than a 404: not being in the export is a normal answer, not a client error.
+    """
+    if not callable(NAFDAC_HOOKS["verify"]):
+        raise ModelUnavailable("The NAFDAC greenbook data is not loaded.")
+    result = NAFDAC_HOOKS["verify"](payload.nrn, include_history=payload.include_history)
+    if not result.searched:
+        raise InvalidRequest(
+            "No NAFDAC number found in the request. It looks like A4-100160 or "
+            "04-3877."
+        )
+    return result.to_dict()
+
+
+@app.post("/v1/nafdac/search", dependencies=[Depends(verify_api_key)])
+def nafdac_search(payload: NafdacSearchRequest):
+    """Free-text search over product names, ingredients and applicants."""
+    if not callable(NAFDAC_HOOKS["search"]):
+        raise ModelUnavailable("The NAFDAC greenbook data is not loaded.")
+    records = NAFDAC_HOOKS["search"](payload.query, limit=payload.limit)
+    return {
+        "query": payload.query,
+        "count": len(records),
+        "results": [record.to_dict() for record in records],
     }
 
 
@@ -1803,6 +1886,39 @@ def chat_completions(payload: ChatCompletionRequest, request: Request):
         )
 
     prepared = build_prompt_messages(client_messages)
+
+    # The greenbook data is attached here, as its own system message, after the
+    # prompt is built. It has to come after the language directive so the
+    # directive still lands on the first system message, and before generation
+    # so the model sees the values while it is answering. Only runs for a
+    # message that actually carries a NAFDAC number.
+    nafdac_enrich = NAFDAC_HOOKS.get("enrich")
+    nafdac_context: Optional[Dict[str, Any]] = None
+    if callable(nafdac_enrich):
+        try:
+            nafdac_context = nafdac_enrich(prepared)
+        except Exception as exc:
+            # A greenbook failure must not fail the chat turn; the model simply
+            # answers without the verified block.
+            logger.error("nafdac enrichment failed: %r", exc, exc_info=True)
+            nafdac_context = None
+    if nafdac_context:
+        prepared = [dict(message) for message in prepared]
+        prepared.insert(
+            1,
+            {
+                "role": "system",
+                "content": nafdac_context["content"],
+            },
+        )
+        logger.info(
+            "request_id=%s nafdac nrn=%s found=%s confidence=%s",
+            request_id,
+            nafdac_context.get("nrn"),
+            nafdac_context.get("found"),
+            nafdac_context.get("confidence"),
+        )
+
     result = generate(
         prepared,
         max_new_tokens=max_new_tokens,
@@ -2743,3 +2859,312 @@ if not _failed:
         print("Next stage (not started here): secure external tunnel -> laptop client.")
 else:
     print("Stage 1 NOT complete. Fix the failures above before exposing this server.")
+
+# %% [code]
+# =============================================================================
+# CELL 17 — NAFDAC greenbook verification
+# =============================================================================
+# This cell is what lets N-ATLaS answer "is A4-100160 genuine?" from data
+# instead of from memory. It loads the shared `nafdac_source` package, points it
+# at whatever greenbook data is reachable, and fills the NAFDAC_HOOKS that Cell
+# 9 declared.
+#
+# Data sources, in the order they are consulted:
+#
+#   1. PostgreSQL  NAFDAC_DATABASE_URL. This is the one that matters most on
+#                  Kaggle: the laptop's files are not reachable from here, but
+#                  a hosted database is. It also carries superseded and
+#                  withdrawn products, so "this used to be registered" stays
+#                  answerable.
+#   2. CSV         nafdac_greenbook.csv, if one was uploaded as a Kaggle
+#                  dataset and NAFDAC_CSV_PATH points at it.
+#   3. XLSX        nafdac_greenbook.xlsx, likewise via NAFDAC_XLSX_PATH.
+#
+# The package is looked for in several places, because on Kaggle it has to be
+# uploaded as a dataset and the mount path is not something this notebook can
+# assume. Every entry is treated as a candidate *parent* directory containing
+# `nafdac_source/`, or as the package directory itself.
+NAFDAC_SEARCH_DIRS = [
+    os.environ.get("NAFDAC_SOURCE_DIR", ""),
+    "/kaggle/input/n-atlas-source",
+    "/kaggle/input/nafdac-source",
+    "/kaggle/input/natlas-source",
+    "/kaggle/input/n-afdac-source",
+    str(WORKDIR / "nafdac_source"),
+    str(WORKDIR),
+    str(Path.cwd()),
+]
+
+# The notebook's own directory and its parent, when running from a checkout
+# rather than from Kaggle. Not added inside the list literal because __file__
+# does not exist in a notebook, and a bare `str()` of it would inject the
+# string "<__file__>" into the search path.
+_NAFDAC_SELF = globals().get("__file__")
+if _NAFDAC_SELF:
+    _NAFDAC_SELF_DIR = Path(_NAFDAC_SELF).resolve().parent
+    # apiserver.py already puts the project root on sys.path, so the checkout
+    # layout is: <root>/n_atlas_server/natlas_notebook.py, <root>/nafdac_source/.
+    for _candidate in (
+        _NAFDAC_SELF_DIR,
+        _NAFDAC_SELF_DIR.parent,
+        _NAFDAC_SELF_DIR.parent / "nafdac_source",
+    ):
+        _text = str(_candidate)
+        if _text not in NAFDAC_SEARCH_DIRS:
+            NAFDAC_SEARCH_DIRS.append(_text)
+
+# The data sources below are optional in the sense that a missing one is
+# reported, not fatal. When the package cannot be found the cell degrades
+# rather than raising: the server still starts, /health still reports
+# nafdac.enabled=false, and chat still works. A missing greenbook must not take
+# the model offline.
+NAFDAC_ENABLED = _env_flag("N_ATLAS_NAFDAC_ENABLED", True)
+NAFDAC_MAX_CONTEXT_CHARS = _env_int("N_ATLAS_NAFDAC_MAX_CONTEXT_CHARS", 1800)
+NAFDAC_MAX_SEARCH_RESULTS = _env_int("N_ATLAS_NAFDAC_MAX_SEARCH_RESULTS", 10)
+
+# The instruction prepended to the verified block. Phrased as a constraint
+# rather than a suggestion, because the failure this prevents — the model
+# confidently inventing a product name or an approval date — is exactly the
+# thing a verification tool must not do.
+NAFDAC_INSTRUCTION = (
+    "[nafdac] The block below is verified data from the NAFDAC Greenbook "
+    "database, retrieved for this question. Treat it as fact.\n"
+    "- Report these exact values. Do not reword a product name, and do not "
+    "round or reformat a date.\n"
+    "- Do not add an ingredient, strength, applicant, manufacturer, approval "
+    "date or status that is not listed.\n"
+    "- If a field the user asks about is not listed, say it is not recorded in "
+    "the greenbook. Do not fill the gap from memory.\n"
+    "- If the block says the number was not found, say so plainly and do not "
+    "conclude that the product is counterfeit: the export may be out of date.\n"
+    "- Answer in the user's language, as the rest of your instructions say."
+)
+
+NAFDAC_IMPORT_ERROR = ""
+NAFDAC_SOURCES: List[Any] = []
+NAFDAC_AVAILABLE = False
+
+
+def _import_nafdac_source() -> bool:
+    """Put `nafdac_source` on sys.path and import it. Returns True on success."""
+    global NAFDAC_IMPORT_ERROR
+
+    if "nafdac_source" in sys.modules:
+        return True
+
+    tried = []
+    for directory in NAFDAC_SEARCH_DIRS:
+        if not directory:
+            continue
+        path = Path(directory)
+        # Accept both a parent directory containing nafdac_source/ and the
+        # package directory itself, because a Kaggle dataset can be mounted
+        # either way depending on how it was uploaded.
+        candidates = [path] if path.name == "nafdac_source" else [path]
+        for candidate in candidates:
+            package_init = candidate / "nafdac_source" / "__init__.py"
+            tried.append(str(package_init))
+            if package_init.is_file():
+                if str(candidate) not in sys.path:
+                    sys.path.insert(0, str(candidate))
+                try:
+                    import nafdac_source  # noqa: F401
+
+                    logger.info("nafdac_source loaded from %s", candidate)
+                    return True
+                except Exception as exc:
+                    NAFDAC_IMPORT_ERROR = f"import failed from {candidate}: {exc}"
+                    logger.error(NAFDAC_IMPORT_ERROR)
+                    continue
+
+        # The directory may itself be the package (not a parent of one).
+        direct_init = path / "__init__.py"
+        if path.name == "nafdac_source" and direct_init.is_file():
+            tried.append(str(direct_init))
+            if str(path.parent) not in sys.path:
+                sys.path.insert(0, str(path.parent))
+            try:
+                import nafdac_source  # noqa: F401
+
+                logger.info("nafdac_source loaded from %s", path.parent)
+                return True
+            except Exception as exc:
+                NAFDAC_IMPORT_ERROR = f"import failed from {path.parent}: {exc}"
+                continue
+
+    if not NAFDAC_IMPORT_ERROR:
+        NAFDAC_IMPORT_ERROR = (
+            "nafdac_source/__init__.py not found in any of: "
+            + ", ".join(tried[:6])
+        )
+    return False
+
+
+def _build_nafdac_sources() -> List[Any]:
+    """The source list, in merge order, from the environment."""
+    from nafdac_source.sources import CsvSource, PostgresSource, XlsxSource
+
+    sources: List[Any] = []
+
+    dsn = os.environ.get("NAFDAC_DATABASE_URL", "").strip()
+    if dsn:
+        sources.append(
+            PostgresSource(
+                dsn=dsn,
+                connect_timeout=_env_int("NAFDAC_DB_CONNECT_TIMEOUT", 10),
+            )
+        )
+
+    csv_setting = os.environ.get("NAFDAC_CSV_PATH", "").strip()
+    xlsx_setting = os.environ.get("NAFDAC_XLSX_PATH", "").strip()
+
+    if csv_setting:
+        sources.append(CsvSource(Path(csv_setting) if csv_setting else None))
+    elif _env_flag("NAFDAC_AUTODETECT_FILES", True):
+        # Upload nafdac_greenbook.csv as a Kaggle dataset and it is found
+        # without any configuration, because CsvSource walks up from here.
+        sources.append(CsvSource())
+
+    if xlsx_setting:
+        sources.append(XlsxSource(Path(xlsx_setting) if xlsx_setting else None))
+    elif _env_flag("NAFDAC_AUTODETECT_FILES", True):
+        sources.append(XlsxSource())
+
+    return sources
+
+
+def _nafdac_status() -> Dict[str, Any]:
+    """The payload behind /health's nafdac field and /v1/nafdac/sources."""
+    if not NAFDAC_AVAILABLE:
+        return {
+            "enabled": False,
+            "reason": NAFDAC_IMPORT_ERROR or "nafdac_source is not importable",
+            "hint": (
+                "Upload the nafdac_source/ directory as a Kaggle dataset, or set "
+                "NAFDAC_SOURCE_DIR to a directory containing it."
+            ),
+        }
+
+    payload: Dict[str, Any] = {"enabled": True, "sources": []}
+    for source in NAFDAC_SOURCES:
+        try:
+            detail = source.describe()
+        except Exception as exc:
+            detail = f"error: {type(exc).__name__}"
+        payload["sources"].append(
+            {
+                "name": getattr(source, "name", "unknown"),
+                "detail": detail,
+                "usable": source.available(),
+            }
+        )
+    payload["any_source_usable"] = any(
+        entry["usable"] for entry in payload["sources"]
+    )
+    if not payload["any_source_usable"]:
+        payload["hint"] = (
+            "No source is reachable. Set NAFDAC_DATABASE_URL for a hosted "
+            "database, or NAFDAC_CSV_PATH to an uploaded nafdac_greenbook.csv."
+        )
+    return payload
+
+
+def _nafdac_enrich(prompt_messages: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    """Attach verified greenbook data to a prompt, or return None.
+
+    Returns None when the last user message is not a NAFDAC question, when no
+    number could be found in it, or when the number is not in the data. A miss
+    is deliberately not passed on as verified context: telling the model
+    "not found" as fact would stop it answering sensibly about a product that
+    is simply newer than the export.
+    """
+    if not NAFDAC_AVAILABLE:
+        return None
+
+    last_user = next(
+        (
+            message["content"]
+            for message in reversed(prompt_messages)
+            if message["role"] == "user"
+        ),
+        "",
+    )
+    if not last_user:
+        return None
+
+    from nafdac_source import extract_nrn, mentions_nafdac
+
+    # Cheap gate first, so ordinary conversation never pays for a lookup. A
+    # message that names a number but not NAFDAC is still checked, because a
+    # bare "A4-100160" is usually a lookup and the greenbook resolves it in
+    # milliseconds. Anything with no number-shaped token at all stops here.
+    has_nrn = bool(extract_nrn(last_user))
+    if not has_nrn and not mentions_nafdac(last_user):
+        return None
+
+    result = verify_nafdac_product(last_user, sources=NAFDAC_SOURCES)
+    if not result.found:
+        logger.info("nafdac %s not found in any source", result.nrn)
+        return None
+
+    rendered = result.render()
+    if len(rendered) > NAFDAC_MAX_CONTEXT_CHARS:
+        rendered = rendered[: NAFDAC_MAX_CONTEXT_CHARS].rstrip() + "\n[truncated]"
+
+    return {
+        "nrn": result.nrn,
+        "found": True,
+        "confidence": result.confidence,
+        "content": f"{NAFDAC_INSTRUCTION}\n\n{rendered}",
+    }
+
+
+if NAFDAC_ENABLED and _import_nafdac_source():
+    try:
+        NAFDAC_SOURCES = _build_nafdac_sources()
+        NAFDAC_AVAILABLE = True
+    except Exception as exc:
+        NAFDAC_IMPORT_ERROR = f"could not build sources: {type(exc).__name__}: {exc}"
+        logger.error(NAFDAC_IMPORT_ERROR)
+
+if NAFDAC_AVAILABLE:
+    from nafdac_source import search_products, verify_nafdac_product
+
+    NAFDAC_HOOKS["verify"] = verify_nafdac_product
+    NAFDAC_HOOKS["search"] = search_products
+    NAFDAC_HOOKS["status"] = _nafdac_status
+    NAFDAC_HOOKS["enrich"] = _nafdac_enrich
+
+    # A read-only check at startup: it costs one round trip, and it means a
+    # misconfigured connection is visible in the log rather than surfacing as
+    # a failed lookup in a user's answer.
+    _startup_result = verify_nafdac_product("A4-100160", sources=NAFDAC_SOURCES)
+    _probe_note = ""
+    if _startup_result.found:
+        _probe_note = (
+            f"probe A4-100160 -> {_startup_result.primary.product_name!r} "
+            f"({_startup_result.status})"
+        )
+    else:
+        _probe_note = "probe A4-100160 -> not found"
+        logger.warning(
+            "nafdac probe found nothing. Sources: %s",
+            {name: why for name, why in _startup_result.sources_failed.items()},
+        )
+else:
+    if not NAFDAC_ENABLED:
+        _probe_note = "disabled by N_ATLAS_NAFDAC_ENABLED=0"
+    else:
+        _probe_note = f"unavailable: {NAFDAC_IMPORT_ERROR}"
+
+print("=" * 70)
+print("NAFDAC GREENBOOK")
+print("=" * 70)
+if NAFDAC_AVAILABLE:
+    for _entry in _nafdac_status().get("sources", []):
+        _mark = "ok " if _entry["usable"] else "-- "
+        print(f"  {_mark}{_entry['name']:<9} {_entry['detail']}")
+else:
+    print(f"  unavailable: {_probe_note}")
+print(f"  {_probe_note}")
+print("=" * 70)

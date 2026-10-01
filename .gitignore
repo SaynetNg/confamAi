@@ -17,3 +17,10 @@ natlas_api_key.txt
 # --- Local data --------------------------------------------------------------
 # Saved chats from both clients (n_atlas_client/, modular and single-file).
 conversations/
+
+# Parsed index of nafdac_greenbook.xlsx, written by nafdac_source on first use.
+# Derived from a file that is already tracked, and rebuilt automatically if the
+# workbook changes, so it has no business in git. Without it openpyxl takes
+# about 40 seconds to read the workbook; with it, 1.5.
+nafdac_greenbook.xlsx.nafdac_rows.csv
+nafdac_greenbook.xlsx.nafdac_rows.csv.stamp

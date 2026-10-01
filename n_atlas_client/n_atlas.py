@@ -61,6 +61,211 @@ try:
 except Exception:  # pragma: no cover
     OpenAI = None
 
+# The greenbook lookup package lives next to this file, at the project root.
+# Resolved here rather than imported relatively because this client is meant to
+# work as a standalone copy.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from nafdac_source import (  # noqa: E402
+        search_products,
+        verify_nafdac_product,
+    )
+    from nafdac_source.formatting import source_status  # noqa: E402
+
+    NAFDAC_AVAILABLE = True
+except ImportError as _nafdac_error:  # pragma: no cover
+    NAFDAC_AVAILABLE = False
+    _NAFDAC_IMPORT_ERROR = _nafdac_error
+    search_products = None
+    verify_nafdac_product = None
+    source_status = None
+
+if NAFDAC_AVAILABLE:
+
+    class NafdacInterceptor:
+        """Decides whether a message is a NAFDAC lookup and prepares context.
+
+        Kept as a class rather than a function so the sources are built once and
+        reused: building them re-reads the greenbook, which takes seconds.
+
+        The client verifies on this machine rather than on the Kaggle server,
+        because the greenbook data and the PostgreSQL connection live here. The
+        model still does the talking: it receives the verified block as context
+        and writes the reply in the user's language, so it never has to recall
+        a product name or an approval date from memory.
+        """
+
+        def __init__(self, cfg, debug=False):
+            self.cfg = cfg
+            self.debug = bool(getattr(cfg, "debug", False) or debug)
+            self.enabled = bool(getattr(cfg, "nafdac_enabled", True))
+            self.show_data = bool(getattr(cfg, "nafdac_show_data", True))
+            self.max_results = int(
+                getattr(cfg, "nafdac_max_search_results", 10) or 10
+            )
+            self._sources = None
+            self.last_result = None
+
+        def _get_sources(self):
+            """Build the source list on first use, then reuse it."""
+            if self._sources is None:
+                _push_nafdac_env(self.cfg)
+                from nafdac_source.sources import build_sources
+
+                self._sources = build_sources()
+                if self.debug:
+                    for source in self._sources:
+                        print(
+                            "[debug] nafdac source %s: %s"
+                            % (source.name, source.describe()),
+                            flush=True,
+                        )
+            return self._sources
+
+        def status(self):
+            from nafdac_source.formatting import format_status
+
+            return format_status(self._get_sources())
+
+        def looks_like_lookup(self, message):
+            """True when this message should be verified rather than just sent on.
+
+            The cheap test comes first so ordinary conversation never pays for a
+            data lookup. A message that names a number but not NAFDAC is still
+            checked, because a bare `A4-100160` is usually a lookup; what stops
+            a date or a quantity from being treated as one is that the greenbook
+            has to actually know the number.
+            """
+            if not self.enabled or not message:
+                return False
+            from nafdac_source import extract_nrn, mentions_nafdac
+
+            if mentions_nafdac(message):
+                return True
+            if not extract_nrn(message):
+                return False
+            result = self.verify(message, quiet=True)
+            return bool(result and result.found)
+
+        def verify(self, message, quiet=False):
+            """Verify whatever NAFDAC number is in `message`.
+
+            `quiet` suppresses the data block and is used for the
+            looks-like-a-lookup probe, so a decision is not printed twice.
+            """
+            if not self.enabled:
+                return None
+            result = verify_nafdac_product(message, sources=self._get_sources())
+            self.last_result = result
+            if self.debug:
+                print(
+                    "[debug] nafdac %s nrn=%r found=%s sources=%s failed=%s"
+                    % (
+                        "verify" if not quiet else "probe",
+                        result.nrn,
+                        result.found,
+                        result.sources_checked,
+                        result.sources_failed,
+                    ),
+                    flush=True,
+                )
+            return result
+
+        def verify_command(self, argument):
+            """Handle `/verify <nrn>`, answered entirely on this laptop."""
+            argument = (argument or "").strip()
+            if not argument:
+                return "Usage: /verify <nafdac number>   e.g. /verify A4-100160"
+            from nafdac_source.formatting import format_verification
+
+            result = self.verify(argument)
+            if not result or not result.searched:
+                return (
+                    "No NAFDAC number found in that. It looks like A4-100160 or "
+                    "04-3877 — the number NAFDAC printed on the pack."
+                )
+            return format_verification(result, show_data=self.show_data)
+
+        def search_command(self, argument):
+            """Handle `/search <text>`, a free-text greenbook search."""
+            argument = (argument or "").strip()
+            if not argument:
+                return "Usage: /search <text>   e.g. /search malaria"
+            from nafdac_source.formatting import format_search_results
+
+            records = search_products(
+                argument, sources=self._get_sources(), limit=self.max_results
+            )
+            return format_search_results(records, argument, limit=self.max_results)
+
+        def context_for(self, message, result):
+            """The block handed to N-ATLaS as context for this turn.
+
+            Prefixed so the model can tell verified database output from the
+            conversation around it, and so it is obvious the values are not
+            something it is expected to recall.
+            """
+            return (
+                "[nafdac] Verified greenbook data for this question. Report "
+                "these values to the user as fact. Do not add a product name, "
+                "applicant, date or status that is not listed here, and do not "
+                "say a field is missing when it is present. If the user asks "
+                "something the data does not cover, say so plainly.\n\n"
+                + result.render()
+            )
+
+else:  # pragma: no cover - only when the greenbook package is missing
+
+    class NafdacInterceptor:
+        """Stand-in used when the greenbook package is not installed.
+
+        Every command and every check is inert, so the client still chats
+        normally; only product verification is unavailable, and /nafdac says so.
+        """
+
+        enabled = False
+        show_data = True
+        max_results = 10
+        last_result = None
+
+        def __init__(self, cfg, debug=False):
+            self.cfg = cfg
+            self.debug = debug
+
+        def _get_sources(self):
+            return []
+
+        def status(self):
+            return (
+                "NAFDAC verification is unavailable: the nafdac_source package "
+                "could not be imported from %s.\nKeep nafdac_source next to "
+                "n_atlas_client, or set PYTHONPATH to the project root.\n"
+                "(original error: %s)" % (PROJECT_ROOT, _NAFDAC_IMPORT_ERROR)
+            )
+
+        def looks_like_lookup(self, message):
+            return False
+
+        def verify(self, message, quiet=False):
+            return None
+
+        def verify_command(self, argument):
+            return self.status()
+
+        def search_command(self, argument):
+            return self.status()
+
+        def help_text(self):
+            return "NAFDAC verification is unavailable on this install."
+
+        def context_for(self, message, result):
+            return ""
+
+        def answer_locally(self, result):
+            return ""
+
 # ----------------------------------------------------------------------
 # Configuration (all from env / .env, nothing hard-coded)
 # ----------------------------------------------------------------------
@@ -80,7 +285,27 @@ DEFAULTS = {
     "N_ATLAS_CONVERSATIONS_DIR": "conversations",
     "N_ATLAS_SYSTEM_PROMPT": "",
     "N_ATLAS_SYSTEM_PROMPT_FILE": "",
+    "NAFDAC_ENABLED": "true",
+    "NAFDAC_DATABASE_URL": "",
+    "NAFDAC_CSV_PATH": "",
+    "NAFDAC_XLSX_PATH": "",
+    "NAFDAC_SHOW_DATA": "true",
+    "NAFDAC_MAX_SEARCH_RESULTS": 10,
 }
+
+
+def _push_nafdac_env(cfg):
+    """Publish the NAFDAC settings as environment variables.
+
+    `nafdac_source` reads its configuration from the environment, so the same
+    package works identically on the laptop and on Kaggle.
+    """
+    if getattr(cfg, "nafdac_database_url", ""):
+        os.environ["NAFDAC_DATABASE_URL"] = cfg.nafdac_database_url
+    if getattr(cfg, "nafdac_csv_path", ""):
+        os.environ["NAFDAC_CSV_PATH"] = cfg.nafdac_csv_path
+    if getattr(cfg, "nafdac_xlsx_path", ""):
+        os.environ["NAFDAC_XLSX_PATH"] = cfg.nafdac_xlsx_path
 
 
 class Config:
@@ -116,6 +341,14 @@ class Config:
         self.save_conversations = self._bool(resolved["N_ATLAS_SAVE_CONVERSATIONS"], True)
         self.conversations_dir = str(resolved["N_ATLAS_CONVERSATIONS_DIR"] or "conversations")
         self.system_prompt = str(resolved["N_ATLAS_SYSTEM_PROMPT"] or "").strip()
+        self.nafdac_enabled = self._bool(resolved["NAFDAC_ENABLED"], True)
+        self.nafdac_database_url = str(resolved["NAFDAC_DATABASE_URL"] or "").strip()
+        self.nafdac_csv_path = str(resolved["NAFDAC_CSV_PATH"] or "").strip()
+        self.nafdac_xlsx_path = str(resolved["NAFDAC_XLSX_PATH"] or "").strip()
+        self.nafdac_show_data = self._bool(resolved["NAFDAC_SHOW_DATA"], True)
+        self.nafdac_max_search_results = max(
+            1, int(float(resolved["NAFDAC_MAX_SEARCH_RESULTS"]))
+        )
         prompt_file = str(resolved["N_ATLAS_SYSTEM_PROMPT_FILE"] or "").strip()
         if not self.system_prompt and prompt_file:
             try:
@@ -400,6 +633,64 @@ class NAtlasClient:
         self.server_info = {}
         self.api_connected = False
         self.model_available = False
+        # Built on first NAFDAC use; see _nafdac().
+        self._nafdac_interceptor = None
+
+    # -- NAFDAC verification --------------------------------------------
+    def _nafdac(self):
+        """The interceptor, built once on first use.
+
+        Lazy because it imports the greenbook package and may load data files;
+        a user who never asks about a product should not pay for either.
+        """
+        if self._nafdac_interceptor is None:
+            self._nafdac_interceptor = NafdacInterceptor(self.cfg, self.debug)
+        return self._nafdac_interceptor
+
+    def verify_nafdac(self, nrn):
+        """Verify one NAFDAC number against the greenbook.
+
+        Returns a `VerificationResult`. Runs entirely on this machine, so it
+        works with the server offline.
+        """
+        return self._nafdac().verify(nrn)
+
+    def search_nafdac(self, query, limit=None):
+        """Free-text search over the greenbook, on this machine."""
+        interceptor = self._nafdac()
+        return search_products(
+            query,
+            sources=interceptor._get_sources(),
+            limit=limit or interceptor.max_results,
+        )
+
+    def nafdac_status(self):
+        return self._nafdac().status()
+
+    def _nafdac_context(self, message):
+        """Verify `message` and return the context block, or an empty string.
+
+        Empty when NAFDAC verification is off, when the message is not a
+        lookup, or when the number could not be found. A miss is deliberately
+        not passed to the model as context: telling N-ATLaS "not found" as
+        verified data would stop it from answering sensibly when the export is
+        merely out of date.
+        """
+        interceptor = self._nafdac()
+        if not interceptor.enabled or not message:
+            return ""
+        try:
+            if not interceptor.looks_like_lookup(message):
+                return ""
+            result = interceptor.verify(message, quiet=True)
+        except Exception as exc:
+            # Verification must never be the reason a chat fails.
+            log_debug(self, "nafdac check failed: %r" % (exc,))
+            return ""
+        if not result.found:
+            log_debug(self, "nafdac: %s not found locally" % result.nrn)
+            return ""
+        return interceptor.context_for(message, result)
 
     # -- lifecycle -----------------------------------------------------
     def connect(self):
@@ -470,6 +761,13 @@ class NAtlasClient:
         if isinstance(message, list):
             payload_messages = message
         else:
+            # A message carrying a NAFDAC number is verified first, and the
+            # verified facts are injected as context. N-ATLaS then writes the
+            # reply in the user's language from those facts, so the product
+            # data is never invented.
+            nafdac_context = self._nafdac_context(message)
+            if nafdac_context:
+                message = "%s\n\n%s" % (message, nafdac_context)
             payload_messages = self.conversation.build_messages_for(message)
         use_stream = self.cfg.stream if stream is None else stream
         attempts = 0
@@ -830,12 +1128,15 @@ def print_banner(client):
     print("")
     print("Languages: English | Hausa | Igbo | Yoruba")
     print("")
+    if getattr(client.cfg, "nafdac_enabled", False) and NAFDAC_AVAILABLE:
+        print("NAFDAC verification: ON")
+        print("")
     print("Type /help for commands.")
     print("Type /exit to quit.")
     print("=" * width)
 
 
-def print_help_text():
+def print_help_text(client=None):
     lines = [
         "Available commands:",
         "  /help    Show this list",
@@ -843,6 +1144,9 @@ def print_help_text():
         "  /clear   Clear conversation history",
         "  /history Display local conversation history",
         "  /status  Check whether the remote API is reachable",
+        "  /nafdac  Show which NAFDAC data sources are available",
+        "  /verify  Check one NAFDAC number   (/verify A4-100160)",
+        "  /search  Search products           (/search malaria)",
         "  /exit    Exit the client",
         "",
         "Anything else is sent to N-ATLaS.",
@@ -850,6 +1154,12 @@ def print_help_text():
         "The model replies naturally in English, Hausa, Igbo or Yoruba and",
         "follows your language switches — no reset needed.",
     ]
+    if client is not None and NAFDAC_AVAILABLE:
+        if getattr(client.cfg, "nafdac_enabled", False):
+            lines.append("")
+            lines.append("NAFDAC verification is on. Ask about a product in your")
+            lines.append("own words — \"is A4-100160 genuine?\" — and the answer")
+            lines.append("comes from the greenbook data, not from the model's memory.")
     print("\n".join(lines))
 
 
@@ -932,9 +1242,13 @@ def run_repl(client):
         if not user_input:
             continue
         if user_input.startswith("/"):
-            command = user_input[1:].strip().lower()
+            # Split the command word from its argument once, so
+            # `/verify A4-100160` reaches the handlers as ("verify", "A4-100160").
+            parts = user_input[1:].split(None, 1)
+            command = parts[0].strip().lower() if parts else ""
+            argument = parts[1].strip() if len(parts) > 1 else ""
             if command == "help":
-                print_help_text()
+                print_help_text(client)
                 continue
             if command == "new":
                 client.clear_conversation()
@@ -949,6 +1263,15 @@ def run_repl(client):
                 continue
             if command == "status":
                 handle_status(client)
+                continue
+            if command == "nafdac":
+                print(client.nafdac_status())
+                continue
+            if command == "verify":
+                print(client._nafdac().verify_command(argument))
+                continue
+            if command == "search":
+                print(client._nafdac().search_command(argument))
                 continue
             if command == "exit":
                 print("Bye!")

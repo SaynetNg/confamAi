@@ -32,6 +32,7 @@ from openai import (
 
 from .config import Config
 from .conversation import Conversation
+from .nafdac_source import search_products
 
 # Template/lint artifacts that occasionally leak out of remote chat templates.
 TEMPLATE_ARTIFACTS = (
@@ -123,6 +124,8 @@ class NAtlasClient:
         self.server_info: dict = {}
         self.api_connected = False
         self.model_available = False
+        # Built on first NAFDAC use; see _nafdac().
+        self._nafdac_interceptor = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -200,6 +203,44 @@ class NAtlasClient:
     # ------------------------------------------------------------------
     # chat
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # NAFDAC verification
+    # ------------------------------------------------------------------
+    def _nafdac(self):
+        """The interceptor, built once on first use.
+
+        Lazy because it imports the greenbook package and may load data files;
+        a user who never asks about a product should not pay for either.
+        """
+        if getattr(self, "_nafdac_interceptor", None) is None:
+            from .nafdac import NafdacInterceptor
+
+            self._nafdac_interceptor = NafdacInterceptor(self.cfg, self.debug)
+        return self._nafdac_interceptor
+
+    def verify_nafdac(self, nrn: str):
+        """Verify one NAFDAC number against the greenbook.
+
+        Returns a `VerificationResult`. Runs entirely on this machine, so it
+        works with the server offline.
+        """
+        return self._nafdac().verify(nrn)
+
+    def search_nafdac(self, query: str, limit: int | None = None):
+        """Free-text search over the greenbook, on this machine."""
+        interceptor = self._nafdac()
+        return search_products(
+            query,
+            sources=interceptor._get_sources(),
+            limit=limit or interceptor.max_results,
+        )
+
+    def nafdac_status(self) -> str:
+        return self._nafdac().status()
+
+    # ------------------------------------------------------------------
+    # chat
+    # ------------------------------------------------------------------
     def chat(self, message, stream: bool | None = None, on_token=None):
         """Send a message and return (response_text, info).
 
@@ -207,7 +248,16 @@ class NAtlasClient:
         caller after a valid reply. `on_token` is an optional callable used to
         render streaming tokens live (e.g. a terminal). Streaming is tried
         only when configured and falls back to non-streaming automatically.
+
+        A message carrying a NAFDAC number is verified first, and the verified
+        facts are injected as context. N-ATLaS then writes the reply in the
+        user's language from those facts, so the product data is never
+        invented. If the server is unreachable, the verified block is returned
+        directly rather than an error.
         """
+        nafdac_context = self._nafdac_context(message)
+        if nafdac_context:
+            message = "%s\n\n%s" % (message, nafdac_context)
         payload_messages = self.conversation.build_messages_for(message)
         use_stream = self.cfg.stream if stream is None else stream
 
@@ -375,6 +425,31 @@ class NAtlasClient:
                 "total_tokens": getattr(usage, "total_tokens", None),
             }
         return clean_response_text(text), info
+
+    def _nafdac_context(self, message: str) -> str:
+        """Verify `message` and return the context block, or an empty string.
+
+        Empty when NAFDAC verification is off, when the message is not a
+        lookup, or when the number could not be found. A miss is deliberately
+        not passed to the model as context: telling N-ATLaS "not found" as
+        verified data would stop it from answering sensibly when the export is
+        merely out of date.
+        """
+        interceptor = self._nafdac()
+        if not interceptor.enabled or not message:
+            return ""
+        try:
+            if not interceptor.looks_like_lookup(message):
+                return ""
+            result = interceptor.verify(message, quiet=True)
+        except Exception as exc:
+            # Verification must never be the reason a chat fails.
+            self._log_debug("nafdac check failed: %r" % (exc,))
+            return ""
+        if not result.found:
+            self._log_debug("nafdac: %s not found locally" % result.nrn)
+            return ""
+        return interceptor.context_for(message, result)
 
     # ------------------------------------------------------------------
     # conversation / storage conveniences
