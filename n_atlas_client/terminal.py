@@ -1,11 +1,36 @@
 """N-ATLaS terminal UI: banner, REPL loop and local commands.
 
-Commands (/help, /new, /clear, /history, /status, /exit) are handled locally
-and are never sent to the remote N-ATLaS server.
+Commands (/help, /new, /clear, /history, /status, /hausa, /exit) are handled
+locally and are never sent to the remote N-ATLaS server.
+
+The language is chosen here too. Each language is its own command, so the mode
+is one keystroke away rather than an argument to remember:
+
+    /hausa  /yoruba  /igbo  /english  /auto
+
+A pinned mode holds: in Yoruba mode a Hausa message is still answered in
+Yoruba, because the mode is a choice about the reply. `/langueage` shows the
+current one without changing it.
 """
 
 import sys
 import time
+
+from .language import AUTO
+
+# Command word -> mode code. An empty code means "show the current mode"
+# without setting one. Adding a spelling is a one-line change, so the whole
+# command surface lives in one readable block.
+LANGUAGE_COMMANDS = {
+    "hausa": "ha",
+    "yoruba": "yo",
+    "igbo": "ig",
+    "english": "en",
+    "auto": AUTO,
+    "langueage": "",
+    "language": "",
+    "lang": "",
+}
 
 
 def print_banner(client) -> None:
@@ -29,7 +54,11 @@ def print_banner(client) -> None:
     ))
     print("Remote GPU: %s" % (gpu or "not reported"))
     print()
-    print("Languages: English | Hausa | Igbo | Yoruba")
+    mode = client._language()
+    print("Language: %s%s" % (
+        mode.label(),
+        "   (/hausa /yoruba /igbo /english /auto to change)" if mode.pinned else "",
+    ))
     print()
     if getattr(getattr(client, "cfg", None), "nafdac_enabled", False):
         print("NAFDAC verification: ON")
@@ -50,12 +79,21 @@ def print_help_text(client=None) -> None:
         "  /nafdac  Show which NAFDAC data sources are available",
         "  /verify  Check one NAFDAC number   (/verify A4-100160)",
         "  /search  Search products           (/search malaria)",
+        "  /hausa   Reply in Hausa from now on",
+        "  /yoruba  Reply in Yoruba from now on",
+        "  /igbo    Reply in Igbo from now on",
+        "  /english Reply in English from now on",
+        "  /auto    Follow the language of each message",
+        "  /langueage  Show the current language mode",
         "  /exit    Exit the client",
         "",
         "Anything else is sent to N-ATLaS.",
         "",
-        "N-ATLaS replies naturally in English, Hausa, Igbo or Yoruba and",
-        "follows your language switches without resetting the conversation.",
+        "N-ATLaS replies in English, Hausa, Igbo or Yoruba and follows your",
+        "language switches without resetting the conversation.",
+        "",
+        "A language command pins the reply, so it holds even if the next",
+        "message is in another language. /auto hands the choice back.",
     ]
     if client is not None and getattr(client, "cfg", None) is not None:
         if getattr(client.cfg, "nafdac_enabled", False):
@@ -107,8 +145,12 @@ def run_repl(client) -> int:
     print_banner(client)
 
     while True:
+        mode = client._language()
+        # The pinned mode is shown in the prompt, because a hard pin is
+        # otherwise invisible until a reply comes back in the wrong language.
+        prompt = "\nYou [%s]: " % mode.label() if mode.pinned else "\nYou: "
         try:
-            user_input = input("\nYou: ").strip()
+            user_input = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             print("Bye! Kar ka dawo. See you next time.")
@@ -156,6 +198,10 @@ def run_repl(client) -> int:
         if command == "exit":
             print("Bye!")
             return 0
+        if command in LANGUAGE_COMMANDS:
+            # `/hausa` and friends pin the mode; `/langueage` only shows it.
+            print(mode.command(LANGUAGE_COMMANDS[command]))
+            continue
         if command is not None:
             print("Unknown command: /%s. Type /help for commands." % command)
             continue

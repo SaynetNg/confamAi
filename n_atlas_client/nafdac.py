@@ -23,15 +23,46 @@ Two paths through here:
 
 from .nafdac_source import (
     NAFDAC_HELP,
+    SearchResult,
     VerificationResult,
     extract_nrn,
+    extract_search_terms,
+    find_products,
     format_not_found,
+    format_no_number_found,
     format_search_results,
+    format_search_verdict,
+    format_searched_nothing,
     format_status,
+    format_usage_search,
+    format_usage_verification,
+    format_usage_verification_words,
     format_verification,
-    mentions_nafdac,
+mentions_nafdac,
     search_products,
     verify_nafdac_product,
+)
+
+# Prepended to every context block, whether it came from a number lookup or a
+# search. Kept as one constant so the two paths cannot drift apart on what the
+# model is allowed to say.
+_CONTEXT_PREFIX = (
+    "[nafdac] Verified greenbook data for this question. Report these values "
+    "to the user as fact. Do not add a product name, applicant, date or status "
+    "that is not listed here, and do not say a field is missing when it is "
+    "present. If the user asks something the data does not cover, say so "
+    "plainly.\n"
+    "- Use the VERDICT line to answer 'is it genuine?': AUTHENTIC, FLAGGED or "
+    "NOT_REGISTERED.\n"
+    "- NEVER tell the user a product is counterfeit, fake or poisoned. The "
+    "greenbook records registrations, not counterfeiting. Not being listed is "
+    "not the same as being fake.\n"
+    "- AUTHENTIC means registered, not that this particular pack is genuine: a "
+    "copied number resolves just as well.\n"
+    "- If several candidates are listed with no verdict, show them and ask which "
+    "product the user means. Never pick one for them.\n"
+    "- Answer in the user's language, including Hausa, Yoruba or Igbo. Keep "
+    "product names, NAFDAC numbers, dates and statuses exactly as written.\n\n"
 )
 
 
@@ -42,7 +73,7 @@ class NafdacInterceptor:
     reused: building them re-reads the greenbook, which takes seconds.
     """
 
-    def __init__(self, cfg, debug: bool = False):
+    def __init__(self, cfg, debug: bool = False, language=None):
         self.cfg = cfg
         self.debug = bool(getattr(cfg, "debug", False) or debug)
         self.enabled = bool(getattr(cfg, "nafdac_enabled", True))
@@ -50,6 +81,24 @@ class NafdacInterceptor:
         self.max_results = int(getattr(cfg, "nafdac_max_search_results", 10) or 10)
         self._sources = None
         self.last_result: VerificationResult | None = None
+        self.last_search: SearchResult | None = None
+        # A zero-argument callable returning the current language code, so
+        # `/hausa` changes the language these tables print in without
+        # rebuilding the interceptor and re-reading the greenbook. A callable
+        # rather than a value also keeps this module free of any dependency on
+        # language.py, so it stays testable on its own.
+        self._language_code = language or (lambda: "en")
+
+    def _lang(self) -> str:
+        """The current language code, or English if the holder misbehaves.
+
+        A broken language holder must never be the reason a greenbook lookup
+        fails, so an exception here degrades to the default rendering.
+        """
+        try:
+            return str(self._language_code() or "en")
+        except Exception:
+            return "en"
 
     # ------------------------------------------------------------------
     def _get_sources(self):
@@ -69,25 +118,66 @@ class NafdacInterceptor:
 
     def status(self) -> str:
         """A short report on which sources are usable, for /nafdac."""
-        return format_status(self._get_sources())
+        return format_status(self._get_sources(), lang=self._lang())
 
     def looks_like_lookup(self, message: str) -> bool:
-        """True when this message should be verified rather than just sent on.
+        """True when this message should bring greenbook data with it.
 
-        The cheap test comes first so ordinary conversation never pays for a
-        data lookup. A message that names a number but not NAFDAC is still
-        checked, because a bare `A4-100160` is usually a lookup; what stops a
-        date or a quantity from being treated as one is that the greenbook has
-        to actually know the number.
+        There is no longer a test for "is this about a product". Every message
+        is searched, and a hit is passed on whether or not the user asked about a
+        product, because greenbook names are ordinary English words: "good
+        morning" matches products called "Morning", and no word list can tell
+        that apart from a genuine product question. The model reads the block and
+        decides whether it is relevant.
+
+        What this returns is narrower: whether there is anything at all to pass
+        on. An unknown number or a search with no hits returns False, and the
+        model answers the message conversationally.
         """
         if not self.enabled or not message:
             return False
         if mentions_nafdac(message):
             return True
-        if not extract_nrn(message):
-            return False
-        result = self.verify(message, quiet=True)
-        return bool(result and result.found)
+
+        if extract_nrn(message):
+            result = self.verify(message, quiet=True)
+            return bool(result and result.found)
+
+        search = self.search(message, quiet=True)
+        return bool(search and search.found)
+
+    # ------------------------------------------------------------------
+    def search(self, message: str, quiet: bool = False) -> SearchResult:
+        """Free-text search whatever product words are in `message`.
+
+        `quiet` suppresses the data block and is used for the
+        looks-like-a-lookup probe, so a decision is not printed twice.
+        """
+        if not self.enabled:
+            return SearchResult()
+        terms = extract_search_terms(message)
+        if not terms:
+            return SearchResult(query=(message or "").strip())
+
+        result = find_products(
+            terms, sources=self._get_sources(), limit=self.max_results
+        )
+        self.last_search = result
+
+        if self.debug:
+            print(
+                "[debug] nafdac search %s query=%r found=%s total=%s "
+                "verdict=%s"
+                % (
+                    "probe" if quiet else "search",
+                    result.query,
+                    result.found,
+                    result.total,
+                    result.verdict,
+                ),
+                flush=True,
+            )
+        return result
 
     # ------------------------------------------------------------------
     def verify(self, message: str, quiet: bool = False) -> VerificationResult:
@@ -116,35 +206,63 @@ class NafdacInterceptor:
         return result
 
     def verify_command(self, argument: str) -> str:
-        """Handle `/verify <nrn>`, answered entirely on the laptop."""
+        """Handle `/verify <nrn or product name>`, answered on the laptop.
+
+        A number is verified by number. Anything else is searched instead of
+        rejected, because `/verify paracetamol` and `/verify is this genuine?`
+        are the same question a user types in words, and answering "no NAFDAC
+        number found" to those is a non-answer.
+        """
         argument = (argument or "").strip()
         if not argument:
-            return "Usage: /verify <nafdac number>   e.g. /verify A4-100160"
+            return format_usage_verification_words(self._lang())
+
+        if not extract_nrn(argument):
+            return self.verify_word_command(argument)
 
         result = self.verify(argument)
         if not result.searched:
-            return (
-                "No NAFDAC number found in that. It looks like A4-100160 or "
-                "04-3877 — the number NAFDAC printed on the pack."
-            )
-        return format_verification(result, show_data=self.show_data)
+            return format_no_number_found(self._lang())
+        return format_verification(
+            result, show_data=self.show_data, lang=self._lang()
+        )
+
+    def verify_word_command(self, argument: str) -> str:
+        """Search for the product words in `argument` and report the verdict.
+
+        The search half of `verify_command`. A miss is worded as "not in this
+        export", never as counterfeit, for the reason the whole package exists.
+        """
+        argument = (argument or "").strip()
+        if not argument:
+            return format_usage_verification_words_short(self._lang())
+
+        result = self.search(argument)
+        if not result.searched:
+            return format_searched_nothing(self._lang())
+        return format_search_verdict(
+            result, limit=self.max_results, show_data=self.show_data,
+            lang=self._lang(),
+        )
 
     def search_command(self, argument: str) -> str:
         """Handle `/search <text>`, a free-text greenbook search."""
         argument = (argument or "").strip()
         if not argument:
-            return "Usage: /search <text>   e.g. /search malaria"
+            return format_usage_search(self._lang())
         records = search_products(
             argument, sources=self._get_sources(), limit=self.max_results
         )
-        return format_search_results(records, argument, limit=self.max_results)
+        return format_search_results(
+            records, argument, limit=self.max_results, lang=self._lang()
+        )
 
     def status_command(self) -> str:
         """Handle `/nafdac`."""
         return self.status()
 
     def help_text(self) -> str:
-        return NAFDAC_HELP
+        return nafdac_help(self._lang())
 
     # ------------------------------------------------------------------
     def context_for(self, message: str, result: VerificationResult) -> str:
@@ -154,14 +272,18 @@ class NafdacInterceptor:
         conversation around it, and so it is obvious the values are not
         something the model is expected to recall.
         """
-        return (
-            "[nafdac] Verified greenbook data for this question. Report these "
-            "values to the user as fact. Do not add a product name, applicant, "
-            "date or status that is not listed here, and do not say a field is "
-            "missing when it is present. If the user asks something the data "
-            "does not cover, say so plainly.\n\n"
-            + result.render()
-        )
+        return _CONTEXT_PREFIX + result.render()
+
+    def context_for_search(self, message: str, result: SearchResult) -> str:
+        """The context block for a product-name search.
+
+        Same prefix as the number path, so the model is held to the same rule in
+        both cases: only report what the block lists, and never call a product
+        counterfeit because the export does not list it.
+        """
+        if not result or not result.searched:
+            return ""
+        return _CONTEXT_PREFIX + result.render(limit=self.max_results)
 
     def answer_locally(self, result: VerificationResult) -> str:
         """A direct answer with no model call at all.
@@ -172,5 +294,5 @@ class NafdacInterceptor:
         if not result.searched:
             return ""
         if not result.found:
-            return format_not_found(result)
-        return format_verification(result, show_data=self.show_data)
+            return format_not_found(result, lang=self._lang())
+        return format_verification(result, show_data=self.show_data, lang=self._lang())

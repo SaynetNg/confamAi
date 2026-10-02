@@ -22,8 +22,11 @@ if str(_HERE.parent) not in sys.path:
 from nafdac_source import (  # noqa: E402
     VerificationResult,
     classify_status,
+    classify_verdict,
     extract_nrn,
     extract_nrn_candidates,
+    extract_search_terms,
+    find_products,
     is_authorised,
     looks_like_nrn,
     mentions_nafdac,
@@ -31,6 +34,7 @@ from nafdac_source import (  # noqa: E402
     normalize_nrn_key,
     record_from_row,
     search_products,
+    verdict_reason,
     verify_nafdac_product,
 )
 from nafdac_source.records import STATUS_ACTIVE, STATUS_INACTIVE  # noqa: E402
@@ -522,6 +526,463 @@ def test_rendering():
         check("the render has no non-ascii dashes", "\u2014" not in text)
 
 
+# ---------------------------------------------------------------------------
+# localisation of the terminal output
+# ---------------------------------------------------------------------------
+def test_localisation():
+    """`lang=` localises the table without touching a single value.
+
+    The rule under test is the one that makes localisation safe here: a user
+    checking whether a medicine is genuine must still read the real product
+    name, the real applicant and the real dates, in whatever language the
+    client is currently rendering in.
+    """
+    print("\nlocalisation")
+
+    from .formatting import (
+        STRINGS,
+        SUPPORTED_LANGUAGES,
+        _t,
+        format_not_found,
+        format_search_results,
+        format_status,
+        format_verification,
+        nafdac_help,
+    )
+
+    result = verify_nafdac_product("A4-100160", sources=build_sources(use_database=False))
+    if not result.found:
+        check("a found result is available to localise", False, result.nrn)
+        return
+    record = result.primary
+
+    english = format_verification(result, lang="en")
+    check("english is the default rendering", english == format_verification(result))
+
+    # Every language answers every key, so a partially translated table can
+    # never print a key name at a user.
+    keys = set(STRINGS["en"])
+    check(
+        "no language defines a key English does not",
+        all(not set(STRINGS[lang]) - keys for lang in STRINGS),
+    )
+    missing = [
+        (lang, key)
+        for lang in SUPPORTED_LANGUAGES
+        for key in keys
+        if _t(lang, key) == key
+    ]
+    check("every language answers every key", not missing, str(missing[:3]))
+    check(
+        "an unknown language falls back to english",
+        _t("zz", "label_number") == STRINGS["en"]["label_number"],
+    )
+
+    for lang in SUPPORTED_LANGUAGES:
+        text = format_verification(result, lang=lang)
+        label = _t(lang, "label_applicant")
+        check(f"[{lang}] the applicant label is localised", label in text)
+        check(f"[{lang}] the number is untouched", record.nrn in text)
+        check(f"[{lang}] the product name is untouched", record.product_name in text)
+        check(f"[{lang}] the approval date is untouched", record.approval_date in text)
+        check(f"[{lang}] no unformatted placeholder survives", "{" not in text)
+
+    check(
+        "a translated verdict word differs from the english one",
+        _t("ha", "verdict_authorised") != _t("en", "verdict_authorised"),
+    )
+    check(
+        "greenbook stays one word in every language",
+        len({_t(lang, "label_greenbook") for lang in SUPPORTED_LANGUAGES}) == 1,
+    )
+
+    # A miss must stay a miss in every language, and must never accuse anyone.
+    miss = verify_nafdac_product("A4-0000000", sources=build_sources(use_database=False))
+    for lang in SUPPORTED_LANGUAGES:
+        text = format_not_found(miss, lang=lang)
+        check(f"[{lang}] a miss says not found", "A4-0000000" in text)
+        check(
+            f"[{lang}] a miss does not claim the product is fake",
+            "counterfeit" not in text.lower(),
+        )
+
+    empty = format_search_results([], "zzzznotarealproduct", lang="ha")
+    check("a search miss renders in the given language", bool(empty.strip()))
+    check("a search miss keeps the query", "zzzznotarealproduct" in empty)
+    check("the status block renders in the given language", bool(format_status([], lang="yo").strip()))
+    check("the help block renders in the given language", "/verify" in nafdac_help("ig"))
+
+    # The model-facing block is never localised. It is verified data, and a
+    # translation in front of a verifier is how a wrong value gets reported.
+    # Asserted structurally: render() takes no language at all, so there is no
+    # way to localise it by accident.
+    import inspect
+
+    from .records import render_record
+
+    check(
+        "the model block takes no language argument",
+        "lang" not in inspect.signature(result.render).parameters
+        and not [
+            p
+            for p in inspect.signature(render_record).parameters.values()
+            if "lang" in p.name
+        ],
+    )
+    check(
+        "the model block is identical across calls",
+        result.render() == result.render(),
+    )
+    check(
+        "the model block carries no localised verdict",
+        _t("ha", "verdict_authorised") not in result.render(),
+    )
+
+
+
+    """A user asks "is this genuine?", which `authorised` does not answer.
+
+    The verdict is the four-way answer the model actually needs, and the one
+    thing that must never be invented: there is deliberately no "fake" value,
+    because the greenbook records registrations, not counterfeiting.
+    """
+    # ---------------------------------------------------------------------------
+# the user-facing verdict
+# ---------------------------------------------------------------------------
+def test_verdict():
+    """A user asks "is this genuine?", which `authorised` does not answer.
+
+    The verdict is the four-way answer the model actually needs, and the one
+    thing that must never be invented: there is deliberately no "fake" value,
+    because the greenbook records registrations, not counterfeiting.
+    """
+    print("\nverdict")
+
+    check(
+        "an active product is authentic",
+        classify_verdict("Active") == "authentic",
+    )
+    check(
+        "an inactive product is flagged",
+        classify_verdict("Inactive") == "flagged",
+    )
+    for status in ("Withdrawn", "Suspended", "Recalled", "Revoked", "Expired"):
+        check(
+            f"{status} is flagged",
+            classify_verdict(status) == "flagged",
+        )
+    check(
+        "a duplicate entry is flagged even when active",
+        classify_verdict("Active", duplicate=True) == "flagged",
+    )
+    check(
+        "an unrecognised status is unknown, not authentic",
+        classify_verdict("Pending Review") == "unknown",
+    )
+    check("a blank status is unknown", classify_verdict("") == "unknown")
+
+    check(
+        "an action status is named in the reason",
+        "Withdrawn" in verdict_reason("Withdrawn"),
+        verdict_reason("Withdrawn"),
+    )
+    check(
+        "the reason is never the word counterfeit",
+        all(
+            "counterfeit" not in verdict_reason(status).lower()
+            for status in ("Active", "Inactive", "Withdrawn", "", "Weird")
+        ),
+    )
+
+    # The raw status must survive, or a withdrawn product and an expired one
+    # become indistinguishable to the user.
+    withdrawn = record_from_row(_row(Status="Withdrawn", **{"Product ID": "99"}))
+    check("the raw status is preserved", withdrawn.raw_status == "Withdrawn")
+    check("the normalised status is still Inactive", withdrawn.status == "Inactive")
+    check("a withdrawn row is flagged", withdrawn.verdict == "flagged")
+    check(
+        "the verdict prefers the raw status",
+        withdrawn.verdict_reason == "NAFDAC status is Withdrawn",
+        withdrawn.verdict_reason,
+    )
+
+    active = record_from_row(_row())
+    check("an active row is authentic", active.verdict == "authentic")
+    check("the verdict is in to_dict", active.to_dict()["verdict"] == "authentic")
+
+    duplicate = record_from_row(_row(**{"Product Name": "AG Spironolactone (duplicate)"}))
+    check("a duplicate name row is flagged", duplicate.verdict == "flagged")
+
+
+def test_verdict_on_result():
+    """The result-level verdict, aggregated across every match."""
+    print("\nverdict on a result")
+    sources = build_sources(use_database=False)
+
+    found = verify_nafdac_product("A4-100160", sources=sources)
+    check("a known number is authentic", found.verdict == "authentic", found.verdict)
+    check(
+        "the reason explains it",
+        "Active" in found.verdict_reason,
+        found.verdict_reason,
+    )
+    check("the verdict is in to_dict", found.to_dict()["verdict"] == "authentic")
+    check("the render names the verdict", "Verdict: AUTHENTIC" in found.render())
+
+    missing = verify_nafdac_product("A4-0000000", sources=sources)
+    check("an unknown number is not_registered", missing.verdict == "not_registered")
+    check(
+        "a miss says it is not proof, rather than asserting counterfeit",
+        "not proof" in missing.verdict_reason.lower(),
+        missing.verdict_reason,
+    )
+
+    empty = verify_nafdac_product("", sources=sources)
+    check("nothing searched is unknown, not not_registered", empty.verdict == "unknown")
+
+    # A number carrying both an active and a flagged product must never be
+    # reported as authentic, because the user would be told a flagged product
+    # is fine.
+    flagged = record_from_row(_row(Status="Recalled", **{"Product ID": "501"}))
+    ok = record_from_row(_row(**{"Product ID": "502"}))
+    mixed = VerificationResult(
+        nrn="A4-999999",
+        searched=True,
+        found=True,
+        matches=[ok, flagged],
+        authorised=True,
+    )
+    check(
+        "one flagged match makes the whole result flagged",
+        mixed.verdict == "flagged",
+        mixed.verdict,
+    )
+
+    # render() must never license the model to call a product counterfeit, on
+    # any path.
+    for result in (found, missing, mixed):
+        text = result.render().lower()
+        check(
+            f"render forbids calling it counterfeit ({result.verdict})",
+            "never call a product counterfeit" in text,
+        )
+        check(
+            f"render tells the model to reply in the user's language ({result.verdict})",
+            "hausa" in text and "yoruba" in text and "igbo" in text,
+        )
+
+
+# ---------------------------------------------------------------------------
+# search terms, and the whole-word guard
+# ---------------------------------------------------------------------------
+def test_search_terms():
+    """Every message is searched now, so the term extraction has to be right.
+
+    There is no longer a gate deciding whether a message is a product question,
+    which means these terms come from ordinary conversation as well. Getting this
+    wrong shows the user a list of products they never asked about.
+    """
+    print("\nsearch terms")
+
+    # A product noun must survive as a search term. If it were treated as a stop
+    # word the local-language path would have nothing left to search for.
+    check("magari is kept as a term", "magari" in extract_search_terms("Shin wannan magari ne?"))
+    check("oro is kept as a term", "oro" in extract_search_terms("Je oro yi to?"))
+    check("odu is kept as a term", "odu" in extract_search_terms("Nke onye bu odu?"))
+    check("an NRN beats the words around it", extract_search_terms("is A4-100160 real") == ["A4-100160"])
+    check("stop words are dropped", "genuine" not in extract_search_terms("is paracetamol genuine?"))
+    check("the drug name is kept", "paracetamol" in extract_search_terms("is paracetamol genuine?"))
+    check(
+        "a message of only stop words yields no query",
+        extract_search_terms("is it for me to use") == [],
+        extract_search_terms("is it for me to use"),
+    )
+    check("an empty message yields no query", extract_search_terms("") == [])
+
+    sources = build_sources(use_database=False)
+
+    # Diacritics are stripped, so a user typing without tone marks still hits.
+    check("Yoruba without diacritics still yields oro", "oro" in extract_search_terms("Se oro yi to?"))
+    check("Igbo without diacritics still yields odu", "odu" in extract_search_terms("O bu odu?"))
+
+    # Whole-word indexing is what stops an ordinary verb from matching a brand.
+    # Without it "treat" hits "Levotreat" and "cold" hits "Coldkris", which
+    # would attach products to "how do I treat a cold?".
+    from nafdac_source.verify import _candidates
+
+    def matching(text):
+        return sorted(
+            record.product_name
+            for _rank, record in _candidates(sources[0].load(), [text])
+        )
+
+    check(
+        "a word inside a brand name does not match",
+        matching("treat") == [],
+        str(matching("treat")),
+    )
+    check(
+        "a real product name still matches",
+        any("cold" in name.lower() for name in matching("cold")),
+        str(matching("cold")[:3]),
+    )
+    check("an absent word matches nothing", matching("zzzznotaword") == [])
+    check("an exact name matches", len(matching("good morning cough syrup")) >= 1)
+    check(
+        "an NRN substring still matches",
+        len(matching("5180")) >= 1,
+        str(matching("5180")[:3]),
+    )
+    # "Limited" appears in applicant names and rarely in a product name, so it
+    # is the weak-match case: a hit exists but is not a product the user could be
+    # holding, and `strong_match` has to say so.
+    generic = find_products("limited", sources=sources, limit=5)
+    check(
+        "a company-word hit is not a strong match",
+        generic.found is True and generic.strong_match is False,
+        f"rank={generic.best_rank} strong={generic.strong_match}",
+    )
+    check(
+        "a weak match says so in the rendered block",
+        "closest match is weak" in generic.render(limit=1),
+    )
+    # A brand that is also a product name prefix is a strong match.
+    branded = find_products("emzor", sources=sources, limit=5)
+    check(
+        "a brand used as a product name is a strong match",
+        branded.strong_match is True,
+        f"rank={branded.best_rank}",
+    )
+
+    sources = build_sources(use_database=False)
+
+
+def test_search_every_message():
+    """A miss attaches nothing, so the model answers conversationally.
+
+    There is no product-question gate any more. That is a deliberate trade: a
+    greenbook name is ordinary English, so "good morning" matches products called
+    "Morning", and no word list can tell that apart from a real question. The
+    decision is handed to the model, which reads the block and knows what the user
+    actually asked.
+    """
+    print("\nsearch on every message")
+    sources = build_sources(use_database=False)
+
+    # A miss is the case that matters: nothing attached, model answers normally.
+    for label, message in (
+        ("a greeting", "Ka lafiya?"),
+        ("how are you, mixed", "Báwo ni? How are you today?"),
+        ("a symptom", "I have a headache"),
+        ("a nonsense product", "zzzznotarealproduct"),
+    ):
+        terms = extract_search_terms(message)
+        result = find_products(terms, sources=sources, limit=5) if terms else None
+        attached = bool(result and result.searched and result.found)
+        check(
+            f"{label} attaches nothing",
+            not attached,
+            f"terms={terms} hits={result.total if result else 0}",
+        )
+
+    # An incidental match still attaches, because the greenbook genuinely cannot
+    # tell it apart from a product question: "weather", "morning" and "family" are
+    # all words that appear in real product names. What must not happen is the
+    # model being told to trust the match, so every block states the uncertainty
+    # and tells the model to drop the candidates if they are not relevant.
+    for label, message in (
+        ("good morning", "good morning"),
+        ("an unrelated sentence", "I love my family"),
+        ("the weather", "what is the weather in Lagos"),
+    ):
+        terms = extract_search_terms(message)
+        result = find_products(terms, sources=sources, limit=5) if terms else None
+        if not (result and result.found):
+            check(f"an incidental match ({label}) matched nothing", True)
+            continue
+        text = result.render(limit=2)
+        check(
+            f"an incidental match ({label}) states it may not be what the user meant",
+            "not necessarily because the user asked about them" in text,
+            f"hits={result.total} best_rank={result.best_rank}",
+        )
+        check(
+            f"an incidental match ({label}) may be ignored entirely",
+            "ignore this block completely" in text,
+        )
+
+    # A genuine product question still reaches the data.
+    result = find_products(
+        extract_search_terms("is paracetamol genuine?"), sources=sources, limit=5
+    )
+    check("a drug name still finds candidates", result.found is True, str(result.total))
+    check("a drug name is a strong match", result.strong_match is True)
+    check("best_rank is recorded", result.best_rank > 0, str(result.best_rank))
+
+
+def test_search_result():
+    """`find_products` reports provenance, and never over-claims a miss."""
+    print("\nsearch result")
+    sources = build_sources(use_database=False)
+
+    result = find_products("spironolactone", sources=sources, limit=5)
+    check("a search runs", result.searched is True)
+    check("a search reports the sources it used", bool(result.sources_checked))
+    check("a search finds candidates", result.found is True, str(result.total))
+    check("the query is echoed", "spironolactone" in result.query)
+    check("the verdict is in to_dict", "verdict" in result.to_dict())
+
+    # Several candidates means the data has not answered the question about one
+    # specific pack, so no verdict may be claimed.
+    many = find_products("malaria", sources=sources, limit=10)
+    if many.total > 1:
+        check(
+            "several candidates claim no verdict",
+            many.verdict == "unknown",
+            many.verdict,
+        )
+        text = many.render(limit=3)
+        check("the render asks which product", "which one the user means" in text)
+        check("the render will not pick one", "Do not choose" in text)
+
+    miss = find_products("zzzznotarealproduct", sources=sources)
+    check("a miss still searched", miss.searched is True)
+    check("a miss claims nothing", miss.found is False)
+    check("a miss is not_registered", miss.verdict == "not_registered")
+    miss_text = miss.render()
+    check(
+        "a miss is not called counterfeit",
+        "not proof the product is counterfeit" in miss_text.lower(),
+    )
+    check("a miss asks for the number", "A4-100160" in miss_text)
+    check("the miss render is plain text", "**" not in miss_text)
+
+    # Multiple terms must match independently. Joining them into one needle
+    # would match nothing, because no product name contains that exact pair.
+    joined = find_products("paracetamol syrup", sources=sources, limit=5)
+    split = find_products(["paracetamol", "syrup"], sources=sources, limit=5)
+    check(
+        "separate terms match more than one joined phrase",
+        len(split.records) >= len(joined.records),
+        f"split={len(split.records)} joined={len(joined.records)}",
+    )
+
+    # A source that cannot be read must be reported, so "nothing matched" is
+    # never printed when the truth is "nothing was searched".
+    broken = find_products("spironolactone", sources=[], limit=5)
+    check("no readable source means not searched", broken.searched is False)
+    check(
+        "a dead lookup does not claim not_registered",
+        broken.verdict == "unknown",
+        broken.verdict,
+    )
+    check(
+        "a dead lookup warns the model",
+        any("was readable" in note.lower() for note in broken.notes),
+        str(broken.notes),
+    )
+
+
 def main() -> int:
     print("=" * 70)
     print("NAFDAC SOURCE TESTS")
@@ -535,9 +996,15 @@ def main() -> int:
         test_merge_and_history,
         test_not_found_wording,
         test_search,
+        test_verdict,
+        test_verdict_on_result,
+        test_search_terms,
+        test_search_every_message,
+        test_search_result,
         test_reader_writer_agree,
         test_build_sources,
         test_rendering,
+        test_localisation,
     ]
     for test in tests:
         try:

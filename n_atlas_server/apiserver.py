@@ -1,8 +1,8 @@
 """N-ATLaS OpenAI-compatible API server — standalone / Kaggle script.
 
 Starts the full stack: the N-ATLaS 4-bit engine from kaggleserver.py plus the
-FastAPI app, authentication and endpoints (Cells 8-10 of natlas_notebook.py),
-the NAFDAC greenbook lookup (Cell 17), and uvicorn bound to 0.0.0.0:8000 in a
+FastAPI app, authentication and endpoints (Cells 9-11 of natlas_notebook.py),
+the NAFDAC greenbook lookup (Cell 18), and uvicorn bound to 0.0.0.0:8000 in a
 background thread.
 
 Run it:
@@ -31,7 +31,7 @@ from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-# nafdac_source lives at the project root, one level up. Cell 17 imports it, so
+# nafdac_source lives at the project root, one level up. Cell 18 imports it, so
 # the root has to be importable before the cells are executed.
 sys.path.insert(0, str(HERE.parent))
 
@@ -39,7 +39,7 @@ import kaggleserver
 import notebook_cells
 
 _ENGINE = vars(kaggleserver)
-_API = notebook_cells.exec_range(8, 10, _ENGINE)
+_API = notebook_cells.exec_range(9, 11, _ENGINE)
 
 app = _API["app"]
 start_server = _API["start_server"]
@@ -48,10 +48,10 @@ is_server_running = _API["is_server_running"]
 serve_forever = _API["serve_forever"]
 CONFIG = _API["CONFIG"]
 
-# Cell 17 registers the NAFDAC routes and fills NAFDAC_HOOKS. It is executed
-# after Cells 8-10 because it needs the app those cells build, and it must run
+# Cell 18 registers the NAFDAC routes and fills NAFDAC_HOOKS. It is executed
+# after Cells 9-11 because it needs the app those cells build, and it must run
 # before the server starts so the routes exist when the first request arrives.
-_NAFDAC = notebook_cells.exec_range(17, 17, _API)
+_NAFDAC = notebook_cells.exec_range(18, 18, _API)
 
 nafdac_status = _NAFDAC.get("_nafdac_status")
 nafdac_available = bool(_NAFDAC.get("NAFDAC_AVAILABLE"))

@@ -4,12 +4,13 @@ Some people prefer a script over a .ipynb, and Kaggle also accepts a plain
 Python file. This runs the exact same cells as natlas_notebook.py — there is no
 second implementation.
 
-    python kaggle.py                    # all 16 cells, then exit
-    python kaggle.py --cells 1-7        # config + tokenizer + model + engine only
-    python kaggle.py --cells 1-10       # also builds and starts the API server
+    python kaggle.py                    # all 18 cells, then exit
+    python kaggle.py --cells 2-8        # config + tokenizer + model + engine only
+    python kaggle.py --cells 2-11       # also builds and starts the API server
     python kaggle.py --list             # show the cell map
 
-Cells are numbered 1-16 to match the notebook and the specification.
+Cells are numbered to match the notebook. The default range stops at Cell 18 on
+purpose: Cell 19 logs in and opens a tunnel, which blocks.
 """
 
 import argparse
@@ -29,8 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cells",
-        default="1-16",
-        help="cell range to run, 1-based inclusive (e.g. 1-7, 10, 1-16)",
+        default="1-18",
+        help="cell range to run, 1-based inclusive (e.g. 2-8, 11, 1-18)",
     )
     parser.add_argument(
         "--list",

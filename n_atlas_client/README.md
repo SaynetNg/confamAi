@@ -111,10 +111,57 @@ run from**, so run them from the project root to keep one history folder.
 | `/nafdac`  | Show which NAFDAC data sources are reachable  |
 | `/verify`  | Check one NAFDAC number (`/verify A4-100160`) |
 | `/search`  | Search products (`/search malaria`)           |
+| `/hausa`   | Pin every reply to Hausa                      |
+| `/yoruba`  | Pin every reply to Yoruba                     |
+| `/igbo`    | Pin every reply to Igbo                       |
+| `/english` | Pin every reply to English                    |
+| `/auto`    | Drop the pin; follow each message's language  |
+| `/langueage` | Show the current language mode              |
 | `/exit`    | Quit the client                               |
 
 `/verify`, `/search` and `/nafdac` are answered entirely on the laptop. They
 never reach the model, so they work with the server offline.
+
+## 5b. Language modes
+
+Each language is its own command, so the mode is one keystroke away:
+
+```
+/hausa        Language mode: Hausa. N-ATLaS will reply in Hausa until you switch...
+Báwo ni?      -> a reply in Hausa, not Yoruba
+/yoruba       Language mode: Yoruba...
+Sannu da yawa?  -> a reply in Yoruba, not Hausa
+/english      Language mode: English...
+/auto         Language mode: Auto. N-ATLaS will reply in the language of each message.
+```
+
+**The mode is a hard pin.** It is a choice about the *reply*, so it holds even
+when the next message is in another language: in Yoruba mode a Hausa message is
+still answered in Yoruba. The mode changes when you run another language
+command, never because of what you typed.
+
+`/auto` is the default and sends nothing at all, which is how the client has
+always behaved — the server reads each message and answers in the language it
+finds there.
+
+The mode reaches the server two ways at once: as the `language` field of the
+request, and as one directive line on the outgoing turn. A server that
+understands the field uses it as authoritative and skips its own detector; a
+server that does not ignore the unknown field (its request model is
+`extra="allow"`) and still reads the directive. Either build works, and
+switching modes never resets the conversation.
+
+The mode also sets the language of the local NAFDAC tables, so `/verify` prints
+Hausa labels when you are in Hausa mode. **Product data is never translated** —
+a product name, an applicant and an approval date are printed exactly as the
+greenbook holds them. Only labels, verdicts and sentences change.
+
+| Setting            | Default | Meaning                                    |
+|--------------------|---------|--------------------------------------------|
+| `N_ATLAS_LANGUAGE` | `auto`  | Starting mode: `auto`, `en`, `ha`, `yo`, `ig` |
+
+In `auto`, local NAFDAC output is English, since there is no mode to localise
+to. The model's own reply still follows the message.
 
 ## 6. Example multilingual conversation
 
@@ -136,7 +183,12 @@ Assistant: (English reply)
 ```
 
 The client never resets history when the language switches — you can switch
-between English, Hausa, Igbo and Yoruba freely in one conversation.
+between English, Hausa, Igbo and Yoruba freely in one conversation, and you can
+pin a mode with `/hausa` and change your mind later without losing anything.
+
+In `auto` (the default) the model follows the language of each message, so
+"explain this in English" is not needed. `/hausa` and friends are for when you
+want every reply in one language regardless of what you type.
 
 ## 7. Conversation memory and context
 
@@ -325,6 +377,7 @@ confamAi/
 │   ├── main.py                      # entry point
 │   ├── config.py                    # configuration
 │   ├── api.py                       # NAtlasClient (API client)
+│   ├── language.py                  # /hausa /yoruba /igbo /english /auto modes
 │   ├── nafdac.py                    # NAFDAC interception for chat
 │   ├── nafdac_source.py             # locates the shared nafdac_source
 │   ├── conversation.py              # local memory + context trimming
@@ -345,13 +398,13 @@ confamAi/
 │   ├── schema.sql                   # the PostgreSQL schema
 │   ├── load_postgres.py             # CSV -> PostgreSQL loader
 │   ├── verify_postgres.py           # checks the database path
-│   ├── tests.py                     # 109 checks, no network needed
+│   ├── tests.py                     # 222 checks, no network needed
 │   └── requirements.txt
 ├── n_atlas_server/                  # the Kaggle half
 │   ├── readme.md
 │   ├── natlas_notebook.py           # single source of truth (17 cells)
 │   ├── natlas_kaggle.ipynb          # build artefact — upload this to Kaggle
-│   ├── verify_nafdac.py             # checks Cell 17 without a GPU
+│   ├── verify_nafdac.py             # checks Cell 18 without a GPU
 │   ├── requirements.txt
 │   └── kaggleserver.py, apiserver.py, kaggle.py, ...
 ├── nafdac_scraper/                  # where the greenbook data comes from

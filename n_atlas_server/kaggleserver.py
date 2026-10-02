@@ -2,7 +2,7 @@
 
 Loads the N-ATLaS tokenizer, the 4-bit NF4 model, the system prompt, the
 generation engine, the response cleaner and the conversation/context manager
-(Cells 1-7 of natlas_notebook.py). No HTTP server is started here.
+(Cells 2-8 of natlas_notebook.py). No HTTP server is started here.
 
 Run it directly for a smoke test:
 
@@ -22,10 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import notebook_cells
 
-_ENGINE = notebook_cells.exec_range(1, 7, globals())
+_ENGINE = notebook_cells.exec_range(1, 8, globals())
 
 # Re-bound explicitly so this module's public surface is greppable and static
-# analysis can see it. Cell 4 loads the model, so importing this module loads it.
+# analysis can see it. Cell 5 loads the model, so importing this module loads it.
 CONFIG = _ENGINE["CONFIG"]
 GPU = _ENGINE["GPU"]
 DEVICE = _ENGINE["DEVICE"]

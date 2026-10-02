@@ -26,6 +26,7 @@ import argparse
 import csv
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -102,11 +103,30 @@ _INT_COLUMNS = frozenset(
 
 
 def _safe_date(value: str) -> Optional[str]:
+    """A date or timestamp PostgreSQL will accept, or None.
+
+    The scraper emits a year-1 sentinel wherever a timestamp was missing, which
+    serialises as '-000001-11-30T00:00:00.000000Z' -- datetime.min pushed
+    through the proleptic Gregorian calendar. PostgreSQL rejects it, and because
+    one poisoned row aborts a whole 500-row batch, 2,211 of the 8,930 greenbook
+    rows were enough to stop the load dead and force a per-row retry that took
+    fifteen minutes to write nothing.
+
+    Anything empty, unparseable or out of range becomes NULL, which is what the
+    note above _DATE_COLUMNS promises. Valid values are passed through
+    untouched so PostgreSQL, not this function, decides what it accepts.
+    """
     text = (value or "").strip()
-    if not text:
+    if not text or text.lower() in {"none", "nan", "null", "nat"}:
         return None
-    # The greenbook writes ISO dates; anything else is left to PostgreSQL,
-    # which raises on a bad value and is caught per row by the caller.
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # PostgreSQL's timestamp range starts at 4713 BC, but anything before year
+    # 1000 in this data is a sentinel rather than a real approval date.
+    if parsed.year < 1000:
+        return None
     return text
 
 
@@ -116,7 +136,7 @@ def _row_values(record) -> List[Any]:
     for column in _COLUMNS:
         if column == "nrn_key":
             values.append(record.nrn_key)
-        elif column in _DATE_COLUMNS:
+        elif column in _DATE_COLUMNS or column in _TIMESTAMP_COLUMNS:
             values.append(_safe_date(record.field(column)))
         elif column in _INT_COLUMNS:
             values.append(getattr(record, column, None))
@@ -244,7 +264,12 @@ def load(
     Loaded rows that were not in the table before are counted as new, and rows
     that have disappeared from the CSV are moved to history.
     """
-    placeholders = ", ".join(["%s"] * len(_COLUMNS))
+    # The parentheses are load-bearing, not decoration. Without them psycopg3
+    # cannot split the parameter list out of `VALUES %s, %s`, so it sends the
+    # statement through the simple query protocol where $1 is literal text and
+    # PostgreSQL answers `syntax error at or near "$1"`. Measured on this
+    # project: `VALUES (%s, %s)` succeeds, `VALUES %s, %s` always fails.
+    placeholders = "(" + ", ".join(["%s"] * len(_COLUMNS)) + ")"
     columns = ", ".join(_COLUMNS)
 
     with connection.cursor() as cursor:

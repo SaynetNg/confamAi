@@ -112,12 +112,113 @@ _LOOKUP_VERBS = (
 
 
 def fold(text: str) -> str:
-    """Lowercase and strip diacritics so 'NAFDAC' and 'nafdac' both match."""
+    """Lowercase and strip diacritics so 'NAFDAC' and 'nafdac' both match.
+
+    Also the reason `Báwo` and `Bawo`, or `ọdụ` and `odu`, reach the same
+    entry: a user typing without diacritics is not typing a different word.
+    """
     if not text:
         return ""
     decomposed = unicodedata.normalize("NFD", str(text)).lower()
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return unicodedata.normalize("NFC", stripped)
+
+
+# Nouns that mean a medicine, a drug or a packaged product. These widen the
+# trigger beyond the word NAFDAC so a user who asks "is this malaria tablet
+# genuine?" in their own language reaches the greenbook at all.
+#
+# Written in the languages' own orthography, then folded at import time.
+# `fold()` strips diacritics, so `ọdụ` is matched as `odu` and a user who types
+# either form hits the same entry.
+#
+# Kept deliberately short and high-precision. A loose word like Yoruba `ewu`
+# (bag) or `ikun` (rope) would fire on unrelated conversation, and a trigger
+# that fires on ordinary chat is worse than no trigger at all, because every
+# ordinary message would then cost a greenbook lookup.
+_MULTILINGUAL_PRODUCT_NOUNS = (
+    # English
+    "drug",
+    "drugs",
+    "medicine",
+    "medicines",
+    "medication",
+    "medications",
+    "tablet",
+    "tablets",
+    "capsule",
+    "capsules",
+    # Hausa
+    "magari",
+    "kwayoyi",
+    "ruwan tabo",
+    # Yoruba
+    "oro",
+    "oogun",
+    "abọ",
+    "ojú",
+    # Igbo
+    "ọdụ",
+    "ọdọ",
+    "nwanwị",
+    "ụdụ",
+)
+
+
+_WORD = re.compile(r"[a-z0-9]+")
+_FOLDED_PRODUCT_NOUNS = frozenset(
+    fold(word) for word in _MULTILINGUAL_PRODUCT_NOUNS
+)
+
+
+def _tokens(text: str) -> List[str]:
+    """Word-split a folded string, so short tokens cannot match inside words."""
+    return _WORD.findall(fold(text))
+
+
+def extract_search_terms(text: str, max_terms: int = 3) -> List[str]:
+    """Pull greenbook search terms out of free text.
+
+    Returns a list, most distinctive first, and an empty list when nothing
+    usable is left — the caller's signal not to search at all.
+
+    A list rather than one joined string because the greenbook is ranked by
+    substring match: joining "paracetamol syrup" into a single needle would match
+    nothing, since no product name contains that exact pair. The terms are
+    matched independently and the best hit wins.
+
+    The greenbook indexes English product names, ingredients and applicants, so
+    this deliberately returns plain terms. A Yoruba or Igbo message is expected
+    to have been translated by the model, which knows the language, before it
+    reaches this function.
+
+    Stop words are dropped and the longest terms are kept, because a greenbook
+    name is specific ("Spironolactone") while the sentence around it is not.
+    """
+    folded = fold(text)
+    if not folded:
+        return []
+
+    # An NRN in the text is a far better query than any word around it.
+    nrn = extract_nrn(text)
+    if nrn:
+        return [nrn]
+
+    tokens = _tokens(folded)
+    terms = [
+        token
+        for token in tokens
+        if len(token) >= _MIN_QUERY_TERM and token not in _QUERY_STOPWORDS
+    ]
+    if not terms:
+        return []
+
+    # Longest first, so a distinctive multi-word drug name beats the short
+    # filler around it. dict.fromkeys de-duplicates while keeping first-seen
+    # order, which matters because the original order is the user's emphasis.
+    unique = list(dict.fromkeys(terms))
+    ordered = sorted(unique, key=lambda token: -len(token))
+    return ordered[: max(1, max_terms)]
 
 
 def looks_like_nrn(value: str) -> bool:
@@ -272,3 +373,47 @@ def mentions_nafdac(text: str) -> bool:
     has_verb = any(verb in folded for verb in _LOOKUP_VERBS)
     has_number = bool(EXTRACTION_PATTERN.search(folded) or _BARE_DIGITS.search(folded))
     return has_verb and has_number
+
+
+# Words that carry no product meaning and would otherwise end up as the search
+# query. English filler plus the local function words that crowd out a real
+# product name.
+_BASE_STOPWORDS = frozenset(
+    {
+        # English
+        "a", "an", "the", "this", "that", "these", "those", "is", "it", "are",
+        "am", "was", "were", "be", "been", "do", "does", "did", "can", "could",
+        "will", "would", "should", "have", "has", "had", "please", "want", "need",
+        "know", "tell", "help", "check", "verify", "genuine", "real", "original",
+        "fake", "safe", "use", "used", "using", "buy", "bought", "get", "got",
+        "any", "some", "about", "for", "from", "with", "me", "my", "i",
+        "you", "your", "and", "or", "not", "no", "yes", "of", "in", "on", "at",
+        "to", "so", "if", "then", "what", "which", "who", "how", "when", "where",
+        "why", "there", "here", "pack", "packet", "box", "nafdac", "greenbook",
+        # Hausa
+        "wannan", "wancan", "shi", "ita", "su", "mu", "ku", "na", "ta", "ba",
+        "tafi", "yana", "yake", "ina", "don", "kane", "kanwa", "ina", "san",
+        "saboda", "tunda", "yanzu", "gaske", "gaskiya",
+        # Yoruba
+        "nibii", "mo", "ko", "ati", "ibi", "yen", "won", "wonii", "ti", "si",
+        "fun", "pelu", "lati", "ati", "julo", "jo", "kini", "se", "ba",
+        # Igbo
+        "maka", "mgbe", "ndi", "gi", "ka", "nwa", "onye", "nke", "a", "na",
+        "ya", "ha", "m", "di", "ga", "ere",
+    }
+)
+
+# Minimum length for a search term. One or two letter fragments produce
+# nonsense matches against 8930 rows.
+_MIN_QUERY_TERM = 3
+
+# The product nouns are deliberately NOT stop words. `magari`, `oro` and `odu`
+# are the most useful search terms a local-language message can offer, because
+# they are often the only product-related word the user typed. Subtracting the
+# noun set here rather than hand-editing it below means a noun added to
+# `_MULTILINGUAL_PRODUCT_NOUNS` can never be silently swallowed by this list.
+#
+# The authenticity words (`genuine`, `to`, `eziokwu`) stay in, because they
+# describe the question rather than the product and match nothing in the
+# greenbook.
+_QUERY_STOPWORDS = _BASE_STOPWORDS - _FOLDED_PRODUCT_NOUNS

@@ -58,6 +58,13 @@ class Config:
     temperature: float = 0.7      # N_ATLAS_TEMPERATURE
     stream: bool = True           # N_ATLAS_STREAM     (auto-fallback)
 
+    # --- language --------------------------------------------------------
+    # One of auto, en, ha, yo, ig. `auto` sends nothing and lets the server
+    # detect the language of each message, which is how the client has always
+    # behaved. A code pins every reply to that language until /hausa, /yoruba,
+    # /igbo, /english or /auto changes it. See language.py.
+    language: str = "auto"       # N_ATLAS_LANGUAGE
+
     # --- client-side context management ---------------------------------
     max_conversation_messages: int = 40   # N_ATLAS_MAX_CONVERSATION_MESSAGES
     max_conversation_tokens: int = 3500   # N_ATLAS_MAX_CONVERSATION_TOKENS
@@ -85,6 +92,15 @@ class Config:
     nafdac_xlsx_path: str = ""           # NAFDAC_XLSX_PATH
     nafdac_show_data: bool = True        # NAFDAC_SHOW_DATA
     nafdac_max_search_results: int = 10  # NAFDAC_MAX_SEARCH_RESULTS
+
+    # The server is the authoritative NAFDAC layer: it extracts intent, applies
+    # the intent gate and only then queries the greenbook. When this is on, the
+    # client never searches locally on its own initiative, because a second
+    # retrieval authority would decide for itself that a message was about a
+    # product — the exact failure the server's gate exists to prevent. Local data
+    # is still used as a fallback when no server is reachable, and on explicit
+    # commands like /verify, which are the user asking directly.
+    nafdac_server_authoritative: bool = True  # NAFDAC_SERVER_AUTHORITATIVE
 
     # --- diagnostics ------------------------------------------------------
     debug: bool = False           # --debug flag
@@ -132,6 +148,7 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
         max_tokens=max(1, _env_int("N_ATLAS_MAX_TOKENS", 512)),
         temperature=_env_float("N_ATLAS_TEMPERATURE", 0.7),
         stream=_env_bool("N_ATLAS_STREAM", True),
+        language=_env_str("N_ATLAS_LANGUAGE", "auto") or "auto",
         max_conversation_messages=max(4, _env_int("N_ATLAS_MAX_CONVERSATION_MESSAGES", 40)),
         max_conversation_tokens=max(256, _env_int("N_ATLAS_MAX_CONVERSATION_TOKENS", 3500)),
         max_message_chars=max(256, _env_int("N_ATLAS_MAX_MESSAGE_CHARS", 6000)),
@@ -145,6 +162,9 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
         nafdac_xlsx_path=_env_str("NAFDAC_XLSX_PATH"),
         nafdac_show_data=_env_bool("NAFDAC_SHOW_DATA", True),
         nafdac_max_search_results=max(1, _env_int("NAFDAC_MAX_SEARCH_RESULTS", 10)),
+        nafdac_server_authoritative=_env_bool(
+            "NAFDAC_SERVER_AUTHORITATIVE", True
+        ),
         debug=debug,
     )
 

@@ -1,6 +1,6 @@
 """Offline test doubles for the N-ATLaS Kaggle notebook.
 
-These stubs let the full notebook (Cells 1-16) run on a CPU-only laptop so the
+These stubs let the full notebook (Cells 2-17) run on a CPU-only laptop so the
 FastAPI layer, auth, schema validation, context budgeting, response cleaning,
 error mapping and the generation lock can be verified without a T4.
 

@@ -18,7 +18,7 @@ if nb.get("nbformat") != 4:
 if "accelerator" not in json.dumps(nb.get("metadata", {})):
     problems.append("GPU accelerator metadata missing")
 
-EXPECTED_CODE_CELLS = 17  # Cells 1-16 plus Cell 17, the NAFDAC greenbook cell.
+EXPECTED_CODE_CELLS = 19  # Cell 1 credentials, Cells 2-17, Cell 18 NAFDAC, Cell 19 tunnel.
 
 code_cells = [c for c in nb["cells"] if c["cell_type"] == "code"]
 if len(code_cells) != EXPECTED_CODE_CELLS:

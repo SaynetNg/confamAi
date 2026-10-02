@@ -97,7 +97,7 @@ if NAFDAC_AVAILABLE:
         a product name or an approval date from memory.
         """
 
-        def __init__(self, cfg, debug=False):
+        def __init__(self, cfg, debug=False, language=None):
             self.cfg = cfg
             self.debug = bool(getattr(cfg, "debug", False) or debug)
             self.enabled = bool(getattr(cfg, "nafdac_enabled", True))
@@ -107,6 +107,21 @@ if NAFDAC_AVAILABLE:
             )
             self._sources = None
             self.last_result = None
+            # A zero-argument callable returning the current language code, so
+            # /hausa changes the language these tables print in without
+            # rebuilding the interceptor and re-reading the greenbook.
+            self._language_code = language or (lambda: "en")
+
+        def _lang(self):
+            """The current language code, or English if the holder misbehaves.
+
+            A broken language holder must never be the reason a greenbook
+            lookup fails, so an exception here degrades to the default.
+            """
+            try:
+                return str(self._language_code() or "en")
+            except Exception:
+                return "en"
 
         def _get_sources(self):
             """Build the source list on first use, then reuse it."""
@@ -127,7 +142,7 @@ if NAFDAC_AVAILABLE:
         def status(self):
             from nafdac_source.formatting import format_status
 
-            return format_status(self._get_sources())
+            return format_status(self._get_sources(), lang=self._lang())
 
         def looks_like_lookup(self, message):
             """True when this message should be verified rather than just sent on.
@@ -177,28 +192,44 @@ if NAFDAC_AVAILABLE:
             """Handle `/verify <nrn>`, answered entirely on this laptop."""
             argument = (argument or "").strip()
             if not argument:
-                return "Usage: /verify <nafdac number>   e.g. /verify A4-100160"
-            from nafdac_source.formatting import format_verification
+                from nafdac_source.formatting import format_usage_verification
+
+                return format_usage_verification(self._lang())
+            from nafdac_source.formatting import (
+                format_no_number_found,
+                format_verification,
+            )
 
             result = self.verify(argument)
             if not result or not result.searched:
-                return (
-                    "No NAFDAC number found in that. It looks like A4-100160 or "
-                    "04-3877 — the number NAFDAC printed on the pack."
-                )
-            return format_verification(result, show_data=self.show_data)
+                return format_no_number_found(self._lang())
+            return format_verification(
+                result, show_data=self.show_data, lang=self._lang()
+            )
 
         def search_command(self, argument):
             """Handle `/search <text>`, a free-text greenbook search."""
             argument = (argument or "").strip()
             if not argument:
-                return "Usage: /search <text>   e.g. /search malaria"
+                from nafdac_source.formatting import format_usage_search
+
+                return format_usage_search(self._lang())
             from nafdac_source.formatting import format_search_results
 
             records = search_products(
                 argument, sources=self._get_sources(), limit=self.max_results
             )
-            return format_search_results(records, argument, limit=self.max_results)
+            return format_search_results(
+                records, argument, limit=self.max_results, lang=self._lang()
+            )
+
+        def help_text(self):
+            try:
+                from nafdac_source.formatting import nafdac_help
+
+                return nafdac_help(self._lang())
+            except Exception:
+                return "NAFDAC verification"
 
         def context_for(self, message, result):
             """The block handed to N-ATLaS as context for this turn.
@@ -234,6 +265,9 @@ else:  # pragma: no cover - only when the greenbook package is missing
             self.cfg = cfg
             self.debug = debug
 
+        def _lang(self):
+            return "en"
+
         def _get_sources(self):
             return []
 
@@ -267,6 +301,220 @@ else:  # pragma: no cover - only when the greenbook package is missing
             return ""
 
 # ----------------------------------------------------------------------
+# LANGUAGE MODES
+# ----------------------------------------------------------------------
+# The modular package keeps this in n_atlas_client/language.py; it is inlined
+# here because this file imports nothing from the package.
+#
+#     /hausa  /yoruba  /igbo  /english  /auto  /langueage
+#
+# A pinned mode is a hard pin, not a suggestion: in Yoruba mode a Hausa
+# message is answered in Yoruba, because the mode is the user's choice about
+# the reply. It changes only when one of the commands above is run.
+#
+# The mode reaches the server two ways, and both are always sent: as the
+# `language` field of the request, which a patched server honours and an
+# unpatched one ignores (its ChatCompletionRequest is `extra="allow"`), and as
+# a directive line on the outgoing turn, which any server reads.
+#
+# There is deliberately no language detector here. The server has a good one
+# and a second copy would only be a second thing to keep in step with it.
+LANGUAGE_AUTO = "auto"
+
+LANGUAGE_NAMES = {
+    LANGUAGE_AUTO: "Auto",
+    "en": "English",
+    "ha": "Hausa",
+    "yo": "Yoruba",
+    "ig": "Igbo",
+}
+
+LANGUAGE_MODE_ORDER = ("ha", "yo", "ig", "en", LANGUAGE_AUTO)
+
+LANGUAGE_COMMANDS_BY_MODE = {
+    "ha": "hausa",
+    "yo": "yoruba",
+    "ig": "igbo",
+    "en": "english",
+    LANGUAGE_AUTO: "auto",
+}
+
+# Command word -> mode code. An empty code means "show the current mode"
+# without setting one.
+LANGUAGE_COMMANDS = {
+    "hausa": "ha",
+    "yoruba": "yo",
+    "igbo": "ig",
+    "english": "en",
+    "auto": LANGUAGE_AUTO,
+    "langueage": "",
+    "language": "",
+    "lang": "",
+}
+
+# Both the two-letter code and the full name resolve to the same mode, so a
+# caller passing "yoruba" and one passing "yo" cannot disagree. Local names are
+# here too, because the person choosing the language may be typing in it.
+LANGUAGE_SYNONYMS = {
+    "en": "en", "english": "en",
+    "ha": "ha", "hausa": "ha", "harshe": "ha", "sauraya": "ha",
+    "yo": "yo", "yoruba": "yo", "yebu": "yo", "ede yoruba": "yo",
+    "ig": "ig", "igbo": "ig", "ahukeri": "ig",
+    LANGUAGE_AUTO: LANGUAGE_AUTO, "automatic": LANGUAGE_AUTO, "follow": LANGUAGE_AUTO,
+}
+
+LANGUAGE_DIRECTIVE = (
+    "[language] LANGUAGE MODE: {name}. The user set it with /{command} and "
+    "every reply must be in {name}, even when the message is written in "
+    "another language. Write the entire reply in {name} and do not use "
+    "{others}. Keep names, numbers, dates and product data exactly as given, "
+    "and ignore automatic language detection for this turn."
+)
+
+# The /hausa family of commands is answered on the laptop, so this is the one
+# place the client itself speaks four languages, and the wording has to be
+# right without a model to check it.
+LANGUAGE_UI = {
+    "en": {
+        "title": "Language mode",
+        "current": "Now replying in {name}.",
+        "confirm": "Language mode: {name}. N-ATLaS will reply in {name} until "
+                   "you switch with another language command.",
+        "auto_confirm": "Language mode: Auto. N-ATLaS will reply in the "
+                        "language of each message.",
+        "hint": "/hausa  /yoruba  /igbo  /english  /auto",
+    },
+    "ha": {
+        "title": "Yanin harshen",
+        "current": "Ana amsa cikin {name} a yanzu.",
+        "confirm": "An saita harshen: {name}. Za a amsa cikin {name} har sai "
+                   "ka canza shi da umarni harshen nan.",
+        "auto_confirm": "An saita harshen: Auto. Za a amsa cikin yaren da kake "
+                        "yi a kowane sauri.",
+        "hint": "/hausa  /yoruba  /igbo  /english  /auto",
+    },
+    "yo": {
+        "title": "Èdè tí a ṣe tàn",
+        "current": "À ń dá ọjọ́ nínú {name} ní báyìí.",
+        "confirm": "A ṣètò èdè: {name}. A ó dá gbogbo ìdáhùn nínú {name} títí "
+                   "o yí padà pẹ̀lú àṣà èdè mìíràn.",
+        "auto_confirm": "A ṣètò èdè: Auto. A ó dá ọjọ́ nínú èdè tí o bá ń lò "
+                        "fún gbogbo ìbéèrè.",
+        "hint": "/hausa  /yoruba  /igbo  /english  /auto",
+    },
+    "ig": {
+        "title": "Ụdọ akabọọga",
+        "current": "Anyị na-ezighata na {name} ugbu a.",
+        "confirm": "Agbanyela ụdọ akabọọga: {name}. N-ATLaS ga-ezighata na "
+                   "{name} ruo mgbe ị gbanwee ụdọ site na nzọọụta ọzọ.",
+        "auto_confirm": "Agbanyela ụdọ akabọọga: Akpọcha. N-ATLaS ga-ezighata "
+                        "na ụdọ ọ na-eme maka ihe ọ bụla.",
+        "hint": "/hausa  /yoruba  /igbo  /english  /auto",
+    },
+}
+
+
+def normalize_language(mode):
+    """The mode, or auto. Anything unrecognised is not a mode."""
+    key = str(mode or "").strip().lower()
+    if key in LANGUAGE_NAMES:
+        return key
+    return LANGUAGE_SYNONYMS.get(key, LANGUAGE_AUTO)
+
+
+def language_directive_for(mode):
+    """The line added to each outgoing turn. Empty in auto."""
+    code = normalize_language(mode)
+    if code == LANGUAGE_AUTO:
+        return ""
+    others = ", ".join(
+        name for other, name in LANGUAGE_NAMES.items()
+        if other != LANGUAGE_AUTO and other != code
+    )
+    return LANGUAGE_DIRECTIVE.format(
+        name=LANGUAGE_NAMES[code],
+        command=LANGUAGE_COMMANDS_BY_MODE[code],
+        others=others,
+    )
+
+
+class LanguageSwitcher:
+    """Holds the mode and answers the /hausa family of commands on the laptop."""
+
+    def __init__(self, cfg=None, debug=False):
+        self.debug = bool(debug or getattr(cfg, "debug", False))
+        self.configured = getattr(cfg, "language", LANGUAGE_AUTO) or LANGUAGE_AUTO
+        self.mode = normalize_language(self.configured)
+        if self.debug and self.configured and self.mode == LANGUAGE_AUTO:
+            print("[debug] N_ATLAS_LANGUAGE=%r is not a language; using auto."
+                  % (self.configured,), flush=True)
+
+    @property
+    def pinned(self):
+        return self.mode != LANGUAGE_AUTO
+
+    def label(self):
+        return LANGUAGE_NAMES[self.mode]
+
+    def code(self):
+        """The code for the request body, and for local output rendering.
+
+        Auto renders local NAFDAC output in English: with no mode there is
+        nothing to localise to, and a deterministic table beats a guess.
+        """
+        return "en" if self.mode == LANGUAGE_AUTO else self.mode
+
+    def _t(self, key, **kwargs):
+        table = LANGUAGE_UI.get(self.mode) or LANGUAGE_UI["en"]
+        return table[key].format(**kwargs)
+
+    def set(self, mode):
+        """Handle /hausa, /yoruba, /igbo, /english and /auto."""
+        self.mode = normalize_language(mode)
+        if self.debug:
+            print("[debug] language mode = %s" % self.mode, flush=True)
+        if self.mode == LANGUAGE_AUTO:
+            return self._t("auto_confirm")
+        return self._t("confirm", name=LANGUAGE_NAMES[self.mode])
+
+    def command(self, code):
+        """Handle one language command; an empty code just shows the mode."""
+        if not code:
+            return self.menu()
+        return self.set(code)
+
+    def menu(self):
+        lines = [self._t("title")]
+        for mode in LANGUAGE_MODE_ORDER:
+            marker = "*" if mode == self.mode else " "
+            lines.append("  %s %s" % (marker, LANGUAGE_NAMES[mode]))
+        lines.append("")
+        lines.append(self._t("current", name=self.label()))
+        lines.append(self._t("hint"))
+        return "\n".join(lines)
+
+    def context_for(self, message=""):
+        """The line added to this turn. Empty in auto, always.
+
+        `message` is accepted and ignored on purpose: a pin does not care what
+        language the message is in, which is the whole point of it.
+        """
+        directive = language_directive_for(self.mode)
+        if self.debug:
+            print("[debug] language mode=%s directive=%s"
+                  % (self.mode, bool(directive)), flush=True)
+        return directive
+
+    def request_language(self):
+        """The value for the request body: the code, or None in auto.
+
+        None rather than "auto" so an auto request is byte-identical to what
+        the client sent before language modes existed.
+        """
+        return None if self.mode == LANGUAGE_AUTO else self.mode
+
+
+# ----------------------------------------------------------------------
 # Configuration (all from env / .env, nothing hard-coded)
 # ----------------------------------------------------------------------
 DEFAULTS = {
@@ -277,6 +525,7 @@ DEFAULTS = {
     "N_ATLAS_MAX_TOKENS": 512,
     "N_ATLAS_TEMPERATURE": 0.7,
     "N_ATLAS_STREAM": True,
+    "N_ATLAS_LANGUAGE": "auto",
     "N_ATLAS_MAX_CONVERSATION_MESSAGES": 40,
     "N_ATLAS_MAX_CONVERSATION_TOKENS": 3500,
     "N_ATLAS_MAX_MESSAGE_CHARS": 6000,
@@ -330,6 +579,7 @@ class Config:
         self.max_tokens = max(1, int(float(resolved["N_ATLAS_MAX_TOKENS"])))
         self.temperature = float(resolved["N_ATLAS_TEMPERATURE"])
         self.stream = self._bool(resolved["N_ATLAS_STREAM"], True)
+        self.language = str(resolved["N_ATLAS_LANGUAGE"] or "auto").strip()
         self.max_conversation_messages = max(
             4, int(float(resolved["N_ATLAS_MAX_CONVERSATION_MESSAGES"]))
         )
@@ -635,6 +885,29 @@ class NAtlasClient:
         self.model_available = False
         # Built on first NAFDAC use; see _nafdac().
         self._nafdac_interceptor = None
+        # Built on first language use; see _language().
+        self._language_switcher = None
+
+    # -- language modes ---------------------------------------------------
+    def _language(self):
+        """The mode holder, built once on first use.
+
+        Also handed to the NAFDAC interceptor, so /hausa changes the language
+        the greenbook tables print in without rebuilding anything.
+        """
+        if self._language_switcher is None:
+            self._language_switcher = LanguageSwitcher(self.cfg, self.debug)
+        return self._language_switcher
+
+    def set_language(self, mode):
+        """Pin a language mode and return the confirmation to print."""
+        return self._language().set(mode)
+
+    def language_menu(self):
+        return self._language().menu()
+
+    def language_label(self):
+        return self._language().label()
 
     # -- NAFDAC verification --------------------------------------------
     def _nafdac(self):
@@ -644,7 +917,9 @@ class NAtlasClient:
         a user who never asks about a product should not pay for either.
         """
         if self._nafdac_interceptor is None:
-            self._nafdac_interceptor = NafdacInterceptor(self.cfg, self.debug)
+            self._nafdac_interceptor = NafdacInterceptor(
+                self.cfg, self.debug, language=self._language().code
+            )
         return self._nafdac_interceptor
 
     def verify_nafdac(self, nrn):
@@ -766,8 +1041,10 @@ class NAtlasClient:
             # reply in the user's language from those facts, so the product
             # data is never invented.
             nafdac_context = self._nafdac_context(message)
-            if nafdac_context:
-                message = "%s\n\n%s" % (message, nafdac_context)
+            language_context = self._language().context_for(message)
+            for block in (nafdac_context, language_context):
+                if block:
+                    message = "%s\n\n%s" % (message, block)
             payload_messages = self.conversation.build_messages_for(message)
         use_stream = self.cfg.stream if stream is None else stream
         attempts = 0
@@ -807,6 +1084,13 @@ class NAtlasClient:
             max_tokens=self.cfg.max_tokens,
             temperature=self.cfg.temperature,
         )
+        # The pinned language travels as a request field. A patched server treats
+        # it as authoritative and skips its own detector for this turn; an
+        # unpatched server ignores it, because ChatCompletionRequest is
+        # `extra="allow"`, and the directive on the turn covers that case.
+        language = self._language().request_language()
+        if language:
+            request_kwargs["extra_body"] = {"language": language}
         try:
             if use_stream:
                 try:
@@ -1126,7 +1410,11 @@ def print_banner(client):
     print("Model:  %s" % (info.get("served_model_name") or info.get("model") or client.cfg.model))
     print("Remote GPU: %s" % (gpu or "not reported"))
     print("")
-    print("Languages: English | Hausa | Igbo | Yoruba")
+    mode = client._language()
+    print("Language: %s%s" % (
+        mode.label(),
+        "   (/hausa /yoruba /igbo /english /auto to change)" if mode.pinned else "",
+    ))
     print("")
     if getattr(client.cfg, "nafdac_enabled", False) and NAFDAC_AVAILABLE:
         print("NAFDAC verification: ON")
@@ -1147,12 +1435,21 @@ def print_help_text(client=None):
         "  /nafdac  Show which NAFDAC data sources are available",
         "  /verify  Check one NAFDAC number   (/verify A4-100160)",
         "  /search  Search products           (/search malaria)",
+        "  /hausa   Reply in Hausa from now on",
+        "  /yoruba  Reply in Yoruba from now on",
+        "  /igbo    Reply in Igbo from now on",
+        "  /english Reply in English from now on",
+        "  /auto    Follow the language of each message",
+        "  /langueage  Show the current language mode",
         "  /exit    Exit the client",
         "",
         "Anything else is sent to N-ATLaS.",
         "",
-        "The model replies naturally in English, Hausa, Igbo or Yoruba and",
-        "follows your language switches — no reset needed.",
+        "The model replies in English, Hausa, Igbo or Yoruba and follows your",
+        "language switches without resetting the conversation.",
+        "",
+        "A language command pins the reply, so it holds even if the next",
+        "message is in another language. /auto hands the choice back.",
     ]
     if client is not None and NAFDAC_AVAILABLE:
         if getattr(client.cfg, "nafdac_enabled", False):
@@ -1233,8 +1530,12 @@ def run_repl(client):
                 print("An unexpected error occurred: %s" % exc)
 
     while True:
+        mode = client._language()
+        # The pinned mode is shown in the prompt, because a hard pin is
+        # otherwise invisible until a reply comes back in the wrong language.
+        prompt = "\nYou [%s]: " % mode.label() if mode.pinned else "\nYou: "
         try:
-            user_input = input("You: ").strip()
+            user_input = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             print("Bye! Kar ka dawo — jiya ma'aikata. See you next time.")
@@ -1276,6 +1577,10 @@ def run_repl(client):
             if command == "exit":
                 print("Bye!")
                 break
+            if command in LANGUAGE_COMMANDS:
+                # `/hausa` and friends pin the mode; `/langueage` only shows it.
+                print(mode.command(LANGUAGE_COMMANDS[command]))
+                continue
             print("Unknown command: /%s. Type /help for commands." % command)
             continue
 
@@ -1422,6 +1727,56 @@ def run_tests(cfg):
     ]
     for label, prompt in language_cases:
         chat_test(label, prompt)
+
+    # -- language modes (no network) --
+    switcher = LanguageSwitcher(cfg, debug=False)
+    results.record(
+        "language: a fresh client starts in auto",
+        switcher.mode == LANGUAGE_AUTO,
+        "mode=%s" % switcher.mode,
+    )
+    results.record(
+        "language: auto sends no directive and no field",
+        switcher.context_for("Báwo ni?") == ""
+        and switcher.request_language() is None,
+    )
+    for command, expected in [
+        ("hausa", "ha"), ("yoruba", "yo"), ("igbo", "ig"), ("english", "en"),
+    ]:
+        switcher.set(command)
+        directive = switcher.context_for("How are you?")
+        results.record(
+            "language: /%s pins %s" % (command, LANGUAGE_NAMES[expected]),
+            switcher.mode == expected
+            and switcher.request_language() == expected
+            and LANGUAGE_NAMES[expected] in directive,
+        )
+    results.record(
+        "language: a pin holds against a message in another language",
+        "even when the message is written in another language"
+        in language_directive_for("ha"),
+    )
+    results.record(
+        "language: every command spelling is accepted",
+        all(
+            LANGUAGE_COMMANDS[word] == code
+            for word, code in [
+                ("hausa", "ha"), ("yoruba", "yo"),
+                ("igbo", "ig"), ("english", "en"), ("auto", LANGUAGE_AUTO),
+            ]
+        ),
+    )
+
+    # -- a pinned mode holds --
+    # Each mode is asked an English question on purpose: a mode that only
+    # followed the message would pass the block above and fail this one.
+    for command, label in [
+        ("hausa", "Hausa"), ("yoruba", "Yoruba"),
+        ("igbo", "Igbo"), ("english", "English"),
+    ]:
+        client.set_language(command)
+        chat_test("%s mode" % label, "How are you? Tell me about yourself.")
+    client.set_language("auto")
 
     # -- conversation memory --
     client.clear_conversation()

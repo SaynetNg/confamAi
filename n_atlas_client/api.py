@@ -126,6 +126,8 @@ class NAtlasClient:
         self.model_available = False
         # Built on first NAFDAC use; see _nafdac().
         self._nafdac_interceptor = None
+        # Built on first language use; see _language().
+        self._language_switcher = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -215,8 +217,22 @@ class NAtlasClient:
         if getattr(self, "_nafdac_interceptor", None) is None:
             from .nafdac import NafdacInterceptor
 
-            self._nafdac_interceptor = NafdacInterceptor(self.cfg, self.debug)
+            self._nafdac_interceptor = NafdacInterceptor(
+                self.cfg, self.debug, language=self._language().code
+            )
         return self._nafdac_interceptor
+
+    def _language(self):
+        """The mode holder, built once on first use.
+
+        Also handed to the NAFDAC interceptor, so `/hausa` changes the language
+        the greenbook tables print in without rebuilding anything.
+        """
+        if getattr(self, "_language_switcher", None) is None:
+            from .language import LanguageSwitcher
+
+            self._language_switcher = LanguageSwitcher(self.cfg, self.debug)
+        return self._language_switcher
 
     def verify_nafdac(self, nrn: str):
         """Verify one NAFDAC number against the greenbook.
@@ -239,6 +255,27 @@ class NAtlasClient:
         return self._nafdac().status()
 
     # ------------------------------------------------------------------
+    # language
+    # ------------------------------------------------------------------
+    def set_language(self, mode: str) -> str:
+        """Pin a language mode and return the confirmation to print.
+
+        `mode` is a code ("ha", "yoruba", "igbo", "english", "auto") as handed
+        over by the REPL's command table, not free text.
+        """
+        return self._language().set(mode)
+
+    def language_menu(self) -> str:
+        return self._language().menu()
+
+    def language_label(self) -> str:
+        return self._language().label()
+
+    @property
+    def language(self) -> str:
+        return self._language().mode
+
+    # ------------------------------------------------------------------
     # chat
     # ------------------------------------------------------------------
     def chat(self, message, stream: bool | None = None, on_token=None):
@@ -254,10 +291,17 @@ class NAtlasClient:
         user's language from those facts, so the product data is never
         invented. If the server is unreachable, the verified block is returned
         directly rather than an error.
+
+        When a language mode is pinned (`/hausa`, `/english`, ...), a directive
+        naming that mode is added after the NAFDAC block, and the mode also
+        travels as the `language` field of the request. The directive is what
+        makes the mode hold on a server that does not read the field.
         """
         nafdac_context = self._nafdac_context(message)
-        if nafdac_context:
-            message = "%s\n\n%s" % (message, nafdac_context)
+        language_context = self._language().context_for(message)
+        for block in (nafdac_context, language_context):
+            if block:
+                message = "%s\n\n%s" % (message, block)
         payload_messages = self.conversation.build_messages_for(message)
         use_stream = self.cfg.stream if stream is None else stream
 
@@ -291,6 +335,13 @@ class NAtlasClient:
             max_tokens=self.cfg.max_tokens,
             temperature=self.cfg.temperature,
         )
+        # The pinned language travels as a request field. A patched server
+        # treats it as authoritative and skips its own detector for this turn;
+        # an unpatched server ignores it, because ChatCompletionRequest is
+        # `extra="allow"`, and the directive on the turn covers that case.
+        language = self._language().request_language()
+        if language:
+            kwargs["extra_body"] = {"language": language}
         if use_stream:
             result = self._try_stream(kwargs, on_token)
             if result is not None:
@@ -427,29 +478,59 @@ class NAtlasClient:
         return clean_response_text(text), info
 
     def _nafdac_context(self, message: str) -> str:
-        """Verify `message` and return the context block, or an empty string.
+        """Greenbook data for this turn, or an empty string.
 
-        Empty when NAFDAC verification is off, when the message is not a
-        lookup, or when the number could not be found. A miss is deliberately
-        not passed to the model as context: telling N-ATLaS "not found" as
-        verified data would stop it from answering sensibly when the export is
-        merely out of date.
+        Empty whenever a server is reachable. The server owns retrieval: it
+        extracts intent, applies the intent gate, and only then queries the
+        greenbook. If this method also decided for itself that a message was
+        product-related, there would be two retrieval authorities, and the
+        client one runs before the server has seen the message at all.
+
+        That mattered in practice rather than in principle. The block returned
+        here was appended to the user's own turn as plain text, so the server's
+        intent extraction then read the client's greenbook candidates as part of
+        the user's message — product names, "Verdict: AUTHENTIC" and all. A
+        greeting that matched a product locally could therefore talk the server
+        into searching as well.
+
+        Local data is still used, in two cases that are not a second authority:
+        as a fallback when no server is reachable, where there is no server to
+        ask, and on explicit commands such as /verify, which are the user asking
+        for a lookup directly.
         """
         interceptor = self._nafdac()
         if not interceptor.enabled or not message:
             return ""
+
+        if getattr(self.cfg, "nafdac_server_authoritative", True) and self.api_connected:
+            self._log_debug("nafdac: server is the retrieval authority, sending as-is")
+            return ""
+
         try:
             if not interceptor.looks_like_lookup(message):
                 return ""
-            result = interceptor.verify(message, quiet=True)
+
+            from .nafdac_source import extract_nrn
+
+            if extract_nrn(message):
+                result = interceptor.verify(message, quiet=True)
+                if not result.found:
+                    self._log_debug("nafdac: %s not found locally" % result.nrn)
+                    return ""
+                return interceptor.context_for(message, result)
+
+            search = interceptor.search(message, quiet=True)
+            if not search or not search.found:
+                self._log_debug(
+                    "nafdac: search %r matched nothing, nothing attached"
+                    % search.query
+                )
+                return ""
+            return interceptor.context_for_search(message, search)
         except Exception as exc:
             # Verification must never be the reason a chat fails.
             self._log_debug("nafdac check failed: %r" % (exc,))
             return ""
-        if not result.found:
-            self._log_debug("nafdac: %s not found locally" % result.nrn)
-            return ""
-        return interceptor.context_for(message, result)
 
     # ------------------------------------------------------------------
     # conversation / storage conveniences

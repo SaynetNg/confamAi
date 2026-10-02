@@ -21,6 +21,7 @@ CSV therefore comes from PostgreSQL, and vice versa.
 """
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,10 @@ from .extract import (
 )
 from .records import (
     STATUS_UNKNOWN,
+    VERDICT_AUTHENTIC,
+    VERDICT_FLAGGED,
+    VERDICT_NOT_REGISTERED,
+    VERDICT_UNKNOWN,
     ProductRecord,
     is_authorised,
     merge_records,
@@ -88,6 +93,49 @@ class VerificationResult:
         return record.status if record else STATUS_UNKNOWN
 
     @property
+    def verdict(self) -> str:
+        """The user-facing answer: authentic, flagged, not_registered or unknown.
+
+        Aggregated across matches with the worst verdict winning. A number
+        carrying one flagged product and one active product must never be
+        reported as authentic, so `flagged` beats `authentic` here and the
+        `ambiguous` flag separately tells the user to ask which product they
+        meant.
+        """
+        if not self.searched:
+            return VERDICT_UNKNOWN
+        if not self.matches:
+            return VERDICT_NOT_REGISTERED
+
+        verdicts = {record.verdict for record in self.matches}
+        if VERDICT_FLAGGED in verdicts:
+            return VERDICT_FLAGGED
+        if verdicts == {VERDICT_AUTHENTIC}:
+            return VERDICT_AUTHENTIC
+        return VERDICT_UNKNOWN
+
+    @property
+    def verdict_reason(self) -> str:
+        """Why the verdict came out that way, in the user's terms."""
+        verdict = self.verdict
+        if verdict == VERDICT_NOT_REGISTERED:
+            return (
+                "no available source lists this number, which is not proof the "
+                "product is counterfeit"
+            )
+        if verdict == VERDICT_UNKNOWN and not self.searched:
+            return "no NAFDAC number was found to look up"
+        if verdict == VERDICT_UNKNOWN:
+            return "the status recorded for this number is not one this code recognises"
+
+        reasons: List[str] = []
+        for record in self.matches:
+            reason = record.verdict_reason
+            if reason not in reasons:
+                reasons.append(reason)
+        return "; ".join(reasons)
+
+    @property
     def greenbook_url(self) -> str:
         record = self.primary
         if not record or not record.product_id:
@@ -103,6 +151,8 @@ class VerificationResult:
             "ambiguous": self.ambiguous,
             "authorised": self.authorised,
             "status": self.status,
+            "verdict": self.verdict,
+            "verdict_reason": self.verdict_reason,
             "confidence": self.confidence,
             "greenbook_url": self.greenbook_url,
             "match_count": len(self.matches),
@@ -129,6 +179,7 @@ class VerificationResult:
         if not self.found:
             lines = [
                 f"NAFDAC {self.nrn}: NOT FOUND in the NAFDAC Greenbook.",
+                f"  Verdict: {self.verdict.upper()} - {self.verdict_reason}.",
                 "  This number does not appear in any available source.",
             ]
             if self.sources_checked:
@@ -141,6 +192,16 @@ class VerificationResult:
             lines.append(
                 "  Do not treat this as proof the product is fake. The greenbook "
                 "may be out of date, or the number may be mistyped."
+            )
+            lines.append(
+                "  NEVER call a product counterfeit or fake: the greenbook "
+                "records registrations, not counterfeiting. Tell the user the "
+                "number was not found in this export, and ask them to check the "
+                "number printed on the pack."
+            )
+            lines.append(
+                "  Answer in the language the user wrote in, including Hausa, "
+                "Yoruba or Igbo."
             )
             return "\n".join(lines)
 
@@ -161,6 +222,41 @@ class VerificationResult:
             )
             lines.append(f"NAFDAC {self.nrn}: found - {state}.")
 
+        lines.append(f"  Verdict: {self.verdict.upper()} - {self.verdict_reason}.")
+        if self.verdict == VERDICT_AUTHENTIC:
+            lines.append(
+                "  The greenbook lists this product as currently authorised. Tell "
+                "the user it is registered, but that the greenbook cannot confirm "
+                "this particular pack is genuine: a copied number also resolves "
+                "here."
+            )
+        elif self.verdict == VERDICT_FLAGGED:
+            lines.append(
+                "  Tell the user this product is flagged and should not be used, "
+                "and give the reason above. Do not soften this into a suggestion."
+            )
+
+        # Before the records, not after: callers cap this block and an ambiguous
+        # number can produce several, so anything placed at the end risks being
+        # truncated away. These rules are the whole point of the block.
+        lines.append(
+            "  Report only the values listed below. If the user asks about a "
+            "field that is not listed, say the greenbook does not record it. "
+            "Never supply a product name, ingredient, strength, applicant, "
+            "manufacturer, date or status from memory."
+        )
+        lines.append(
+            "  Use the VERDICT line as the answer to 'is it genuine?', but do not "
+            "invent a stronger one. NEVER call a product counterfeit or fake: the "
+            "greenbook records registrations, not counterfeiting."
+        )
+        lines.append(
+            "  Answer in the language the user wrote in, including Hausa, Yoruba "
+            "or Igbo. Keep product names, NAFDAC numbers, dates and statuses "
+            "exactly as written."
+        )
+        lines.append("")
+
         for record in self.matches:
             lines.append(render_record(record))
 
@@ -169,12 +265,6 @@ class VerificationResult:
         lines.append(f"  Confidence: {self.confidence}.")
         for note in self.notes:
             lines.append(f"  Note: {note}")
-        lines.append(
-            "  Report only the values listed above. If the user asks about a "
-            "field that is not listed, say the greenbook does not record it. "
-            "Never supply a product name, ingredient, strength, applicant, "
-            "manufacturer, date or status from memory."
-        )
         return "\n".join(lines)
 
 
@@ -373,20 +463,45 @@ def verify_nafdac_product(
     return result
 
 
+def _as_needles(query: Any) -> List[str]:
+    """Accept a string or a sequence of terms and return folded needles.
+
+    A single string is treated as one needle, so `search_products("paracetamol
+    syrup")` keeps behaving exactly as before: it matches a product whose name
+    contains that whole phrase. Callers that want per-term matching pass a list.
+    """
+    if query is None:
+        return []
+    if isinstance(query, str):
+        text = query.strip().lower()
+        return [text] if text else []
+    needles: List[str] = []
+    for item in query:
+        text = str(item or "").strip().lower()
+        if text and text not in needles:
+            needles.append(text)
+    return needles
+
+
 def search_products(
-    query: str,
+    query: Any,
     sources: Optional[List[NafdacSource]] = None,
     limit: int = 20,
 ) -> List[ProductRecord]:
     """Free-text search across product name, ingredients and applicant.
 
-    Used by the server so N-ATLaS can answer "do you have anything for malaria?"
-    rather than only exact-number lookups. Results are ranked: an exact NRN or
-    product-ID hit first, then a name prefix, then a substring, then a match in
-    the ingredients or applicant.
+    `query` is either one string or a list of search terms, matched
+    independently. Returns a plain ranked list, which is what the REST endpoint
+    and the `/search` command want. For anything that feeds the model, use
+    `find_products()` instead: it returns a `SearchResult` that renders itself as
+    an anti-hallucination block and carries the per-record verdicts.
+
+    `query` is normally the output of `extract_search_terms()`, which drops stop
+    words and keeps the distinctive ones. Matching is whole-word, so an ordinary
+    verb does not hit a brand that contains it.
     """
-    needle = (query or "").strip().lower()
-    if not needle:
+    needles = _as_needles(query)
+    if not needles:
         return []
     if sources is None:
         sources = build_sources(
@@ -396,7 +511,6 @@ def search_products(
         )
 
     scored: List[tuple] = []
-    seen: set = set()
 
     for source in sources:
         loader = getattr(source, "load", None)
@@ -406,37 +520,386 @@ def search_products(
             index = loader()
         except Exception:
             continue
-        for records in index.values():
-            for record in records:
-                identity = record.product_id or (record.nrn_key, record.product_name)
-                if identity in seen:
-                    continue
-                rank = _rank(record, needle)
-                if rank:
-                    seen.add(identity)
-                    scored.append((rank, record))
+        scored.extend(_candidates(index, needles))
 
-    scored.sort(key=lambda item: (item[0], item[1].product_name.lower()))
-    return [record for _rank_value, record in scored[: max(1, limit)]]
+    deduped: Dict[Any, tuple] = {}
+    for rank, record in scored:
+        identity = record.product_id or (record.nrn_key, record.product_name)
+        current = deduped.get(identity)
+        if current is None or rank < current[0]:
+            deduped[identity] = (rank, record)
+
+    ordered = sorted(deduped.values(), key=lambda item: (item[0], item[1].product_name.lower()))
+    return [record for _rank_value, record in ordered[: max(1, limit)]]
 
 
-def _rank(record: ProductRecord, needle: str) -> int:
-    """Lower is better; 0 means no match."""
-    nrn_key = record.nrn_key.lower()
-    name = record.product_name.lower()
-    ingredients = record.active_ingredients.lower()
-    applicant = record.applicant_name.lower()
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
-    if needle == nrn_key or needle == name:
-        return 1
-    if nrn_key and needle in nrn_key and len(needle) >= 4:
-        return 2
-    if name.startswith(needle):
-        return 3
-    if name and needle in name:
-        return 4
-    if needle in ingredients:
-        return 5
-    if needle in applicant:
-        return 6
-    return 0
+# Built once per loaded source index. Keyed on id() of that index, with the
+# index itself kept in the value so its id cannot be reused by a later object.
+_SCAN_INDEX: Dict[int, tuple] = {}
+
+
+def _scan_index(index: Any) -> tuple:
+    """An inverted word index over one source's loaded rows.
+
+    Every message is searched now, so this is the hot path. Scanning the raw
+    strings of 8930 rows for every message measured about 0.9s; scoring from
+    per-record word sets brought it to about 35s of work over the whole run, and
+    this removes the scan entirely: a lookup becomes three dict gets instead of
+    8930 record comparisons.
+
+    Whole words, not substrings. Greenbook names are ordinary English, and a
+    substring test makes `treat` match "Levotreat" and `cold` match "Coldkris",
+    which attaches a list of candidates to "how do I treat a cold?".
+    """
+    cached = _SCAN_INDEX.get(id(index))
+    if cached is not None:
+        return cached[1]
+
+    by_identity: Dict[Any, ProductRecord] = {}
+    for records in index.values():
+        for record in records:
+            identity = record.product_id or (record.nrn_key, record.product_name)
+            if identity not in by_identity:
+                by_identity[identity] = record
+
+    names: Dict[str, List[Any]] = {}
+    ingredients: Dict[str, List[Any]] = {}
+    applicants: Dict[str, List[Any]] = {}
+    exact: Dict[str, List[Any]] = {}
+    nrns: List[tuple] = []
+
+    for identity, record in by_identity.items():
+        name = record.product_name.lower()
+        for word in _WORD_RE.findall(name):
+            names.setdefault(word, []).append(identity)
+        for word in _WORD_RE.findall(record.active_ingredients.lower()):
+            ingredients.setdefault(word, []).append(identity)
+        for word in _WORD_RE.findall(record.applicant_name.lower()):
+            applicants.setdefault(word, []).append(identity)
+        if name:
+            exact.setdefault(name, []).append(identity)
+        nrns.append((record.nrn_key.lower(), identity))
+
+    built = (by_identity, names, ingredients, applicants, exact, nrns)
+    _SCAN_INDEX[id(index)] = (index, built)
+    return built
+
+
+def _candidates(index: Any, needles: List[str]) -> List[tuple]:
+    """Every (rank, record) matching any needle, best rank per record.
+
+    Ranks, lower being better:
+
+      1  the NRN or the whole product name, exactly
+      2  a substring of the NRN
+      3  a whole word at the start of the name
+      4  a whole word anywhere in the name
+      5  a whole word in the active ingredients
+      6  a whole word in the applicant name
+
+    Only the NRN is matched as a substring, and only when the needle contains a
+    digit, so `/search 5180` still finds `A4-5180` without paying for 8930
+    string tests on every message.
+    """
+    by_identity, names, ingredients, applicants, exact, nrns = _scan_index(index)
+    best: Dict[Any, int] = {}
+
+    def offer(identity: Any, rank: int) -> None:
+        current = best.get(identity)
+        if current is None or rank < current:
+            best[identity] = rank
+
+    for needle in needles:
+        if not needle:
+            continue
+        for identity in exact.get(needle, ()):
+            offer(identity, 1)
+        for identity in names.get(needle, ()):
+            name = by_identity[identity].product_name.lower()
+            offer(identity, 3 if name.startswith(needle) else 4)
+        for identity in ingredients.get(needle, ()):
+            offer(identity, 5)
+        for identity in applicants.get(needle, ()):
+            offer(identity, 6)
+        if any(char.isdigit() for char in needle):
+            for nrn_key, identity in nrns:
+                if needle in nrn_key:
+                    offer(identity, 2)
+
+    return [(rank, by_identity[identity]) for identity, rank in best.items()]
+
+
+@dataclass
+class SearchResult:
+    """Free-text search candidates, plus enough context to report honestly.
+
+    The same caution as a single verification applies here, and more sharply: a
+    search that returns nothing is not evidence the product is counterfeit, and
+    a search that returns twelve things has not answered anything until the user
+    says which pack they hold. `sources_checked` and `sources_failed` are kept
+    for the same reason they exist on `VerificationResult` — a lookup that ran
+    against nothing must not be reported as a lookup that found nothing.
+    """
+
+    query: str = ""
+    records: List[ProductRecord] = field(default_factory=list)
+    total: int = 0
+    searched: bool = False
+    best_rank: int = 0
+    sources_checked: List[str] = field(default_factory=list)
+    sources_failed: Dict[str, str] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.records)
+
+    @property
+    def strong_match(self) -> bool:
+        """True when the best hit identifies a product rather than a word.
+
+        Not a gate — every message is searched, and a hit is always passed on.
+        This tells the caller how much to trust the candidates, which the
+        rendered block states in words so the model can discount them.
+
+        A match at product level or better (rank 1-5: the number, the name, or an
+        ingredient) is something the user could plausibly be holding. A match that
+        only appears in a company's name is a coincidence of wording, and since
+        greenbook names are ordinary English, so are a few unexpected ones:
+        "good morning" really does match products called "Morning".
+        """
+        return 0 < self.best_rank <= 5
+
+    @property
+    def flagged_count(self) -> int:
+        return sum(1 for record in self.records if record.verdict == VERDICT_FLAGGED)
+
+    @property
+    def authoritative_count(self) -> int:
+        return sum(
+            1 for record in self.records if record.verdict == VERDICT_AUTHENTIC
+        )
+
+    @property
+    def verdict(self) -> str:
+        """A verdict only when the candidates agree; otherwise unknown.
+
+        With one candidate the verdict is meaningful. With several it is not,
+        because "flagged" here means "at least one of these is flagged", which
+        is a statement about the candidate list rather than about the pack in
+        the user's hand.
+        """
+        if not self.searched:
+            return VERDICT_UNKNOWN
+        if not self.records:
+            return VERDICT_NOT_REGISTERED
+        if len(self.records) == 1:
+            return self.records[0].verdict
+        if self.flagged_count and self.flagged_count == len(self.records):
+            return VERDICT_FLAGGED
+        return VERDICT_UNKNOWN
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "found": self.found,
+            "searched": self.searched,
+            "total": self.total,
+            "count": len(self.records),
+            "verdict": self.verdict,
+            "flagged_count": self.flagged_count,
+            "matches": [record.to_dict() for record in self.records],
+            "sources_checked": list(self.sources_checked),
+            "sources_failed": dict(self.sources_failed),
+            "notes": list(self.notes),
+        }
+
+    def render(self, limit: int = 8) -> str:
+        """A plain-text block for the model, in the spirit of VerificationResult.
+
+        Two behaviours are deliberate. A miss says the greenbook export does not
+        list it rather than implying the product is fake. A multi-candidate hit
+        refuses to pick one, because the user asked about a pack and the data
+        only knows about registrations.
+        """
+        if not self.searched:
+            return (
+                "No product name was extracted from the message, so no greenbook "
+                "search was run. Ask the user for the product name or its NAFDAC "
+                "registration number."
+            )
+
+        if not self.records:
+            lines = [
+                f"Greenbook search for {self.query!r}: no product matched.",
+                f"  Verdict: {self.verdict.upper()} - not listed in this greenbook "
+                "export.",
+            ]
+            if self.sources_checked:
+                lines.append(f"  Sources searched: {', '.join(self.sources_checked)}")
+            if self.sources_failed:
+                lines.append(
+                    "  Could not search: "
+                    + ", ".join(f"{name} ({why})" for name, why in self.sources_failed.items())
+                )
+            lines.append(
+                "  This is not proof the product is counterfeit or unregistered. "
+                "The export may be out of date, or the name may be spelled "
+                "differently on the pack."
+            )
+            lines.append(
+                "  Ask the user for the NAFDAC registration number printed on the "
+                "pack, which looks like A4-100160 or 04-3877, and look that up "
+                "instead."
+            )
+            return "\n".join(lines)
+
+        shown = self.records[: max(1, limit)]
+        lines: List[str] = []
+        if len(self.records) == 1:
+            record = shown[0]
+            lines.append(
+                f"Greenbook search for {self.query!r}: one product matched."
+            )
+            lines.append(f"  Verdict: {self.verdict.upper()} - {record.verdict_reason}.")
+        else:
+            lines.append(
+                f"Greenbook search for {self.query!r}: {len(self.records)} "
+                "products matched, shown ranked by how closely they match."
+            )
+            lines.append(
+                "  Verdict: UNKNOWN - these are different products, so this is not "
+                "an answer about one pack."
+            )
+            lines.append(
+                "  Show the candidates and ask which one the user means. Do not "
+                "choose the top-ranked one for them."
+            )
+            if self.flagged_count:
+                lines.append(
+                    f"  {self.flagged_count} of them are flagged by NAFDAC."
+                )
+
+        # The instructions come before the records, not after them. Callers cap
+        # this block at a few thousand characters, and a long candidate list is
+        # truncated at the end — which would otherwise cut off the rules that
+        # matter most. Putting them first means they survive every cut.
+        lines.append("")
+        lines.append(
+            "  These matched because the message shared words with the greenbook, "
+            "not necessarily because the user asked about them. Greenbook names "
+            "are ordinary English, so an unrelated sentence can match by accident."
+        )
+        if not self.strong_match:
+            lines.append(
+                "  The closest match is weak: a word appears in a name or an "
+                "ingredient rather than the product being named."
+            )
+        lines.append(
+            "  If the user is not asking about a medicine, a product or their "
+            "health, ignore this block completely and answer what they actually "
+            "asked. Never open with an unprompted product list."
+        )
+        lines.append(
+            "  Report only the values listed below. Never supply a product name, "
+            "ingredient, strength, applicant, manufacturer, date or status from "
+            "memory, and never call a product counterfeit or fake: the greenbook "
+            "records registrations, not counterfeiting."
+        )
+        lines.append(
+            "  Answer in the language the user wrote in, including Hausa, Yoruba "
+            "or Igbo. Keep product names, NAFDAC numbers, dates and statuses "
+            "exactly as written."
+        )
+        lines.append("")
+
+        for record in shown:
+            lines.append(render_record(record))
+        if len(self.records) > len(shown):
+            lines.append(f"  ...and {len(self.records) - len(shown)} more not shown.")
+
+        if len(self.records) == 1:
+            record = shown[0]
+            if record.verdict == VERDICT_AUTHENTIC:
+                lines.append(
+                    "  The greenbook lists this as currently authorised. Tell the "
+                    "user it is registered, but that the greenbook cannot confirm "
+                    "this particular pack is genuine: a copied number resolves here "
+                    "too."
+                )
+            elif record.verdict == VERDICT_FLAGGED:
+                lines.append(
+                    "  Tell the user this product is flagged and should not be used, "
+                    "and give the reason above. Do not soften this into a suggestion."
+                )
+
+        for note in self.notes:
+            lines.append(f"  Note: {note}")
+        return "\n".join(lines)
+
+
+def find_products(
+    query: Any,
+    sources: Optional[List[NafdacSource]] = None,
+    limit: int = 8,
+) -> SearchResult:
+    """Free-text search that reports its own provenance.
+
+    `query` is either one string or a list of search terms, matched
+    independently. Unlike `search_products()`, a source that could not be read is
+    recorded rather than skipped silently, so "nothing matched" is never
+    reported when the truth is "nothing was searched".
+    """
+    needles = _as_needles(query)
+    label = " ".join(needles) if len(needles) != 1 else needles[0]
+    result = SearchResult(query=label)
+    if not needles:
+        return result
+
+    result.searched = True
+    if sources is None:
+        sources = build_sources(
+            csv_path=_env_path("NAFDAC_CSV_PATH"),
+            xlsx_path=_env_path("NAFDAC_XLSX_PATH"),
+            database_url=os.environ.get("NAFDAC_DATABASE_URL", ""),
+        )
+
+    scored: List[tuple] = []
+    deduped: Dict[Any, tuple] = {}
+
+    for source in sources:
+        name = getattr(source, "name", "unknown")
+        loader = getattr(source, "load", None)
+        if not callable(loader):
+            result.sources_failed[name] = "no searchable index"
+            continue
+        try:
+            index = loader()
+        except Exception as exc:
+            result.sources_failed[name] = f"{type(exc).__name__}: {exc}"
+            continue
+        result.sources_checked.append(name)
+
+        for rank, record in _candidates(index, needles):
+            identity = record.product_id or (record.nrn_key, record.product_name)
+            current = deduped.get(identity)
+            if current is None or rank < current[0]:
+                deduped[identity] = (rank, record)
+
+    if not result.sources_checked:
+        result.searched = False
+        result.notes.append(
+            "No greenbook source was readable, so nothing was searched. Do not "
+            "tell the user the product is unregistered."
+        )
+        return result
+
+    ordered = sorted(
+        deduped.values(), key=lambda item: (item[0], item[1].product_name.lower())
+    )
+    result.total = len(ordered)
+    result.best_rank = ordered[0][0] if ordered else 0
+    result.records = [record for _rank_value, record in ordered[: max(1, limit)]]
+    return result

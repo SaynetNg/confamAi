@@ -196,7 +196,10 @@ def _verify_database(dsn: str, csv_path: Optional[Path], skip_load: bool) -> int
         from .load_postgres import _COLUMNS, _row_values
 
         columns = ", ".join(_COLUMNS)
-        placeholders = ", ".join(["%s"] * len(_COLUMNS))
+        # Parentheses required; see the note in load_postgres.load(). psycopg3
+        # otherwise falls back to the simple query protocol and PostgreSQL
+        # rejects the literal `$1`.
+        placeholders = "(" + ", ".join(["%s"] * len(_COLUMNS)) + ")"
         with connection.cursor() as cursor:
             cursor.execute(
                 f"INSERT INTO nafdac_products ({columns}) VALUES {placeholders}",

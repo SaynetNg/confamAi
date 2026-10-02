@@ -18,6 +18,43 @@ STATUS_ACTIVE = "Active"
 STATUS_INACTIVE = "Inactive"
 STATUS_UNKNOWN = "Unknown"
 
+# The user-facing verdict. `authorised` is the accurate technical answer, but it
+# answers the wrong question: a user asking "is this genuine?" does not want
+# True/False, they want to know whether they can trust the pack. These four
+# values say that directly, and `flagged` deliberately covers more than a plain
+# "not authorised" so the model never has to guess why.
+#
+#   authentic      found, currently Active, and not marked as a duplicate
+#   flagged        found, but NAFDAC has withdrawn/suspended/recalled it, or the
+#                  greenbook marks the entry itself as a duplicate
+#   not_registered no source has it at all
+#   unknown        found, but the status is not one this code recognises, or the
+#                  number is genuinely ambiguous
+#
+# There is deliberately no "fake" verdict. The greenbook records registrations,
+# not counterfeiting: a miss means this export does not list it, which is not
+# the same claim.
+VERDICT_AUTHENTIC = "authentic"
+VERDICT_FLAGGED = "flagged"
+VERDICT_NOT_REGISTERED = "not_registered"
+VERDICT_UNKNOWN = "unknown"
+
+# Greenbook statuses that mean NAFDAC has taken the product off the register,
+# as opposed to it simply having lapsed. Both are "flagged" for the user, but
+# the reason is worth naming.
+_ACTION_STATUSES = frozenset(
+    {
+        "suspended",
+        "withdrawn",
+        "recalled",
+        "cancelled",
+        "canceled",
+        "revoked",
+        "expired",
+        "superseded",
+    }
+)
+
 # The fields a human verification answer is built from, in the order they are
 # shown. Everything else in the row is available on the record but not printed.
 CORE_FIELDS = (
@@ -154,6 +191,54 @@ def is_authorised(status: str) -> Optional[bool]:
     return None
 
 
+def classify_verdict(status: str, duplicate: bool = False) -> str:
+    """The user-facing verdict for one product.
+
+    `duplicate` comes from the greenbook's own `(duplicate)` name marker. It is
+    treated as flagged rather than authentic because the greenbook publishing a
+    row at all under a name it marks duplicate means a user buying that pack is
+    looking at an entry the regulator itself is not endorsing as distinct.
+
+    The raw status is inspected where it is available, so an action status
+    ("withdrawn", "recalled") is distinguishable from a plain lapse. Callers
+    that have only the normalised status still get a correct verdict, just a
+    vaguer reason.
+    """
+    cleaned = _clean(status)
+    lowered = cleaned.lower()
+
+    if lowered in _ACTION_STATUSES:
+        return VERDICT_FLAGGED
+    if lowered == STATUS_ACTIVE.lower():
+        return VERDICT_FLAGGED if duplicate else VERDICT_AUTHENTIC
+    if lowered == STATUS_INACTIVE.lower():
+        return VERDICT_FLAGGED
+    if not cleaned:
+        return VERDICT_UNKNOWN
+    return VERDICT_FLAGGED if duplicate else VERDICT_UNKNOWN
+
+
+def verdict_reason(status: str, duplicate: bool = False) -> str:
+    """A short phrase naming why a verdict came out the way it did.
+
+    Plain text with no trailing full stop, because callers embed it in a line
+    that supplies its own punctuation.
+    """
+    cleaned = _clean(status)
+    lowered = cleaned.lower()
+    if duplicate:
+        return "the greenbook lists this entry as a duplicate"
+    if lowered in _ACTION_STATUSES:
+        return f"NAFDAC status is {cleaned}"
+    if lowered == STATUS_ACTIVE.lower():
+        return "listed as Active in the current greenbook"
+    if lowered == STATUS_INACTIVE.lower():
+        return "listed as Inactive in the current greenbook"
+    if not cleaned:
+        return "no status is recorded"
+    return f"status {cleaned!r} is not one this code recognises"
+
+
 @dataclass
 class ProductRecord:
     """One greenbook product, normalised across all sources."""
@@ -167,6 +252,11 @@ class ProductRecord:
     route: str = ""
     product_category: str = ""
     status: str = STATUS_UNKNOWN
+    # The greenbook's own status string, kept alongside the normalised `status`.
+    # `classify_status` maps withdrawn/recalled/expired all onto Inactive, which
+    # is right for a boolean but loses the reason a product was pulled. The raw
+    # value lets the user-facing verdict name it.
+    raw_status: str = ""
     marketing_category: str = ""
     applicant_name: str = ""
     applicant_address: str = ""
@@ -208,6 +298,25 @@ class ProductRecord:
         return is_authorised(self.status)
 
     @property
+    def verdict(self) -> str:
+        """The user-facing answer: authentic, flagged or unknown."""
+        return classify_verdict(self.verdict_status, self.duplicate_marker)
+
+    @property
+    def verdict_status(self) -> str:
+        """The status to reason about: the raw value when there is one.
+
+        A row pulled from PostgreSQL history carries the reason it was pulled
+        (`Withdrawn`, `Suspended`), which is far more useful to a user than the
+        `Inactive` it normalises to.
+        """
+        return self.raw_status or self.status
+
+    @property
+    def verdict_reason(self) -> str:
+        return verdict_reason(self.verdict_status, self.duplicate_marker)
+
+    @property
     def duplicate_marker(self) -> bool:
         """True for the 268 rows the scraper deliberately kept.
 
@@ -221,6 +330,8 @@ class ProductRecord:
         data = asdict(self)
         data["nrn_key"] = self.nrn_key
         data["authorised"] = self.authorised
+        data["verdict"] = self.verdict
+        data["verdict_reason"] = self.verdict_reason
         return data
 
     def field(self, name: str) -> str:
@@ -256,6 +367,7 @@ def record_from_row(row: Dict[str, Any], source: str = "") -> ProductRecord:
             setattr(record, attribute, _clean(value))
 
     if record.status:
+        record.raw_status = record.status
         record.status = classify_status(record.status)
     if source:
         record.sources = [source]
@@ -285,6 +397,10 @@ def merge_records(base: ProductRecord, other: ProductRecord) -> ProductRecord:
         if name and name not in seen:
             seen.append(name)
     merged.sources = seen
+    # The raw status is provenance rather than a greenbook column, so it is not
+    # in FIELD_COLUMNS and the loop above skips it. Earlier sources still win.
+    if not merged.raw_status:
+        merged.raw_status = base.raw_status or other.raw_status
     if merged.status:
         merged.status = classify_status(merged.status)
     return merged
@@ -301,6 +417,9 @@ def render_record(record: ProductRecord, indent: str = "  ") -> str:
     title = record.product_name or "(name not recorded)"
     header = f"{record.nrn} - {title}" if record.nrn else title
     lines.append(indent + header)
+
+    verdict = record.verdict
+    lines.append(f"{indent}  Verdict: {verdict.upper()} - {record.verdict_reason}")
 
     authorised = record.authorised
     if authorised is True:

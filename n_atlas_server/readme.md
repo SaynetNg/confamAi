@@ -16,10 +16,10 @@ confamAi/
 ```
 
 **Stage 1 is the Kaggle server only.** Do not start Stage 2 until every check in
-Cell 16 prints `PASS` with zero skips on the real T4. The Hugging Face login,
-API key and Cloudflare download commands are documented under
-[Kaggle setup cells](#kaggle-setup-cells); the tunnel cell (D) comes **after**
-the Cell 16 gate, never before it.
+Cell 17 prints `PASS` with zero skips on the real T4. The API key and the
+Hugging Face login are Cell 1; the tunnel is Cell 19 and comes **after** the
+Cell 17 gate, never before it. Both are described under
+[Kaggle setup cells](#kaggle-setup-cells).
 
 ---
 
@@ -28,17 +28,17 @@ the Cell 16 gate, never before it.
 | File | Purpose |
 |---|---|
 | `requirements.txt` | Full pinned dependency set. Safe to `pip install -r` on Kaggle. |
-| `natlas_notebook.py` | Source of truth. 17 `# %%`-delimited cells, plain sequential Python. |
+| `natlas_notebook.py` | Source of truth. 19 `# %%`-delimited cells, plain sequential Python. |
 | `natlas_kaggle.ipynb` | Built from the above by `build_notebook.py`. **Upload this to Kaggle.** |
 | `build_notebook.py` | Regenerates the `.ipynb`. Run after editing `natlas_notebook.py`. |
 | `validate_notebook.py` | Checks the `.ipynb` parses, every cell compiles, no content is lost. |
-| `verify_offline.py` | Runs Cells 1–17 plus all three scripts, with a mock model + real HTTP. |
-| `verify_nafdac.py` | Checks Cell 17 (the greenbook) on its own. No GPU needed. |
+| `verify_offline.py` | Runs Cells 1–18 plus all three scripts, with a mock model + real HTTP. Cell 19 is skipped. |
+| `verify_nafdac.py` | Checks Cell 18 (the greenbook) on its own. No GPU needed. |
 | `mock_backend.py` | Test doubles for the tokenizer/model (used only by the verifier). |
 | `notebook_cells.py` | Loads/parses the cells. Shared by the scripts and the builder. |
-| `kaggleserver.py` | Script entry point: the **generation engine** (Cells 1–7), no HTTP. |
-| `apiserver.py` | Script entry point: **engine + FastAPI server + greenbook** (Cells 1–10, 17). |
-| `kaggle.py` | Runs the notebook cells as a plain script (`--list`, `--cells 1-10`). |
+| `kaggleserver.py` | Script entry point: the **generation engine** (Cells 2–8), no HTTP. |
+| `apiserver.py` | Script entry point: **engine + FastAPI server + greenbook** (Cells 1–11 plus Cell 18). |
+| `kaggle.py` | Runs the notebook cells as a plain script (`--list`, `--cells 2-11`). |
 
 The scripts contain **no duplicated logic** — they execute the very same cells
 the notebook does, so there is nothing to drift out of sync. Editing
@@ -63,7 +63,7 @@ the notebook does, so there is nothing to drift out of sync. Editing
 so it is safe to run on Kaggle as-is.
 
 **`bitsandbytes` is the one hard requirement Kaggle does not ship.** Without it
-Cell 4 cannot build the 4-bit NF4 `BitsAndBytesConfig`.
+Cell 5 cannot build the 4-bit NF4 `BitsAndBytesConfig`.
 
 ---
 
@@ -72,20 +72,19 @@ Cell 4 cannot build the 4-bit NF4 `BitsAndBytesConfig`.
 1. Create a notebook, enable the **GPU T4 x2** accelerator.
 2. Set `Internet` on (needed once to download the model).
 3. Upload `natlas_kaggle.ipynb`.
-4. Add your API key as a Kaggle Secret named `N_ATLAS_API_KEY`, or paste this
-   above Cell 1:
-
-   ```python
-   import os
-   from kaggle_secrets import UserSecretsClient
-   os.environ["N_ATLAS_API_KEY"] = UserSecretsClient().get_secret("N_ATLAS_API_KEY")
-   ```
-
-5. Run Cells 1 → 16 **in order, once each**.
-6. Read the Cell 16 summary. Stage 1 is done only when it says
+4. Run Cell 1 first. It **is** the credentials step: it sets
+   `N_ATLAS_API_KEY` with `os.environ.setdefault` and imports the Hugging Face
+   login. A Kaggle Secret attached as `N_ATLAS_API_KEY` still wins, because
+   `setdefault` only fills the variable when it is not already set. With no
+   secret attached the cell falls back to the key it carries as a literal,
+   which is what keeps the notebook self-contained on Kaggle.
+5. Run Cells 2 → 18 **in order, once each**.
+6. Read the Cell 17 summary. Stage 1 is done only when it says
    `ALL CHECKS PASSED` with **no skipped checks**.
+7. Only then run Cell 19, the public tunnel. It is the last cell and it blocks
+   until you interrupt the kernel.
 
-Cell 2 only pip-installs what is genuinely missing, in two groups:
+Cell 3 only pip-installs what is genuinely missing, in two groups:
 
 - **server** — `fastapi`, `uvicorn`, `pydantic`, `requests`, `nest_asyncio`
 - **model runtime** — `bitsandbytes`, `accelerate`, `safetensors`, installed
@@ -98,45 +97,46 @@ missing package a hard error instead.
 
 ## Kaggle setup cells
 
-Two separate blocks, and they do **not** sit together:
+Two separate cells, and they do **not** sit together:
 
 | Block | Cells | Where they run |
 |---|---|---|
-| **Before the model** | A, B, C | Above Cell 1, before anything loads. |
-| **After everything passes** | D | At the very bottom, only once Cell 16 prints `ALL CHECKS PASSED`. |
+| **Before the model** | Cell 1 | First cell in the notebook, before anything loads. |
+| **After everything passes** | Cell 19 | At the very bottom, only once Cell 17 prints `ALL CHECKS PASSED`. |
 
 ```
-A  HF login  ─┐
-B  API key   ─┼─ above Cell 1 ─→ Cells 1 … 16 ─→ ALL CHECKS PASSED ─→ D  tunnel
-C  cloudflared ┘
+Cell 1  credentials ─→ Cells 2 … 18 ─→ ALL CHECKS PASSED ─→ Cell 19  tunnel
 ```
 
-Cells 11–16 test `http://127.0.0.1:8000` directly. The tunnel is not involved in
+Cells 12–17 test `http://127.0.0.1:8000` directly. The tunnel is not involved in
 any of them, so nothing about Stage 1 depends on it being up.
 
-### Cell A — Hugging Face login
+### Cell 1 — Hugging Face login
 
 `NCAIR1/N-ATLaS` is a gated repo, so the token is required before any download.
+Cell 1 imports the login call itself:
 
 ```python
 from huggingface_hub import login
-
-login()
 ```
 
-`login()` with no argument reads `HF_TOKEN` from the Kaggle secret environment.
-Accept the model licence at <https://huggingface.co/NCAIR1/N-ATLaS> first, or
-every download fails with `403` regardless of token validity.
+`login()` is then called in Cell 19, inside a `try`/`except`, so the tunnel does
+not depend on it. Accept the model licence at
+<https://huggingface.co/NCAIR1/N-ATLaS> first, or every download fails with `403`
+regardless of token validity.
 
-### Cell B — API key
+### Cell 1 — API key
+
+Cell 1 sets the key with `setdefault`, so a Kaggle Secret attached as
+`N_ATLAS_API_KEY` wins over the literal the cell carries:
 
 ```python
 import os
-os.environ["N_ATLAS_API_KEY"] = "<your key>"
+os.environ.setdefault("N_ATLAS_API_KEY", "<your key>")
 ```
 
 The key is the **only** thing standing between the public tunnel URL and your
-GPU. Generate one rather than pasting the placeholder:
+GPU. Generate your own rather than leaving the notebook default:
 
 ```python
 import os, secrets
@@ -144,13 +144,13 @@ os.environ["N_ATLAS_API_KEY"] = "natlas_" + secrets.token_urlsafe(32)
 print("N_ATLAS_API_KEY loaded:", bool(os.environ.get("N_ATLAS_API_KEY")))
 ```
 
-Set `N_ATLAS_ALLOW_EPHEMERAL_KEY=0` in this cell to make a missing key a hard
+Set `N_ATLAS_ALLOW_EPHEMERAL_KEY=0` before Cell 2 to make a missing key a hard
 failure instead of silently falling back to an ephemeral one.
 
-### Cell C — Download the Cloudflare tunnel client
+### Cell 19 — Download the Cloudflare tunnel client
 
-Can be run with A and B above Cell 1, or later. Either way it is inert until
-Cell D starts it.
+Already done for you: Cell 19 runs the download itself, through `subprocess`, and
+`chmod +x`es the result. The equivalent, if you ever need it by hand:
 
 ```python
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared
@@ -160,28 +160,30 @@ Lands in `/kaggle/working`. Verified with `!./cloudflared --version`. Needs
 Internet on, and re-downloads every session because the working directory is
 ephemeral.
 
-### Cell D — Expose the server
+### Cell 19 — Expose the server
 
-**Stage 2. Do not run this until Cell 16 prints `ALL CHECKS PASSED` with no
-skipped checks.** It is the last cell in the notebook, after the Cell 16 gate,
+**Stage 2. Do not run this until Cell 17 prints `ALL CHECKS PASSED` with no
+skipped checks.** It is the last cell in the notebook, after the Cell 17 gate,
 never in the run above it.
 
 ```python
-!./cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate
+./cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate
 ```
 
-Uvicorn is already bound by Cell 10 and already proven by Cells 11–15, so
+Uvicorn is already bound by Cell 11 and already proven by Cells 12–16, so
 `127.0.0.1:8000` is known good before this runs. If Stage 1 has not passed,
 there is nothing worth exposing.
 
-`nohup ... &` is required — a bare `!./cloudflared tunnel` blocks the cell
-forever and the notebook can never be saved. `&` alone is not enough in Kaggle;
-the process gets killed when the cell's shell exits.
+Both commands above are already implemented in Cell 19: it downloads
+cloudflared, marks it executable and runs the tunnel itself, so there is nothing
+left to paste. It **blocks until interrupted**, which is why it is last — there
+is no `nohup` and no background job to set up. Interrupt the kernel when you are
+done.
 
-Then read the URL out of the log, once, after the tunnel is up:
+Then read the URL out of the cell output, once, after the tunnel is up:
 
-```python
-!grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1
+```
+https://<something>.trycloudflare.com
 ```
 
 Point the client at `https://<that-url>/v1`. Only now is Stage 2 reachable.
@@ -190,8 +192,8 @@ Point the client at `https://<that-url>/v1`. Only now is Stage 2 reachable.
 |---|---|
 | URL changes every session | Quick tunnels have no fixed hostname. Re-read it after each restart. |
 | Public and unauthenticated to probe | The bearer key is the only control. No IP allowlist, no TLS you control. |
-| Process dies with the kernel | The tunnel is gone when the session ends. Re-run Cell D. |
-| Notebook autosave | `nohup` plus a background job keeps it saving; do not run the tunnel in the foreground. |
+| Process dies with the kernel | The tunnel is gone when the session ends. Re-run Cell 19. |
+| Notebook autosave | Cell 19 runs in the foreground and blocks. Save before you start it, and expect the cell output to grow for as long as it runs. |
 | Binding | Uvicorn binds `0.0.0.0:8000`, cloudflared dials `127.0.0.1:8000` — keep both on the default port or change both. |
 
 ---
@@ -220,8 +222,8 @@ Everything is an environment variable, so the core server never needs editing.
 | `N_ATLAS_STRICT_GPU` | `1` | `0` permits CPU (dev only). |
 | `N_ATLAS_HOST` / `N_ATLAS_PORT` | `0.0.0.0` / `8000` | Bind address. |
 
-`PYTORCH_ALLOC_CONF` is set to `expandable_segments:True` in Cell 1 before CUDA
-initialises. It only takes effect in a fresh kernel, so re-run Cell 1 if you
+`PYTORCH_ALLOC_CONF` is set to `expandable_segments:True` in Cell 2 before CUDA
+initialises. It only takes effect in a fresh kernel, so re-run Cell 2 if you
 restart mid-notebook.
 
 ---
@@ -276,6 +278,45 @@ Write the entire reply in Yoruba. Do not use English, Hausa or Igbo.
   Nigerian language wins. `How are you? Yaya kake?` targets Hausa, not English.
 - Set `N_ATLAS_LANGUAGE_TAGGING=0` to turn it off.
 
+### Pinned language mode
+
+A client that wants one language for every reply says so per request, in the
+top-level `language` field:
+
+```json
+{ "model": "n-atlas", "messages": [...], "language": "ha" }
+```
+
+`"en"`, `"ha"`, `"yo"` or `"ig"` pin the reply; `"auto"`, `null` or an absent
+field keeps detection. Anything else is rejected with `400`.
+
+When a pin is present the detector **does not run** for that request, and a
+harder directive replaces the detected one:
+
+```
+[language] HARD LANGUAGE MODE: every reply must be written in Hausa.
+The user's message may be written in another language; that does not change
+this mode. Write the entire reply in Hausa and do not use English, Yoruba, Igbo.
+```
+
+That is the whole point: a pin is a statement about the reply, so it has to hold
+when the message disagrees with it. The built-in system prompt's Yoruba/Igbo
+marker rules yield to it — they describe a default, this is a choice.
+
+Two properties worth relying on:
+
+- **Additive.** `ChatCompletionRequest` is `extra="allow"`, so an older server
+  ignores the field rather than rejecting the request, and a client that never
+  sends it is unaffected. A client also sends a directive on the turn, so a pin
+  still works against a build that predates this field.
+- **Reported back.** The response echoes `"language"` with what was applied. It
+  is informational: an older SDK may drop an unknown response field, so do not
+  depend on reading it.
+
+The other two call paths — `generate_response()` and the Cell 14 self-test —
+omit the field and stay on auto, which is why the existing language-adherence
+checks are unchanged.
+
 **2. Model adherence.** The server relays whatever the model produces. On the
 T4, N-ATLaS ignored the marker hints in the system prompt and answered in the
 wrong language, which is what motivated the deterministic tagger above.
@@ -287,7 +328,7 @@ wrong language, which is what motivated the deterministic tagger above.
 | `Kedu ka ị mere?` | `Ina lafiya.` | Hausa, not Igbo |
 | `Kana lafiya?` | `Eh, na gode! Kuma ku?` | correct Hausa |
 
-It never refuses — it answers, in the wrong language. Cell 13 now checks the
+It never refuses — it answers, in the wrong language. Cell 14 now checks the
 tagger and the model separately, so the report distinguishes "my code chose the
 wrong language" from "the model ignored a correct instruction":
 
@@ -331,14 +372,14 @@ print(reply.choices[0].message.content)
 
 Streaming (`stream=true`) is **not** supported and returns `400`.
 
-### NAFDAC verification (Cell 17)
+### NAFDAC verification (Cell 18)
 
 A chat message carrying a NAFDAC number is verified before generation, and the
 verified record is injected as a system message. The model then writes the
 reply in the user's language from those values, so a product name, status,
 applicant or approval date can only come from the data.
 
-Cell 17 loads the shared `nafdac_source` package and reads, in order:
+Cell 18 loads the shared `nafdac_source` package and reads, in order:
 
 1. **PostgreSQL** via `NAFDAC_DATABASE_URL`. The only source reachable from
    Kaggle, and the one carrying superseded, withdrawn and recalled products.
@@ -364,7 +405,7 @@ A number that is not found is a `200` with `found=false`, not a `404`: not
 being in the export is a normal answer, not a client error. A request with no
 number in it at all is a `400`.
 
-Check Cell 17 on its own, without a GPU:
+Check Cell 18 on its own, without a GPU:
 
 ```bash
 python verify_nafdac.py
@@ -410,7 +451,7 @@ and leaves a dangling `user`. Mid-sentence uses of `user:` and numbered lists
 python verify_offline.py
 ```
 
-This runs all 17 cells with `mock_backend.py` substituted for the real model,
+This runs all 18 cells with `mock_backend.py` substituted for the real model,
 boots a real uvicorn server on a free port, and exercises every assertion over
 real HTTP, plus extra assertions the notebook does not make: forced CUDA OOM →
 `507`, forced generation failure → `500`, and a live OpenAI SDK round-trip.
@@ -430,7 +471,7 @@ usage, and tokens/second can only be confirmed on the T4.
 
 ## Stage 1 gate
 
-Cells 11–16 cover all of the following:
+Cells 12–17 cover all of the following:
 
 - [x] model loads, GPU recognised, 4-bit NF4 active
 - [x] English / Hausa / Yoruba / Igbo generation
@@ -448,7 +489,7 @@ Cells 11–16 cover all of the following:
 
 On the T4, the two GPU checks must report `PASS`, not `SKIP`.
 
-Cell 13 reports language adherence as one aggregate line
+Cell 14 reports language adherence as one aggregate line
 (`replies stay in the requested language (N/8)`) so a single model-quality
 number is visible without burying it in eight near-identical failures. It is
 still a gate: any miss fails the run, because your spec lists Hausa, Yoruba and
@@ -464,9 +505,9 @@ cannot drift out of sync with `natlas_notebook.py`.
 
 | Script | Runs | Use |
 |---|---|---|
-| `kaggleserver.py` | Cells 1–7 | Engine only, no HTTP. Smoke-tests all four languages. |
-| `apiserver.py` | Cells 1–10 | Engine + FastAPI on `0.0.0.0:8000`, blocks until Ctrl+C. |
-| `kaggle.py` | any range | `python kaggle.py --list`, `--cells 1-7`, `--cells 1-10`. |
+| `kaggleserver.py` | Cells 2–8 | Engine only, no HTTP. Smoke-tests all four languages. |
+| `apiserver.py` | Cells 1–11 plus Cell 18 | Engine + FastAPI on `0.0.0.0:8000`, blocks until Ctrl+C. |
+| `kaggle.py` | any range | `python kaggle.py --list`, `--cells 2-8`, `--cells 2-11`. |
 
 ```bash
 python kaggle.py --list                 # cell map
@@ -502,9 +543,10 @@ Only after Stage 1 fully passes:
 Kaggle server → secure external tunnel → laptop client
 ```
 
-The tunnel is documented as manual cells under
-[Kaggle setup cells](#kaggle-setup-cells) (Cell D above). It is not wired into
-the server code, and no tunnel URL is assumed anywhere in it.
+The tunnel is Cell 19, at the bottom of the notebook, already implemented
+there: it downloads cloudflared and runs
+`cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate`. It is not part
+of the server code, and no tunnel URL is assumed anywhere in the server.
 
 The laptop client exists already — `../n_atlas_client/` (`python -m
 n_atlas_client`, or the standalone `../n_atlas_client/n_atlas.py`) — and needs
