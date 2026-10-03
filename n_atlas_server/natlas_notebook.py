@@ -486,6 +486,16 @@ RUNTIME_DEPS = {
     "safetensors": "safetensors",
 }
 
+# The greenbook's PostgreSQL driver. Installed only when NAFDAC_DATABASE_URL is
+# set, because that is the only thing that needs it. Without this, a correct DSN
+# still reads as "configured but no PostgreSQL driver installed" on Kaggle, whose
+# image does not ship psycopg, and Cell 18 has no way to tell that apart from a
+# genuinely unreachable database. The notebook still runs without it: the source
+# is reported as unusable rather than aborting Cell 3.
+NAFDAC_DEPS = {
+    "psycopg": "psycopg[binary]",
+}
+
 
 def _missing_deps(deps: Dict[str, str]) -> List[Tuple[str, str]]:
     import importlib.util
@@ -530,6 +540,9 @@ ensure_dependencies(SERVER_DEPS, "server")
 
 if CONFIG.strict_gpu and DEVICE == "cuda":
     ensure_dependencies(RUNTIME_DEPS, "model runtime")
+
+if os.environ.get("NAFDAC_DATABASE_URL", "").strip():
+    ensure_dependencies(NAFDAC_DEPS, "greenbook PostgreSQL source")
 
 import fastapi
 import pydantic
@@ -1963,6 +1976,10 @@ def nafdac_sources():
     Exposed because the answer to "is the database connected?" otherwise
     requires reading the server log, and that is the first question when a
     verification returns nothing.
+
+    Answers even when the greenbook failed to load. A 503 here used to hide the
+    very reason it was failing, which is the one thing an operator needs; the
+    body carries that reason instead.
     """
     if not callable(NAFDAC_HOOKS["status"]):
         raise ModelUnavailable("The NAFDAC greenbook data is not loaded.")
@@ -3049,12 +3066,156 @@ else:
 # uploaded as a dataset and the mount path is not something this notebook can
 # assume. Every entry is treated as a candidate *parent* directory containing
 # `nafdac_source/`, or as the package directory itself.
+#
+# Kaggle does not mount an attached dataset at one predictable place. It has
+# used /kaggle/input/<slug>, and also /kaggle/input/datasets/<owner>/<slug>,
+# where the owner segment alone makes any fixed list of slugs wrong. So the
+# discovered directories below are walked for on disk and searched first; the
+# hardcoded paths stay as a fallback for the flat layout.
+#
+# This cell still needs Cell 2 (Path, os, logger, WORKDIR, the typing names).
+# It is imported here as well so that running this cell on its own fails on the
+# genuinely missing prerequisite rather than on an annotation, which reads like
+# a bug in the cell instead of "you skipped the cells above".
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
+
+
+def _adopt_flat_package(directory: str) -> Optional[str]:
+    """Recover a dataset whose package files sit at the mount root.
+
+    Zipping the nafdac_source/ folder from a file browser produces an archive
+    whose entries are the package's own files, so it extracts as
+    <mount>/__init__.py rather than <mount>/nafdac_source/__init__.py. Python
+    cannot import that as `nafdac_source`, because no directory of that name
+    exists, so every search path misses and the cell reports NOT CONNECTED even
+    though the code is right there.
+
+    Linking the directory under the expected name in a writable location fixes
+    it. A symlink is tried first and a copy is the fallback, because Kaggle's
+    /kaggle/working allows both but symlink creation can be refused.
+    """
+    import shutil
+
+    source = Path(directory)
+    if not (source / "__init__.py").is_file():
+        return None
+    if not (source / "sources.py").is_file():
+        return None
+
+    adopted = Path(WORKDIR) / "nafdac_source"
+    if adopted.exists():
+        return str(adopted.parent)
+    try:
+        WORKDIR.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not prepare %s: %r", WORKDIR, exc)
+        return None
+    try:
+        adopted.symlink_to(source, target_is_directory=True)
+        logger.info("linked %s as %s", source, adopted)
+        return str(adopted.parent)
+    except (OSError, NotImplementedError, AttributeError):
+        pass
+    try:
+        shutil.copytree(str(source), str(adopted))
+        logger.info("copied %s to %s", source, adopted)
+        return str(adopted.parent)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not adopt the flat package at %s: %r", source, exc)
+        return None
+
+
+def _discover_nafdac_dirs() -> List[str]:
+    """Every directory under /kaggle/input that holds a nafdac_source package.
+
+    Walking beats globbing here. Kaggle mounts an attached dataset through a
+    symlink, and glob's recursive '**' does not descend into a symlinked
+    directory, so a glob search reports nothing at all even when the dataset is
+    attached and sitting exactly where it should be. os.walk with followlinks
+    sees through the mount, and it also covers /kaggle/working, so the package
+    works whether it came in as a dataset or was written by an earlier cell.
+    """
+    discovered: List[str] = []
+    seen = set()
+
+    def add(path_str: str) -> None:
+        if path_str not in seen:
+            seen.add(path_str)
+            discovered.append(path_str)
+
+    for root in ("/kaggle/input", "/kaggle/working"):
+        try:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+                # A parent directory that contains the package.
+                if "nafdac_source" in dirnames:
+                    if (Path(dirpath) / "nafdac_source" / "__init__.py").is_file():
+                        add(dirpath)
+                    continue
+                # A flat mount: the package's own files, with no directory
+                # named nafdac_source above them.
+                if "__init__.py" in filenames and "sources.py" in filenames:
+                    adopted = _adopt_flat_package(dirpath)
+                    if adopted:
+                        add(adopted)
+                if len(discovered) >= 8:
+                    break
+        except Exception as exc:  # noqa: BLE001 - discovery must not stop the cell
+            logger.warning("nafdac discovery failed under %s: %r", root, exc)
+    return discovered
+
+
+def _describe_kaggle_input(limit: int = 12) -> str:
+    """What is actually mounted, so a failure names the real layout.
+
+    Without this the error could only say which paths were tried, which is no
+    help when the dataset is mounted somewhere nobody guessed.
+    """
+    root = Path("/kaggle/input")
+    if not root.is_dir():
+        return "/kaggle/input does not exist"
+    try:
+        entries = sorted(root.iterdir())
+    except Exception as exc:  # noqa: BLE001
+        return f"/kaggle/input could not be listed: {exc!r}"
+    if not entries:
+        return "/kaggle/input is empty, so no dataset is attached to this session"
+    described = []
+    for entry in entries[:limit]:
+        if entry.is_dir():
+            try:
+                nested = sorted(c.name for c in entry.iterdir() if c.is_dir())[:6]
+            except Exception:  # noqa: BLE001
+                nested = []
+            shown = f"{entry.name}/[{', '.join(nested)}]" if nested else f"{entry.name}/"
+            described.append(shown)
+        else:
+            described.append(entry.name)
+    if len(entries) > limit:
+        described.append(f"... +{len(entries) - limit} more")
+    return " | ".join(described)
+
+
+NAFDAC_DISCOVERED_DIRS = _discover_nafdac_dirs()
+
+# The dataset slug names Kaggle was observed to use, in both mount layouts:
+# flat at /kaggle/input/<slug>, and nested under the owner at
+# /kaggle/input/datasets/<owner>/<slug>. The discovered directories come first
+# because they are found rather than assumed; these are the documented
+# fallbacks, kept explicit so the list says where the package is expected.
+NAFDAC_DATASET_SLUGS = (
+    "n-atlas-source",
+    "nafdac-source",
+    "natlas-source",
+    "n-afdac-source",
+)
+
 NAFDAC_SEARCH_DIRS = [
     os.environ.get("NAFDAC_SOURCE_DIR", ""),
-    "/kaggle/input/n-atlas-source",
-    "/kaggle/input/nafdac-source",
-    "/kaggle/input/natlas-source",
-    "/kaggle/input/n-afdac-source",
+    *NAFDAC_DISCOVERED_DIRS,
+    *[f"/kaggle/input/{slug}" for slug in NAFDAC_DATASET_SLUGS],
+    *[f"/kaggle/input/datasets/sabuwa/{slug}" for slug in NAFDAC_DATASET_SLUGS],
     str(WORKDIR / "nafdac_source"),
     str(WORKDIR),
     str(Path.cwd()),
@@ -3503,6 +3664,15 @@ def _import_nafdac_source() -> bool:
         NAFDAC_IMPORT_ERROR = (
             "nafdac_source/__init__.py not found in any of: "
             + ", ".join(tried[:6])
+            + ". "
+            + (
+                "Discovered by walking /kaggle/input and /kaggle/working: "
+                + ", ".join(NAFDAC_DISCOVERED_DIRS)
+                if NAFDAC_DISCOVERED_DIRS
+                else "A walk of /kaggle/input and /kaggle/working found no "
+                "nafdac_source package. What is actually mounted: "
+                + _describe_kaggle_input()
+            )
         )
     return False
 
@@ -3541,18 +3711,37 @@ def _build_nafdac_sources() -> List[Any]:
 
 
 def _nafdac_status() -> Dict[str, Any]:
-    """The payload behind /health's nafdac field and /v1/nafdac/sources."""
+    """The payload behind /health's nafdac field and /v1/nafdac/sources.
+
+    Reports the failure as carefully as the success. A deployment that cannot
+    verify anything is a real, common state — a Kaggle dataset was not attached —
+    and the fastest way to fix it is to see the list of paths that were searched
+    next to the reason, so the operator can tell "not attached" from "attached
+    under a different slug".
+    """
     if not NAFDAC_AVAILABLE:
-        return {
+        payload: Dict[str, Any] = {
             "enabled": False,
             "reason": NAFDAC_IMPORT_ERROR or "nafdac_source is not importable",
+            "searched_dirs": [d for d in NAFDAC_SEARCH_DIRS if d],
             "hint": (
-                "Upload the nafdac_source/ directory as a Kaggle dataset, or set "
-                "NAFDAC_SOURCE_DIR to a directory containing it."
+                "The nafdac_source/ package must be importable AND a data file "
+                "must be readable. Either failure leaves enabled=false. Upload a "
+                "Kaggle dataset containing nafdac_source/ and "
+                "nafdac_greenbook.csv, attach it, and either name the slug "
+                "n-atlas-source (also accepted: nafdac-source, natlas-source, "
+                "n-afdac-source) or set NAFDAC_SOURCE_DIR to its mount path. "
+                "The CSV is found automatically once the package is importable. "
+                "Set NAFDAC_DATABASE_URL before Cell 18 for PostgreSQL. "
+                "Env vars must be set before Cell 18 runs: it builds its source "
+                "list at that moment."
             ),
         }
+        if not NAFDAC_ENABLED:
+            payload["reason"] = "disabled by N_ATLAS_NAFDAC_ENABLED=0"
+        return payload
 
-    payload: Dict[str, Any] = {"enabled": True, "sources": []}
+    payload = {"enabled": True, "sources": []}
     for source in NAFDAC_SOURCES:
         try:
             detail = source.describe()
@@ -3568,10 +3757,20 @@ def _nafdac_status() -> Dict[str, Any]:
     payload["any_source_usable"] = any(
         entry["usable"] for entry in payload["sources"]
     )
+
+    # `enabled` alone is not a health signal: it means the package imported, which
+    # still happens when every data file is missing. A server in that state
+    # answers every question from the model's memory while reporting itself as
+    # verification-capable, which is the exact failure this system exists to
+    # prevent. `ready` is the field worth gating on.
+    payload["ready"] = bool(payload["any_source_usable"])
     if not payload["any_source_usable"]:
         payload["hint"] = (
-            "No source is reachable. Set NAFDAC_DATABASE_URL for a hosted "
-            "database, or NAFDAC_CSV_PATH to an uploaded nafdac_greenbook.csv."
+            "nafdac_source imported, but no data file was found, so nothing can "
+            "be verified. Upload nafdac_greenbook.csv as a Kaggle dataset and "
+            "attach it (it is found automatically once the package is "
+            "importable), set NAFDAC_CSV_PATH to it, or set NAFDAC_DATABASE_URL "
+            "for PostgreSQL. Set these before Cell 18 runs."
         )
     return payload
 
@@ -3746,7 +3945,6 @@ if NAFDAC_AVAILABLE:
 
     NAFDAC_HOOKS["verify"] = verify_nafdac_product
     NAFDAC_HOOKS["search"] = search_products
-    NAFDAC_HOOKS["status"] = _nafdac_status
     NAFDAC_HOOKS["enrich"] = _nafdac_enrich
 
     # A read-only check at startup: it costs one round trip, and it means a
@@ -3771,33 +3969,71 @@ else:
     else:
         _probe_note = f"unavailable: {NAFDAC_IMPORT_ERROR}"
 
-print("=" * 70)
-print("NAFDAC GREENBOOK")
-print("=" * 70)
-if NAFDAC_AVAILABLE:
-    for _entry in _nafdac_status().get("sources", []):
+# Registered whether or not the data loaded. This is the only diagnostic that can
+# say *why* a deployment has no greenbook, so it must survive the failure it
+# describes: registering it only on success meant a missing dataset also removed
+# the endpoint that would have named it, and /health fell back to the useless
+# "greenbook data is not loaded yet".
+NAFDAC_HOOKS["status"] = _nafdac_status
+
+if not NAFDAC_AVAILABLE:
+    _readiness = _nafdac_status()
+    logger.error(
+        "NAFDAC greenbook NOT available. The server is running and will answer, "
+        "but it cannot verify anything: %s",
+        _readiness.get("reason"),
+    )
+    logger.error("Fix: %s", _readiness.get("hint"))
+    print("=" * 70)
+    print("NAFDAC GREENBOOK — NOT CONNECTED")
+    print("=" * 70)
+    print(f"  reason: {_readiness.get('reason')}")
+    print(f"  fix:    {_readiness.get('hint')}")
+    print("  Until this is fixed, product questions are answered from the model's")
+    print("  own memory, not from the greenbook. That is how a cough syrup ends up")
+    print("  described with ingredients nobody put in the database.")
+    print("=" * 70)
+else:
+    _status = _nafdac_status()
+    print("=" * 70)
+    print("NAFDAC GREENBOOK")
+    print("=" * 70)
+    for _entry in _status.get("sources", []):
         _mark = "ok " if _entry["usable"] else "-- "
         print(f"  {_mark}{_entry['name']:<9} {_entry['detail']}")
-else:
-    print(f"  unavailable: {_probe_note}")
-print(f"  {_probe_note}")
-print("=" * 70)
+    print(f"  {_probe_note}")
+    # The package importing is not the same as being able to verify. Say so,
+    # loudly, rather than letting a green-looking banner hide a server that will
+    # answer every product question from memory.
+    if not _status.get("ready"):
+        logger.error(
+            "NAFDAC greenbook imported but NOT usable: %s", _status.get("hint")
+        )
+        print("  NOT USABLE: the package loaded but no data file was found.")
+        print(f"  {_status.get('hint')}")
+        print("  /health reports nafdac.enabled=true but nafdac.ready=false.")
+    print("=" * 70)
 
 # %% [code]
 # =============================================================================
-# CELL 19 — Public tunnel (cloudflared)
+# CELL 19 — Named Cloudflare tunnel (cloudflared)
 # =============================================================================
 # The last cell. It publishes the server Cell 11 bound on 0.0.0.0:8000, which is
-# otherwise unreachable from outside the Kaggle VM, and prints the
-# https://<something>.trycloudflare.com URL to paste into the laptop client as
-# N_ATLAS_BASE_URL.
+# otherwise unreachable from outside the Kaggle VM. It runs a *named* tunnel from
+# a token, not a quick tunnel: the public hostname is the one configured in the
+# Cloudflare Zero Trust dashboard, so it is stable instead of changing every run.
+#
+# The dashboard's Public Hostname must point at http://localhost:8000 to match
+# CONFIG.port. A named tunnel takes where-to-serve from the token, not from a
+# command line flag, so a port mismatch surfaces as a 502 from the edge rather
+# than as an error here.
 #
 # Two warnings, both real:
 #
-#   * A quick tunnel URL is anonymous and changes every run. There is no
-#     authentication at the edge, so anyone holding the URL plus the bearer key
-#     can spend the GPU. Treat it as a development tunnel and stop the session
-#     when the work is done.
+#   * The token below is a live credential, hard coded on purpose so this cell is
+#     runnable with nothing to paste. Anyone holding it plus the bearer key can
+#     spend the GPU, so treat it as a development token, rotate it in the
+#     dashboard if it leaks, and remember that this notebook file contains it.
 #   * The tunnel blocks until interrupted. It is the last cell for that reason.
 #
 # login() prompts for a Hugging Face token on stdin. Nothing here needs it — the
@@ -3807,27 +4043,61 @@ try:
 except Exception as exc:  # noqa: BLE001 - the tunnel does not depend on it
     print(f"[tunnel] Hugging Face login skipped: {type(exc).__name__}: {exc}")
 
-CLOUDFLARED_BINARY = WORKDIR / "cloudflared"
-CLOUDFLARED_URL = (
+CLOUDFLARED_DEB_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+    "cloudflared-linux-amd64.deb"
+)
+CLOUDFLARED_RAW_URL = (
     "https://github.com/cloudflare/cloudflared/releases/latest/download/"
     "cloudflared-linux-amd64"
 )
+CLOUDFLARED_DEB = WORKDIR / "cloudflared-linux-amd64.deb"
+CLOUDFLARED_FALLBACK = WORKDIR / "cloudflared"
+
+# Zero Trust -> Networks -> Tunnels -> <tunnel name> -> Install connector. The
+# token is pasted in as a literal rather than read from an env var so the cell
+# runs on Kaggle as-is; rotating it means editing this one line.
+TUNNEL_TOKEN = "eyJhIjoiZGQwYTIyYTI1N2NkZWUxMGQ2MzBjZjAzZjAwNmFlYTYiLCJ0IjoiNzQ4ODM4NzctZWZiNC00OTY4LWE5YjAtNGZjOTIzOTg2NTJlIiwicyI6IlpHSTBZVEJtWlRBdFlUWTNNeTAwTkdZNUxXSmhNbVV0TXpWbVpXWTNaamN4TldZeSJ9"
+
 TUNNEL_TARGET = f"http://127.0.0.1:{CONFIG.port}"
 
 subprocess.run(
-    ["wget", "-q", CLOUDFLARED_URL, "-O", str(CLOUDFLARED_BINARY)],
+    ["wget", "-q", CLOUDFLARED_DEB_URL, "-O", str(CLOUDFLARED_DEB)],
     check=True,
 )
-os.chmod(CLOUDFLARED_BINARY, 0o755)
-print(f"[tunnel] {CLOUDFLARED_BINARY} ready, exposing {TUNNEL_TARGET}")
-print("[tunnel] copy the trycloudflare.com URL it prints into N_ATLAS_BASE_URL")
+_dpkg = subprocess.run(
+    ["dpkg", "-i", str(CLOUDFLARED_DEB)],
+    capture_output=True,
+    text=True,
+)
+if _dpkg.returncode != 0:
+    # dpkg refuses to install when a dependency is missing. The standalone
+    # binary has none, so fall back to it rather than dying on a warning.
+    print(f"[tunnel] dpkg -i failed, falling back to the standalone binary: {_dpkg.stderr.strip()}")
+    subprocess.run(
+        ["wget", "-q", CLOUDFLARED_RAW_URL, "-O", str(CLOUDFLARED_FALLBACK)],
+        check=True,
+    )
+    os.chmod(CLOUDFLARED_FALLBACK, 0o755)
+
+CLOUDFLARED_BINARY = Path("/usr/bin/cloudflared")
+if not CLOUDFLARED_BINARY.exists():
+    CLOUDFLARED_BINARY = CLOUDFLARED_FALLBACK
+
+subprocess.run([str(CLOUDFLARED_BINARY), "--version"], check=True)
+print(f"[tunnel] {CLOUDFLARED_BINARY} ready, serving {TUNNEL_TARGET}")
+print("[tunnel] copy the public hostname from the Cloudflare dashboard into N_ATLAS_BASE_URL")
 
 subprocess.call(
     [
         str(CLOUDFLARED_BINARY),
         "tunnel",
-        "--url",
-        TUNNEL_TARGET,
+        # --no-autoupdate is a `tunnel` command option, not a `run` subcommand
+        # one, so it has to sit in front of "run" or cloudflared exits with
+        # "flag provided but not defined" before dialling anything.
         "--no-autoupdate",
+        "run",
+        "--token",
+        TUNNEL_TOKEN,
     ]
 )

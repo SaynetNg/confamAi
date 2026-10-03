@@ -166,35 +166,38 @@ ephemeral.
 skipped checks.** It is the last cell in the notebook, after the Cell 17 gate,
 never in the run above it.
 
-```python
-./cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate
+```bash
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+dpkg -i cloudflared-linux-amd64.deb
+cloudflared tunnel run --token "<tunnel token>"
 ```
 
 Uvicorn is already bound by Cell 11 and already proven by Cells 12–16, so
 `127.0.0.1:8000` is known good before this runs. If Stage 1 has not passed,
 there is nothing worth exposing.
 
-Both commands above are already implemented in Cell 19: it downloads
-cloudflared, marks it executable and runs the tunnel itself, so there is nothing
-left to paste. It **blocks until interrupted**, which is why it is last — there
-is no `nohup` and no background job to set up. Interrupt the kernel when you are
-done.
+All three commands above are already implemented in Cell 19: it installs
+cloudflared from the `.deb` and runs the named tunnel with the token pasted
+into the cell, so there is nothing left to paste. It **blocks until
+interrupted**, which is why it is last — there is no `nohup` and no background
+job to set up. Interrupt the kernel when you are done.
 
-Then read the URL out of the cell output, once, after the tunnel is up:
-
-```
-https://<something>.trycloudflare.com
-```
-
-Point the client at `https://<that-url>/v1`. Only now is Stage 2 reachable.
+This is a **named** tunnel, not a quick tunnel, so there is no
+`trycloudflare.com` URL in the output. The hostname is the Public Hostname
+configured for the tunnel in the Cloudflare Zero Trust dashboard, and it must
+point at `http://localhost:8000` to match `CONFIG.port`. A named tunnel learns
+where to serve from its token, so a port mismatch shows up as a `502` from the
+edge rather than as an error in the cell. Paste the dashboard hostname into the
+client as `https://<that-hostname>/v1`. Only now is Stage 2 reachable.
 
 | Concern | Handling |
 |---|---|
-| URL changes every session | Quick tunnels have no fixed hostname. Re-read it after each restart. |
+| Token is a live credential | It is hard coded in Cell 19 so the cell runs as-is, which means the notebook file contains it. Rotate it in the dashboard if it leaks. |
+| Hostname fixed by the dashboard | One hostname for every run, but a change there needs no notebook edit. |
 | Public and unauthenticated to probe | The bearer key is the only control. No IP allowlist, no TLS you control. |
 | Process dies with the kernel | The tunnel is gone when the session ends. Re-run Cell 19. |
 | Notebook autosave | Cell 19 runs in the foreground and blocks. Save before you start it, and expect the cell output to grow for as long as it runs. |
-| Binding | Uvicorn binds `0.0.0.0:8000`, cloudflared dials `127.0.0.1:8000` — keep both on the default port or change both. |
+| Binding | Uvicorn binds `0.0.0.0:8000`, the dashboard Public Hostname serves `http://localhost:8000` — keep both on the default port or change both. |
 
 ---
 
@@ -544,9 +547,10 @@ Kaggle server → secure external tunnel → laptop client
 ```
 
 The tunnel is Cell 19, at the bottom of the notebook, already implemented
-there: it downloads cloudflared and runs
-`cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate`. It is not part
-of the server code, and no tunnel URL is assumed anywhere in the server.
+there: it installs cloudflared from the `.deb` and runs
+`cloudflared tunnel run --token "<tunnel token>"` against the named tunnel.
+It is not part of the server code, and no tunnel hostname is assumed anywhere in
+the server.
 
 The laptop client exists already — `../n_atlas_client/` (`python -m
 n_atlas_client`, or the standalone `../n_atlas_client/n_atlas.py`) — and needs

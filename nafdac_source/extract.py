@@ -17,6 +17,7 @@ the digits agree. Everything else is cosmetic.
 
 import re
 import unicodedata
+from typing import List
 
 # The greenbook writes an NRN as an optional letter prefix, one or two digits, a
 # separator, then the serial: `A4-100160`, `B4-6238`, `04-3877`, `C4-1142`,

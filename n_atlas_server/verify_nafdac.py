@@ -13,7 +13,9 @@ This checks the three things that can break Cell 18 without a GPU:
 import json
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 import typing
 from pathlib import Path
 
@@ -493,6 +495,174 @@ def run_gate_tests(result, check):
     restore()
 
 
+def _run_cell18_isolated(search_dirs_replacement=None):
+    """Run Cell 18 in a clean subprocess and return its namespace as JSON.
+
+    A subprocess is required, not stylistic. `nafdac_source` is already in
+    `sys.modules` by the time this test runs, and `_import_nafdac_source()`
+    returns True immediately when it sees that. Re-executing Cell 18 in this
+    process would therefore always report the greenbook as loaded and the test
+    would pass for the wrong reason. A fresh interpreter is the only honest
+    simulation of a Kaggle session.
+
+    The environment always points the data search at files that do not exist, so
+    a data file can never be found. `search_dirs_replacement` additionally hides
+    the package itself, which is the unattached-dataset case.
+    """
+    source = notebook_cells.read_source()
+    if search_dirs_replacement:
+        # Override the whole list rather than its first entry: the list also
+        # contains WORKDIR and the cwd, so editing only the environment entry
+        # would still find the package sitting in the project root.
+        marker = "    str(Path.cwd()),\n]"
+        if marker not in source:
+            raise AssertionError("could not locate the end of NAFDAC_SEARCH_DIRS")
+        source = source.replace(
+            marker,
+            marker + "\n# overridden by the test\nNAFDAC_SEARCH_DIRS = "
+            + search_dirs_replacement,
+            1,
+        )
+    body = notebook_cells.code_cells(source)[17]
+
+    # Written to a file rather than passed with -c: the cell body is far longer
+    # than Windows will accept on a command line.
+    harness = (
+        "import json, logging, pathlib, sys, typing\n"
+        "logging.basicConfig(level=logging.CRITICAL)\n"
+        "ns = {\n"
+        "    'os': __import__('os'),\n"
+        "    're': __import__('re'),\n"
+        "    'json': __import__('json'),\n"
+        "    'unicodedata': __import__('unicodedata'),\n"
+        "    'sys': sys,\n"
+        "    'Path': pathlib.Path,\n"
+        "    'logger': logging.getLogger('isolated'),\n"
+        "    'WORKDIR': pathlib.Path('.'),\n"
+        "    '_env_flag': lambda n, d=False: d,\n"
+        "    '_env_int': lambda n, d=0: d,\n"
+        "    'Any': typing.Any, 'List': typing.List,\n"
+        "    'Dict': typing.Dict, 'Optional': typing.Optional,\n"
+        "    'NAFDAC_HOOKS': {},\n"
+        "    'MODEL': None,\n"
+        "}\n"
+        "exec(compile(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'),"
+        " 'cell18', 'exec'), ns)\n"
+        "out = ns['_nafdac_status']()\n"
+        "out['_hook_registered'] = callable(ns['NAFDAC_HOOKS'].get('status'))\n"
+        "out['_enrich_declines'] = ns['_nafdac_enrich'](\n"
+        "    [{'role': 'user', 'content': 'Is Lonart genuine?'}]\n"
+        ") is None\n"
+        "print('@@JSON@@' + json.dumps(out))\n"
+    )
+
+    env = dict(os.environ)
+    # Point the data search somewhere with no greenbook file in it.
+    env["NAFDAC_SOURCE_DIR"] = str(HERE / "no-such-dir")
+    env["NAFDAC_CSV_PATH"] = str(HERE / "no-such-dir" / "nafdac_greenbook.csv")
+    env["NAFDAC_XLSX_PATH"] = str(HERE / "no-such-dir" / "nafdac_greenbook.xlsx")
+    env["NAFDAC_AUTODETECT_FILES"] = "0"
+    env.pop("NAFDAC_DATABASE_URL", None)
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        body_file = Path(tmp) / "cell18.py"
+        harness_file = Path(tmp) / "harness.py"
+        body_file.write_text(body, encoding="utf-8")
+        harness_file.write_text(harness, encoding="utf-8")
+        # The project root, so the package is importable unless the test hides
+        # it. That is what separates "dataset not attached" from "data file
+        # missing", which behave very differently.
+        completed = subprocess.run(
+            [sys.executable, str(harness_file), str(body_file)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            cwd=str(HERE.parent),
+            env=env,
+        )
+
+    if completed.returncode != 0:
+        raise AssertionError(
+            "isolated Cell 18 failed (rc=%s):\n%s"
+            % (completed.returncode, completed.stderr.strip()[-2000:])
+        )
+    marker_line = "@@JSON@@"
+    for line in completed.stdout.splitlines():
+        if line.startswith(marker_line):
+            return json.loads(line[len(marker_line) :])
+    raise AssertionError("isolated Cell 18 printed no status payload")
+
+
+def run_absent_greenbook_tests(check):
+    """A deployment with no greenbook must be diagnosable, not merely silent.
+
+    This is the state that actually happens on Kaggle when the dataset is not
+    attached, and it is the hardest one to debug: the server still answers every
+    question, so nothing looks broken. Before this was fixed, the endpoint meant
+    to explain the failure returned 503 as well, so the reason was invisible from
+    outside, and /health said only "greenbook data is not loaded yet".
+    """
+    print("\n--- greenbook absent: is the failure diagnosable? --------")
+
+    # Nothing importable and nothing readable: the unattached-notebook case.
+    absent = _run_cell18_isolated('["/nonexistent/a", "/nonexistent/b"]')
+    check(
+        "the status hook is registered even though nothing loaded",
+        absent.get("_hook_registered") is True,
+    )
+    check("enabled is False", absent.get("enabled") is False, json.dumps(absent)[:140])
+    check(
+        "a reason is given",
+        bool(absent.get("reason")),
+        str(absent.get("reason"))[:140],
+    )
+    check(
+        "the paths searched are listed, so the mount can be compared",
+        bool(absent.get("searched_dirs")),
+        str(absent.get("searched_dirs"))[:140],
+    )
+    hint = absent.get("hint") or ""
+    for token in (
+        "nafdac_source",
+        "nafdac_greenbook.csv",
+        "NAFDAC_SOURCE_DIR",
+        "NAFDAC_DATABASE_URL",
+        "Cell 18",
+    ):
+        check(f"the fix names {token}", token in hint)
+    check(
+        "the enrich hook declines rather than raising",
+        absent.get("_enrich_declines") is True,
+    )
+
+    # The package importable but no data file: `enabled` is true here, because
+    # the import succeeded, yet the server still cannot verify anything. This is
+    # the case that matters most, because a green banner would hide it.
+    no_data = _run_cell18_isolated()
+    if no_data.get("enabled") is True:
+        check(
+            "a loaded package with no data file reports enabled but not ready",
+            no_data.get("ready") is False,
+            json.dumps(no_data)[:140],
+        )
+        check(
+            "and says why",
+            "no data file" in (no_data.get("hint") or ""),
+            str(no_data.get("hint"))[:120],
+        )
+        check(
+            "and is never described as ready",
+            no_data.get("ready") is not True,
+        )
+    else:
+        check(
+            "with no data file the status is still diagnosable",
+            no_data.get("enabled") is False,
+            json.dumps(no_data)[:140],
+        )
+
+
 def main() -> int:
     failures = []
 
@@ -525,6 +695,10 @@ def main() -> int:
         "at least one source is usable",
         status.get("any_source_usable") is True,
         str([(s["name"], s["usable"]) for s in status.get("sources", [])]),
+    )
+    check(
+        "the status hook is registered even when the data loaded",
+        callable(result["NAFDAC_HOOKS"].get("status")),
     )
     check(
         "Cell 18 filled the verify hook",
@@ -566,6 +740,8 @@ def main() -> int:
 
     print("\n--- intent gate: the retrieval boundary -------------------")
     gate = run_gate_tests(result, check)
+
+    run_absent_greenbook_tests(check)
 
     print("=" * 70)
     if failures:
