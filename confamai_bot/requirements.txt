@@ -18,5 +18,12 @@ uvicorn[standard]>=0.30.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
 
-# Optional: WHATSAPP_SESSION_BACKEND=supabase
-# psycopg[binary]>=3.1
+# Required for WHATSAPP_SESSION_BACKEND=supabase, which is how the bot stores
+# sessions in production. Not optional any more: without it the import fails at
+# first boot rather than at install time, which is the worst place to find out.
+#
+# Installed unconditionally rather than behind an extra requirements file,
+# because a deployment that must not lose conversation history on a restart
+# should not have a working image and a broken one depending on which
+# requirements file someone remembered to build with.
+psycopg[binary]>=3.1

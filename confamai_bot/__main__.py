@@ -6,6 +6,7 @@
     python -m confamai_bot --ask "..."     one turn, no WhatsApp, for checking
     python -m confamai_bot --assay         a batch of real questions against
                                            the live server
+    python -m confamai_bot --encode-ds PASSWORD   build a percent-encoded DSN and test it
     python -m confamai_bot --version
 
 `--ask` and `--assay` exist because the bot's real dependency is a remote GPU
@@ -61,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --assay, skip the health probe",
     )
     parser.add_argument(
+        "--encode-dsn", metavar="PASSWORD",
+        help="build a correctly percent-encoded DSN from the raw Supabase "
+             "password, using the host already in your .env",
+    )
+    parser.add_argument(
         "--test", action="store_true", help="run the offline test suite"
     )
     parser.add_argument("--env", default=None, metavar="PATH", help="custom .env path")
@@ -86,6 +92,9 @@ def main(argv=None) -> int:
     from .config import ConfigError, load_config, validate
 
     cfg = load_config(env_file=args.env, debug=args.debug)
+
+    if args.encode_dsn is not None:
+        return _encode_dsn(cfg, args.encode_dsn)
 
     if args.status:
         return asyncio.run(_status(cfg))
@@ -125,6 +134,77 @@ def main(argv=None) -> int:
         access_log=False,
     )
     return 0
+
+
+# ---------------------------------------------------------------------------
+def _encode_dsn(cfg, raw_password: str) -> int:
+    """Print a correctly percent-encoded DSN for a raw Supabase password.
+
+    Supabase generates passwords containing `@ : / # ?`, all of which are
+    structural in a postgres:// URL. Hand-editing one into .env means guessing
+    the escaping, and a wrong guess surfaces as `missing '/' after host`, which
+    reads like a host typo and sends an operator debugging the wrong half of
+    the string.
+
+    So: paste the raw password here and the encoded DSN comes out. The host,
+    port and database are taken from whatever is already in .env, so only the
+    one value you cannot easily type correctly is involved.
+
+    The password is printed in clear text in the terminal, which is fine for a
+    local machine and the reason this is a command rather than something that
+    runs on a schedule.
+    """
+    from urllib.parse import quote
+
+    if not cfg.session_dsn:
+        print("No DSN in .env yet, so there is no host to build on.\n"
+              "Put a best-guess DSN in confamai_bot/.env first, then re-run, or "
+              "set WHATSAPP_SESSION_DSN with a placeholder password.")
+        return 2
+
+    import psycopg
+
+    info = psycopg.conninfo.conninfo_to_dict(cfg.session_dsn)
+    host = info.get("host", "")
+    port = info.get("port", "5432")
+    dbname = info.get("dbname", "postgres")
+    user = info.get("user", "")
+
+    encoded = quote(raw_password, safe="")
+    print()
+    print("Paste this into confamai_bot/.env as WHATSAPP_SESSION_DSN:")
+    print()
+    print("  postgresql://%s:%s@%s:%s/%s" % (user, encoded, host, port, dbname))
+    print()
+    if encoded != raw_password:
+        escaped = sorted({ch for ch in raw_password if ch in "@:/#?%"})
+        print("  encoded %s as %s — these break a postgres:// URL if left raw"
+              % (
+                  ", ".join(repr(c) for c in escaped),
+                  ", ".join(quote(c, safe="") for c in escaped),
+              ))
+    else:
+        print("  nothing needed encoding")
+    print()
+
+    # Prove it before they commit it to a file.
+    candidate = "postgresql://%s:%s@%s:%s/%s" % (user, encoded, host, port, dbname)
+    try:
+        with psycopg.connect(candidate, connect_timeout=20) as conn:
+            conn.execute("select 1")
+        print("*** CONNECTED — this password is correct ***")
+        print()
+        print("Next: python -m confamai_bot --status")
+        return 0
+    except Exception as exc:
+        first = str(exc).strip().splitlines()[0]
+        print("still failing: %s" % first[:160])
+        print()
+        if "password authentication failed" in first.lower():
+            print("  The encoding is now correct, so the password itself is")
+            print("  wrong. Reset it in Supabase -> Settings -> Database, then")
+            print("  re-run this command with the new value.")
+        return 1
 
 
 # ---------------------------------------------------------------------------

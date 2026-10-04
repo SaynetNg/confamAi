@@ -57,11 +57,9 @@ pip install -r confamai_bot/requirements.txt
 No torch, no transformers, no bitsandbytes, no GPU. This process is a webhook
 receiver and an HTTP client.
 
-Optional, only for `WHATSAPP_SESSION_BACKEND=supabase`:
-
-```bash
-pip install "psycopg[binary]"
-```
+`psycopg[binary]` is in `requirements.txt` unconditionally, because a deployment
+that must not lose conversations on a restart should not depend on which
+requirements file someone remembered to build with.
 
 ## 3. Configure
 
@@ -214,9 +212,25 @@ window. Set `WHATSAPP_ACK_TEXT=none` to switch it off.
 
 **Session storage.** `sqlite` is one local file and needs no extra dependency.
 `supabase` makes the bot stateless, which matters as soon as there is more than
-one instance or the host disk is ephemeral. It uses its own schema
-(`confamai_bot`) and pins `search_path`, so it cannot reach the greenbook tables
-in `public`. The 24-hour TTL is enforced by a sweeper, not just documented.
+one instance or the host disk is ephemeral — two instances with separate SQLite
+files would each hold a different half of one user's conversation.
+
+The bot's database is **dedicated**, not the one holding the NAFDAC greenbook.
+The greenbook is public regulatory data; `wa_sessions` holds what people typed,
+which is personal data under NDPA 2023. Separate databases mean a backup of
+either is safe to share, and `nafdac_source`'s table-swapping migrations cannot
+reach the bot's tables. The `confamai_bot` schema is kept on top of that as
+belt and braces, so the same code still works if you ever consolidate.
+
+Use the **session pooler** (`:5432`), not the direct connection — the direct
+host needs a static outbound IPv4 that several hosting platforms lack or charge
+extra for. Percent-encode the password: Supabase passwords contain `@`, `:`,
+`/` and `#`, which are structural in a `postgresql://` URL, and an unescaped one
+reports as a misleading `missing '/' after host`.
+
+The schema and both tables are created automatically at startup, so there is no
+DDL to run by hand. The 24-hour TTL is enforced by a sweeper, not just
+documented.
 
 ## 9. Tests
 

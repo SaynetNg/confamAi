@@ -286,14 +286,29 @@ class SqliteSessionStore(SessionStore):
 class SupabaseSessionStore(SessionStore):
     """Postgres, for more than one instance or ephemeral disk.
 
-    Expects the same Supabase project that holds the NAFDAC greenbook, but a
-    different schema: this table holds user conversation content and the
-    greenbook tables hold regulatory data, and nothing here should be able to
-reach the other. Set WHATSAPP_SESSION_SCHEMA (default `confamai_bot`, matching
-     the package directory) and run setup once; it creates the schema and both
-     tables if they are missing.
+    Points at a DEDICATED database, separate from the one holding the NAFDAC
+    greenbook. Two independent reasons, and it is worth keeping both in mind
+    before consolidating them:
 
-    psycopg is imported lazily so a sqlite deployment never needs it.
+    * **Privacy.** The greenbook is public regulatory data. This table holds
+      what people actually typed, which is personal data under NDPA 2023. In
+      one database they share a backup, so a dump of the greenbook can never be
+      handed to NAFDAC, a partner or an auditor without also handing over user
+      conversations.
+    * **Isolation.** `nafdac_source.load_postgres` performs table swaps and
+      archiving. In a separate schema, the worst a careless migration there can
+      reach is the bot's own tables; in `public` it would be the same namespace.
+
+    The schema below (`confamai_bot`) is belt and braces on top of a dedicated
+    database: it costs nothing, and it means this code still works unchanged if
+    you ever point both at one database again.
+
+    Set WHATSAPP_SESSION_DSN to the URI from Supabase -> Connect -> URI, using
+    the session pooler on :5432. Percent-encode the password: Supabase
+    passwords contain `@`, `:`, `/` and `#`, which are structural in a
+    postgres:// URL and otherwise produce a misleading parse error.
+
+    psycopg is imported lazily so a sqlite deployment without it still starts.
     """
 
     def __init__(self, cfg: Config):

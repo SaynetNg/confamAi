@@ -247,6 +247,29 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
     )
 
 
+def _looks_like_placeholder(dsn: str) -> bool:
+    """True when a DSN still carries an unfilled template value.
+
+    `validate()` only rejects an empty DSN, but a copy-pasted dashboard template
+    is non-empty and contains one of these. Left unchecked it passes startup and
+    fails at the first inbound message with `password authentication failed`,
+    which reads like wrong credentials rather than an unfinished setup.
+    """
+    lowered = str(dsn or "").lower()
+    markers = (
+        "your-password", "your_password", "paste_password", "placeholder",
+        "changeme", "change_me", "todo", "xxx", "<", ">",
+    )
+    if any(marker in lowered for marker in markers):
+        return True
+    # Also catch a password segment that is empty, i.e. `user:@host`.
+    if "://" in lowered:
+        credentials = lowered.split("://", 1)[1].split("@", 1)[0]
+        if ":" in credentials and not credentials.split(":", 1)[1].strip():
+            return True
+    return False
+
+
 def validate(cfg: Config, require_whatsapp: bool = True) -> None:
     """Fail fast, naming every missing variable at once.
 
@@ -289,13 +312,22 @@ def validate(cfg: Config, require_whatsapp: bool = True) -> None:
             "https://ai.saynet.ng/v1 (got %r)." % cfg.base_url
         )
 
-    if cfg.uses_supabase() and not cfg.session_dsn:
-        raise ConfigError(
-            "WHATSAPP_SESSION_BACKEND=supabase needs WHATSAPP_SESSION_DSN set. "
-            "It may be the same Supabase project that holds the NAFDAC data, "
-            "but use a separate database or schema so this bot cannot touch "
-            "the greenbook tables."
-        )
+    if cfg.uses_supabase():
+        if not cfg.session_dsn:
+            raise ConfigError(
+                "WHATSAPP_SESSION_BACKEND=supabase needs WHATSAPP_SESSION_DSN "
+                "set. Copy the URI from Supabase -> Connect -> URI (session "
+                "pooler, :5432) into confamai_bot/.env."
+            )
+        if _looks_like_placeholder(cfg.session_dsn):
+            raise ConfigError(
+                "WHATSAPP_SESSION_DSN still contains a placeholder password.\n"
+                "Replace it in confamai_bot/.env with your real Supabase "
+                "password, percent-encoded: @ -> %40, : -> %3A, / -> %2F, "
+                "# -> %23, ? -> %3F.\n"
+                "An unencoded special character is reported as 'missing / after "
+                "host', which looks like a host typo and is not."
+            )
 
     backend = cfg.session_backend.strip().lower()
     if backend not in {"sqlite", "supabase"}:
