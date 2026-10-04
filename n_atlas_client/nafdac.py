@@ -250,8 +250,14 @@ class NafdacInterceptor:
         argument = (argument or "").strip()
         if not argument:
             return format_usage_search(self._lang())
+        # Normalised to terms rather than passed as one string. `search_products`
+        # matches whole words, so a multi-word argument became a single needle
+        # that could never match anything: `/search paracetamol 500mg` reported
+        # "no product matched" while `/verify paracetamol 500mg` found 257.
         records = search_products(
-            argument, sources=self._get_sources(), limit=self.max_results
+            extract_search_terms(argument),
+            sources=self._get_sources(),
+            limit=self.max_results,
         )
         return format_search_results(
             records, argument, limit=self.max_results, lang=self._lang()

@@ -69,6 +69,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 try:
     from nafdac_source import (  # noqa: E402
+        extract_search_terms,
         search_products,
         verify_nafdac_product,
     )
@@ -78,6 +79,7 @@ try:
 except ImportError as _nafdac_error:  # pragma: no cover
     NAFDAC_AVAILABLE = False
     _NAFDAC_IMPORT_ERROR = _nafdac_error
+    extract_search_terms = None
     search_products = None
     verify_nafdac_product = None
     source_status = None
@@ -216,8 +218,13 @@ if NAFDAC_AVAILABLE:
                 return format_usage_search(self._lang())
             from nafdac_source.formatting import format_search_results
 
+            # Normalised to terms rather than passed as one string:
+            # `search_products` matches whole words, so a multi-word argument
+            # became a single needle that could never match anything.
             records = search_products(
-                argument, sources=self._get_sources(), limit=self.max_results
+                extract_search_terms(argument),
+                sources=self._get_sources(),
+                limit=self.max_results,
             )
             return format_search_results(
                 records, argument, limit=self.max_results, lang=self._lang()
@@ -515,6 +522,72 @@ class LanguageSwitcher:
 
 
 # ----------------------------------------------------------------------
+# System prompt
+# ----------------------------------------------------------------------
+# The Confam AI persona sent as the system message on every request. Inline
+# text wins, then the file, then this built-in prompt; `none` (or off / 0 /
+# false / no / disabled) switches the system message off altogether and leaves
+# the server to its own prompt. The same prompt lives in
+# n_atlas_client/prompt.py; this copy exists because this file is copied to
+# other machines on its own and imports nothing from the package.
+CONFAM_AI_SYSTEM_PROMPT = """You are Confam AI, the official verification assistant for the CONFAM powered by saynet.ng.
+
+YOUR IDENTITY:
+- Your name is Confam AI. You are NOT N-ATLaS. Never refer to yourself as N-ATLaS.
+- You help Nigerians verify whether medicines and consumer products are registered with NAFDAC.
+- You are professional, warm, concise, and safety-focused.
+
+YOUR CORE FUNCTION:
+When a user asks about a product or medicine:
+1. If NAFDAC verification data is provided in the conversation, use ONLY that data to respond. Never invent registration numbers, approval dates, manufacturer names, or verdicts.
+2. Use these exact verdicts: AUTHENTIC (registered), FLAGGED (recalled/banned), or NOT REGISTERED (not found in database).
+3. NOT REGISTERED does NOT mean fake or counterfeit. Always say: "This product was not found in our current NAFDAC database. This could mean the product is new, our records are outdated, or the product is not registered."
+4. Never claim a product is counterfeit, fake, or poisoned.
+
+LANGUAGE RULES - CRITICAL:
+- ALWAYS match the user's language. If they write in English, reply in English. If they write in Hausa, reply in Hausa. If they write in Yoruba, reply in Yoruba. If they write in Igbo, reply in Igbo.
+- When a [language] HARD LANGUAGE MODE instruction is present, obey it absolutely.
+- If you are unsure of the language, default to ENGLISH, not Hausa.
+- Never reply in Hausa unless the user explicitly wrote in Hausa or a Hausa language mode is active.
+
+RESPONSE STYLE:
+- Keep responses concise (2-4 sentences for simple queries).
+- Be warm and reassuring but never minimize safety concerns.
+- For greetings, introduce yourself briefly: "I'm Confam AI, I help you verify products against NAFDAC records. How can I help you?"
+- Do not ramble. Do not repeat information. Do not add disclaimers unless safety-relevant.
+
+BOUNDARIES:
+- You ONLY help with product verification and NAFDAC-related questions.
+- For unrelated questions, politely redirect: "I'm Confam AI - I specialize in helping you check products against NAFDAC records. Would you like to verify a product?"
+- Never provide medical advice. If asked about dosage, side effects, or treatment, say: "Please consult a healthcare professional for medical advice."
+- This service is NOT yet officially endorsed by NAFDAC. Do not claim otherwise."""
+
+SYSTEM_PROMPT_OFF_VALUES = frozenset(
+    {"0", "off", "no", "none", "false", "disable", "disabled"}
+)
+
+
+def resolve_system_prompt(inline="", prompt_file=""):
+    """The system prompt to send: inline, file, built-in, or nothing."""
+    if str(inline or "").strip().lower() in SYSTEM_PROMPT_OFF_VALUES:
+        return ""
+    text = str(inline or "").strip()
+    if text:
+        return text
+
+    path_text = str(prompt_file or "").strip()
+    if path_text:
+        try:
+            text = Path(path_text).read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text:
+            return text
+
+    return CONFAM_AI_SYSTEM_PROMPT
+
+
+# ----------------------------------------------------------------------
 # Configuration (all from env / .env, nothing hard-coded)
 # ----------------------------------------------------------------------
 DEFAULTS = {
@@ -599,12 +672,10 @@ class Config:
         self.nafdac_max_search_results = max(
             1, int(float(resolved["NAFDAC_MAX_SEARCH_RESULTS"]))
         )
-        prompt_file = str(resolved["N_ATLAS_SYSTEM_PROMPT_FILE"] or "").strip()
-        if not self.system_prompt and prompt_file:
-            try:
-                self.system_prompt = Path(prompt_file).read_text(encoding="utf-8").strip()
-            except OSError:
-                self.system_prompt = ""
+        self.system_prompt = resolve_system_prompt(
+            self.system_prompt,
+            str(resolved["N_ATLAS_SYSTEM_PROMPT_FILE"] or "").strip(),
+        )
         self.debug = False
 
     @staticmethod
@@ -651,7 +722,7 @@ def validate_config(cfg):
 # Logging / debug
 # ----------------------------------------------------------------------
 def log_debug(cfg, message):
-    if cfg.debug:
+    if cfg is not None and cfg.debug:
         print("[debug] %s" % message, flush=True)
 
 
@@ -694,8 +765,8 @@ class Conversation:
         """Return the message list to send: optional client system prompt +
         trimmed local history + the new user message.
 
-        The server owns the N-ATLaS system prompt; no system message is added
-        unless the user explicitly configured one.
+        The built-in Confam AI prompt leads the list; it is empty only when
+        switched off with N_ATLAS_SYSTEM_PROMPT=none.
         """
         result = []
         if self.cfg.system_prompt:
@@ -931,10 +1002,15 @@ class NAtlasClient:
         return self._nafdac().verify(nrn)
 
     def search_nafdac(self, query, limit=None):
-        """Free-text search over the greenbook, on this machine."""
+        """Free-text search over the greenbook, on this machine.
+
+        Normalised to terms first, so a multi-word query matches the same way
+        whether it arrives from `/search` or from a caller of this method.
+        """
         interceptor = self._nafdac()
+        terms = query if isinstance(query, list) else extract_search_terms(query)
         return search_products(
-            query,
+            terms,
             sources=interceptor._get_sources(),
             limit=limit or interceptor.max_results,
         )
@@ -994,7 +1070,7 @@ class NAtlasClient:
         response = self._request("GET", "/health")
         seconds = time.monotonic() - started
         if response.status_code != 200:
-            log_http_status(self.debug and self or None, "GET", endpoint, response.status_code, seconds)
+            log_http_status(self, "GET", endpoint, response.status_code, seconds)
             raise ServerFailure(
                 "Server returned %d while checking health." % response.status_code
             )

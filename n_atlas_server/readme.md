@@ -210,7 +210,7 @@ Everything is an environment variable, so the core server never needs editing.
 | `N_ATLAS_API_KEY` | random ephemeral dev key | **Set this before exposing the server.** |
 | `N_ATLAS_DEV_KEY` | unset | Known temporary key, dev only. |
 | `N_ATLAS_ALLOW_EPHEMERAL_KEY` | `1` | Set `0` to hard-fail when no key is configured. |
-| `N_ATLAS_SYSTEM_PROMPT` | built-in prompt | Inline system prompt override. |
+| `N_ATLAS_SYSTEM_PROMPT` | the built-in Confam AI prompt | Inline system prompt override. |
 | `N_ATLAS_SYSTEM_PROMPT_FILE` | unset | Path to a prompt file; wins over inline. |
 | `N_ATLAS_MAX_NEW_TOKENS` | `512` | Hard ceiling on client `max_tokens`. |
 | `N_ATLAS_DEFAULT_MAX_TOKENS` | `512` | Used when the client omits it. |
@@ -303,8 +303,8 @@ this mode. Write the entire reply in Hausa and do not use English, Yoruba, Igbo.
 ```
 
 That is the whole point: a pin is a statement about the reply, so it has to hold
-when the message disagrees with it. The built-in system prompt's Yoruba/Igbo
-marker rules yield to it — they describe a default, this is a choice.
+when the message disagrees with it. The built-in system prompt's language rules
+yield to it — they describe a default, this is a choice.
 
 Two properties worth relying on:
 

@@ -304,6 +304,17 @@ class NAtlasClient:
                 message = "%s\n\n%s" % (message, block)
         payload_messages = self.conversation.build_messages_for(message)
         use_stream = self.cfg.stream if stream is None else stream
+        # Ask only if the server has told us it can stream. It cannot: it answers
+        # stream=true with a 400, so with N_ATLAS_STREAM=true every message used
+        # to spend a full round trip being refused before falling back. /health
+        # now advertises the capability, and this reads it once.
+        if use_stream and self.api_connected and self.server_info:
+            if not self.server_info.get("streaming", False):
+                if self.debug:
+                    self._log_debug(
+                        "server reports no streaming support; not asking for it"
+                    )
+                use_stream = False
 
         last_error = None
         attempts = 0
@@ -559,6 +570,11 @@ class NAtlasClient:
         headers = {
             "Authorization": "Bearer %s" % self.cfg.api_key,
             "Accept": "application/json",
+            # Sent explicitly because the server sits behind Cloudflare, whose
+            # browser-integrity check answers some default library agents with
+            # "error code: 1010" and a 403. `Python-urllib` was refused outright
+            # on /v1/nafdac/*; naming the client is both more honest and immune.
+            "User-Agent": "n-atlas-client/1.0 (+https://ai.saynet.ng)",
         }
         started = time.monotonic()
         try:

@@ -39,8 +39,9 @@ class Conversation:
     def build_messages_for(self, user_text: str) -> list[dict]:
         """Return the message payload to send for the new user message.
 
-        The server owns the N-ATLaS system prompt, so no system message is
-        injected unless one was explicitly configured (N_ATLAS_SYSTEM_PROMPT).
+        The Confam AI system prompt (prompt.py) goes first, then the local
+        history, then the new message. The prompt is empty only when it was
+        switched off with N_ATLAS_SYSTEM_PROMPT=none.
         History is trimmed to MAX_CONVERSATION_MESSAGES and to an estimated
         MAX_CONVERSATION_TOKENS, preserving the opening exchange and the most
         recent turns.

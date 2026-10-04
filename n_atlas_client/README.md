@@ -76,6 +76,30 @@ N_ATLAS_API_KEY=YOUR_SECRET_KEY
 - The API key is read from the environment / .env and is NEVER printed or
   written into conversation files.
 
+### System prompt (Confam AI)
+
+The client sends a system message on every request, so the model answers as
+**Confam AI**, the CONFAM verification assistant for saynet.ng, instead of the
+general-purpose N-ATLaS assistant the server was built for. The prompt lives in
+`prompt.py` (`CONFAM_AI_SYSTEM_PROMPT`) and is used when nothing overrides it.
+
+```
+N_ATLAS_SYSTEM_PROMPT=inline text      # wins over everything
+N_ATLAS_SYSTEM_PROMPT_FILE=path.txt    # used when the inline value is empty
+N_ATLAS_SYSTEM_PROMPT=none             # send no system message at all
+```
+
+Empty values count as unset, so the blank lines in `.env` mean "use the built-in
+Confam AI prompt". `none` (also `off`, `0`, `false`, `no`, `disabled`) switches
+the system message off and lets the server's own prompt take over.
+
+The Kaggle server **drops client-supplied system messages** — only server code
+may set them (`n_atlas_server/natlas_notebook.py`, the chat-completions handler).
+So the persona has to live on the server, and it does: `DEFAULT_SYSTEM_PROMPT`
+there is the same Confam AI prompt, byte for byte. The client's copy is what a
+server that *does* honour client system messages sees, and it stays useful for
+testing a prompt without redeploying the notebook.
+
 ## 4. Startup
 
 Run from the project root:
@@ -376,6 +400,7 @@ confamAi/
 │   ├── __main__.py                  # python -m n_atlas_client
 │   ├── main.py                      # entry point
 │   ├── config.py                    # configuration
+│   ├── prompt.py                    # the Confam AI system prompt
 │   ├── api.py                       # NAtlasClient (API client)
 │   ├── language.py                  # /hausa /yoruba /igbo /english /auto modes
 │   ├── nafdac.py                    # NAFDAC interception for chat

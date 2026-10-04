@@ -280,7 +280,13 @@ def save(
     frame = pd.DataFrame(records, columns=config.OUTPUT_COLUMNS)
 
     csv_path = output_dir / config.CSV_FILENAME
-    frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    # Plain utf-8, not utf-8-sig. The BOM this used to write was invisible in
+    # Excel, which is why it was there, but it made the first column arrive as
+    # "﻿Product Name" to anything reading the file as utf-8 — so
+    # `row["Product Name"]` raised KeyError and every product name came back
+    # empty. Readers that must tolerate an older export still use utf-8-sig,
+    # which decodes a BOM-less file identically, so existing files keep working.
+    frame.to_csv(csv_path, index=False, encoding="utf-8")
     log.info("Wrote %s (%s rows, %s columns)", csv_path.name, len(frame), len(frame.columns))
 
     if skip_xlsx:

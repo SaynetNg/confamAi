@@ -594,6 +594,310 @@ def _run_cell18_isolated(search_dirs_replacement=None):
     raise AssertionError("isolated Cell 18 printed no status payload")
 
 
+def run_multi_number_tests(result, check):
+    """Tests 13-18: every NRN is resolved, and a miss still carries a block.
+
+    Both of these are regressions rather than new features, and both came from
+    watching the live server give confidently wrong answers:
+
+      * an unregistered number used to attach no context at all, so the model
+        answered "is A4-9999999 fake?" from memory and said yes;
+      * with two numbers in a message only the first was resolved, so the model
+        invented a product for the second — the same number came back as three
+        different drugs in three runs.
+    """
+    enrich = result["_nafdac_enrich"]
+    original_extractor = result["NAFDAC_INTENT_EXTRACTOR"]
+    original_max = result["NAFDAC_MAX_NUMBERS"]
+
+    def check_intent(intent, product_name=None):
+        result["NAFDAC_INTENT_EXTRACTOR"] = _json_extractor(intent, product_name)
+
+    try:
+        def run(message):
+            return enrich([{"role": "user", "content": message}])
+
+        # --- an unregistered number must still produce a block -------------
+        check_intent("PRODUCT_CHECK")
+        miss = run("Is A4-0000000 genuine?")
+        check(
+            "an unregistered number attaches a block instead of nothing",
+            miss is not None,
+            f"enrich returned {miss!r}",
+        )
+        if miss:
+            check(
+                "the miss block says NOT_REGISTERED",
+                "Verdict: NOT_REGISTERED" in miss["content"],
+                miss.get("verdict"),
+            )
+            check(
+                "the miss block forbids a counterfeit claim",
+                "counterfeit" in miss["content"].lower(),
+            )
+            check(
+                "the miss block tells the model not to call it fake",
+                "not treat this as proof" in miss["content"].lower()
+                or "fake" in miss["content"].lower(),
+            )
+            check("the miss reports found=False", miss.get("found") is False)
+            check(
+                "the miss verdict is not_registered",
+                miss.get("verdict") == "not_registered",
+                miss.get("verdict"),
+            )
+            check(
+                "the miss records the number as unregistered",
+                bool(miss.get("unregistered")),
+                str(miss.get("unregistered")),
+            )
+
+        # --- both numbers resolved -----------------------------------------
+        result["NAFDAC_MAX_NUMBERS"] = 4
+        two = run("Compare A4-100160 and A11-0009 for me.")
+        check("a two-number message produces a block", two is not None)
+        if two:
+            content = two["content"]
+            check(
+                "both numbers are listed as resolved",
+                sorted(two.get("nrns") or []) == ["A11-0009", "A4-100160"],
+                str(two.get("nrns")),
+            )
+            check(
+                "the first product is present",
+                "AG Spironolactone" in content,
+                "A4-100160 record missing",
+            )
+            check(
+                "the second product is present too",
+                "Alben Paracetamol Drops" in content,
+                "A11-0009 record missing",
+            )
+            check(
+                "both numbers are marked registered",
+                sorted(two.get("registered") or []) == ["A11-0009", "A4-100160"],
+                str(two.get("registered")),
+            )
+            check(
+                "the multi-number safety clause is present",
+                "more than one NAFDAC number" in content,
+                "clause missing",
+            )
+            check(
+                "it forbids recommending a substitute",
+                "in place of another" in content,
+                "substitute clause missing",
+            )
+            check(
+                "it forbids ranking the numbers",
+                "NEVER rank" in content,
+                "ranking clause missing",
+            )
+
+        # --- a mixed batch must not report one clean verdict ----------------
+        mixed = run("I have two packs: A4-100160 and A4-0000000. Which should I trust?")
+        check("a mixed batch produces a block", mixed is not None)
+        if mixed:
+            check(
+                "a mixed batch is not reported as authentic",
+                mixed.get("verdict") != "authentic",
+                mixed.get("verdict"),
+            )
+            check("a mixed batch is marked mixed", mixed.get("verdict") == "mixed",
+                  mixed.get("verdict"))
+            check(
+                "the unregistered number is named",
+                bool(mixed.get("unregistered")),
+                str(mixed.get("unregistered")),
+            )
+            check(
+                "the not-registered block is in the merged content",
+                "Verdict: NOT_REGISTERED" in mixed["content"],
+            )
+
+        # --- a flagged number poisons the batch verdict ---------------------
+        flagged = run("Compare A4-100160 and C4-1142.")
+        if flagged:
+            check(
+                "a flagged product makes the whole batch flagged",
+                flagged.get("verdict") == "flagged",
+                flagged.get("verdict"),
+            )
+
+        # --- the single-number block must forbid restating the verdict ------
+        # Regression guard. "Is A4-100160 genuine?" came back as a bare verdict
+        # with no product name, and in 3 of 10 runs it inverted AUTHENTIC into
+        # "not registered". The model was paraphrasing the verdict instead of
+        # quoting it, so the block now forbids restating it.
+        result["NAFDAC_MAX_NUMBERS"] = original_max
+        check_intent("PRODUCT_CHECK")
+        one = run("Is A4-100160 genuine?")
+        if one:
+            content = one["content"]
+            check(
+                "the block forbids restating the verdict in own words",
+                "NEVER restate a verdict" in content,
+                "clause missing",
+            )
+            check(
+                "the block forbids inverting AUTHENTIC into not-registered",
+                "do not write 'not registered'" in content,
+                "inversion clause missing",
+            )
+            check(
+                "the block forbids calling a listed product missing",
+                "Never "
+                "describe a product the block names as missing" in content,
+                "missing-product clause missing",
+            )
+            check(
+                "the block asks for the product name beside the verdict",
+                "name the product from the block" in content,
+                "quote-clause missing",
+            )
+            check(
+                "the block forbids echoing the [nafdac] marker",
+                "Never reproduce the '[nafdac]' marker" in content,
+                "marker clause missing",
+            )
+            check(
+                "the block refuses the yes/no format trap",
+                "one-word or yes/no answer" in content,
+                "format clause missing",
+            )
+            check(
+                "the block refuses a user-asserted counterfeit claim",
+                "does not make it so" in content,
+                "injection clause missing",
+            )
+
+        # --- a single number must not get the multi-number clause ----------------
+        single = run("Is A4-100160 genuine?")
+        check("a single number produces a block", single is not None)
+        if single:
+            check(
+                "a single number omits the multi-number clause",
+                "more than one NAFDAC number" not in single["content"],
+            )
+            check("a single number reports found=True", single.get("found") is True)
+            check(
+                "a single number keeps its nrn for the caller",
+                single.get("nrn") == "A4-100160",
+                str(single.get("nrn")),
+            )
+
+        # --- the cap on how many numbers one message may carry --------------
+        result["NAFDAC_MAX_NUMBERS"] = 1
+        capped = run("Compare A4-100160 and A11-0009.")
+        if capped:
+            check(
+                "the cap bounds the work per message",
+                len(capped.get("nrns") or []) == 1,
+                str(capped.get("nrns")),
+            )
+    finally:
+        result["NAFDAC_INTENT_EXTRACTOR"] = original_extractor
+        result["NAFDAC_MAX_NUMBERS"] = original_max
+
+
+def run_multi_candidate_tests(result, check):
+    """A name search matching many products must not produce an answerable block.
+
+    Regression. "Is Artemether and Lumefantrine genuine?" returned "considered
+    genuine drugs... over-the-counter (OTC)... produced by Swiss Pharma Pvt. Ltd
+    ... since 2020". None of that was invented — it was all row one of the block,
+    C4-1419, with that row's FLAGGED verdict dropped. The block told the model
+    not to choose; it chose the best-ranked row.
+
+    Two causes, both fixed: the candidate list was truncated mid-record so the
+    model never saw the total, and the instruction said "ask which one" without
+    saying what it must not do.
+    """
+    enrich = result["_nafdac_enrich"]
+    original_extractor = result["NAFDAC_INTENT_EXTRACTOR"]
+    original_limit = result["NAFDAC_MAX_SEARCH_RESULTS"]
+    original_ambiguous = result["NAFDAC_MAX_AMBIGUOUS_RESULTS"]
+    original_chars = result["NAFDAC_MAX_CONTEXT_CHARS"]
+
+    def check_intent(product_name):
+        result["NAFDAC_INTENT_EXTRACTOR"] = _json_extractor(
+            "PRODUCT_CHECK", product_name)
+
+    try:
+        # --- many matches -------------------------------------------------
+        check_intent("Artemether and Lumefantrine")
+        many = enrich([{"role": "user",
+                        "content": "Is Artemether and Lumefantrine genuine?"}])
+        check("a many-match search attaches a block", many is not None)
+        if many:
+            content = many["content"]
+            check("a many-match search is marked ambiguous",
+                  many.get("ambiguous") is True)
+            check("the total match count is carried",
+                  isinstance(many.get("total"), int) and many["total"] > 100,
+                  str(many.get("total")))
+            check("the multi-candidate clause is present",
+                  "MANY DIFFERENT products" in content, "clause missing")
+            check("it forbids naming one product as the answer",
+                  "NEVER present one of these products as the answer"
+                  in content, "selection clause missing")
+            check("it forbids a verdict for the whole set",
+                  "NEVER give a verdict for the set as a whole" in content,
+                  "verdict clause missing")
+            check("it calls out the first row specifically",
+                  "The first row is not the answer" in content,
+                  "first-row clause missing")
+            check("it warns that rows may be Inactive",
+                  "are Inactive and expired" in content,
+                  "status clause missing")
+            check("the block is not truncated mid-record",
+                  not content.rstrip().endswith("[truncated]"),
+                  "block ends truncated")
+            check("the block reports how many were shown",
+                  "shown" in many and many["shown"] < many.get("total", 0),
+                  "shown=%s total=%s" % (many.get("shown"), many.get("total")))
+            check("more than one candidate is shown",
+                  many["shown"] >= 3,
+                  "shown=%d" % many["shown"])
+            check("the total is stated in the block text",
+                  "458 products match" in content or
+                  "%d products match" % many["total"] in content,
+                  "total missing from block")
+            check("the block says they are different products",
+                  "DIFFERENT products" in content, "difference note missing")
+            # The temptable fields are what the model quoted from row one, so an
+            # ambiguous block must not carry them at all.
+            for label, needle in (
+                ("manufacturer", "Manufacturer:"),
+                ("marketing category", "Marketing category:"),
+                ("approval date", "Approved:"),
+                ("greenbook url", "Greenbook page:"),
+            ):
+                check("the ambiguous block omits %s" % label,
+                      needle not in content, needle)
+            check("fewer candidates are attached than a plain search",
+                  many["shown"] <= original_ambiguous,
+                  "shown=%d cap=%d" % (many["shown"], original_ambiguous))
+
+        # --- a single match keeps the ordinary path ----------------------
+        check_intent("Artheget EZ")
+        one = enrich([{"role": "user", "content": "Is Artheget EZ genuine?"}])
+        check("a single-match search attaches a block", one is not None)
+        if one:
+            check("a single-match search is not ambiguous",
+                  one.get("ambiguous") is False)
+            check("a single-match search omits the multi-candidate clause",
+                  "MANY DIFFERENT products" not in one["content"])
+            check("a single-match search can show the full candidate list",
+                  one["shown"] == original_limit,
+                  "shown=%d" % one["shown"])
+    finally:
+        result["NAFDAC_INTENT_EXTRACTOR"] = original_extractor
+        result["NAFDAC_MAX_SEARCH_RESULTS"] = original_limit
+        result["NAFDAC_MAX_AMBIGUOUS_RESULTS"] = original_ambiguous
+        result["NAFDAC_MAX_CONTEXT_CHARS"] = original_chars
+
+
 def run_absent_greenbook_tests(check):
     """A deployment with no greenbook must be diagnosable, not merely silent.
 
@@ -740,6 +1044,11 @@ def main() -> int:
 
     print("\n--- intent gate: the retrieval boundary -------------------")
     gate = run_gate_tests(result, check)
+
+    print("\n--- every number resolved, and a miss still carries a block ---")
+    run_multi_number_tests(result, check)
+
+    run_multi_candidate_tests(result, check)
 
     run_absent_greenbook_tests(check)
 

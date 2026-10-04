@@ -11,6 +11,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .prompt import resolve_system_prompt
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -77,9 +79,10 @@ class Config:
     save_conversations: bool = True            # N_ATLAS_SAVE_CONVERSATIONS
     conversations_dir: str = "conversations"   # N_ATLAS_CONVERSATIONS_DIR
 
-    # --- optional client-side system prompt ------------------------------
-    # Off by default. The Kaggle server owns the N-ATLaS system prompt; a
-    # client prompt is only injected when explicitly configured.
+    # --- system prompt ---------------------------------------------------
+    # The built-in Confam AI prompt (prompt.py) is sent unless
+    # N_ATLAS_SYSTEM_PROMPT / ..._FILE say otherwise, or the prompt is
+    # switched off with N_ATLAS_SYSTEM_PROMPT=none.
     system_prompt: str = ""       # N_ATLAS_SYSTEM_PROMPT / ..._FILE
 
     # --- NAFDAC verification ---------------------------------------------
@@ -132,13 +135,10 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
         load_dotenv(PROJECT_ROOT / ".env", override=False)
         load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
-    prompt_file = _env_str("N_ATLAS_SYSTEM_PROMPT_FILE")
-    system_prompt = _env_str("N_ATLAS_SYSTEM_PROMPT")
-    if not system_prompt and prompt_file:
-        try:
-            system_prompt = Path(prompt_file).read_text(encoding="utf-8").strip()
-        except OSError:
-            system_prompt = ""
+    system_prompt = resolve_system_prompt(
+        _env_str("N_ATLAS_SYSTEM_PROMPT"),
+        _env_str("N_ATLAS_SYSTEM_PROMPT_FILE"),
+    )
 
     return Config(
         base_url=_env_str("N_ATLAS_BASE_URL"),

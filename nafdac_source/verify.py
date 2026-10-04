@@ -520,17 +520,25 @@ def search_products(
             index = loader()
         except Exception:
             continue
-        scored.extend(_candidates(index, needles))
+        scored.extend(_candidates(index, needles, with_counts=True))
 
+    # Ordered by how much of the query each record matched, then by rank. Ranking
+    # on rank alone let a one-word overlap beat a record that matched every term:
+    # "Alben Paracetamol Drops" returned "ALBEN AMLODIPINE 5MG TABLET", because
+    # both matched "alben" and the tie fell through to alphabetical order.
     deduped: Dict[Any, tuple] = {}
-    for rank, record in scored:
+    for rank, matched, record in scored:
         identity = record.product_id or (record.nrn_key, record.product_name)
+        sort_key = (-matched, rank)
         current = deduped.get(identity)
-        if current is None or rank < current[0]:
-            deduped[identity] = (rank, record)
+        if current is None or sort_key < current[0]:
+            deduped[identity] = (sort_key, record)
 
-    ordered = sorted(deduped.values(), key=lambda item: (item[0], item[1].product_name.lower()))
-    return [record for _rank_value, record in ordered[: max(1, limit)]]
+    ordered = sorted(
+        deduped.values(),
+        key=lambda item: (item[0], item[1].product_name.lower()),
+    )
+    return [record for _sort_key, record in ordered[: max(1, limit)]]
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -587,8 +595,15 @@ def _scan_index(index: Any) -> tuple:
     return built
 
 
-def _candidates(index: Any, needles: List[str]) -> List[tuple]:
+def _candidates(index: Any, needles: List[str], with_counts: bool = False) -> List[tuple]:
     """Every (rank, record) matching any needle, best rank per record.
+
+    `with_counts` additionally reports how many distinct needles each record
+    matched, as a 3-tuple. It is off by default because the 2-tuple shape is
+    depended on elsewhere, and it exists because "matched at least one word" is
+    not the same as "matched the query": `Alben Paracetamol Drops` and
+    `ALBEN AMLODIPINE 5MG TABLET` both match "alben" at the same rank, so
+    ordering on rank alone returned the wrong product first.
 
     Ranks, lower being better:
 
@@ -605,11 +620,13 @@ def _candidates(index: Any, needles: List[str]) -> List[tuple]:
     """
     by_identity, names, ingredients, applicants, exact, nrns = _scan_index(index)
     best: Dict[Any, int] = {}
+    counts: Dict[Any, int] = {}
 
     def offer(identity: Any, rank: int) -> None:
         current = best.get(identity)
         if current is None or rank < current:
             best[identity] = rank
+        counts[identity] = counts.get(identity, 0) + 1
 
     for needle in needles:
         if not needle:
@@ -628,6 +645,11 @@ def _candidates(index: Any, needles: List[str]) -> List[tuple]:
                 if needle in nrn_key:
                     offer(identity, 2)
 
+    if with_counts:
+        return [
+            (rank, counts[identity], by_identity[identity])
+            for identity, rank in best.items()
+        ]
     return [(rank, by_identity[identity]) for identity, rank in best.items()]
 
 
