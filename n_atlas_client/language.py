@@ -78,9 +78,9 @@ UI = {
         "title": "Language mode",
         "auto": "Auto - follow the language of each message",
         "current": "Now replying in {name}.",
-        "confirm": "Language mode: {name}. N-ATLaS will reply in {name} until "
-                   "you switch with another language command.",
-        "auto_confirm": "Language mode: Auto. N-ATLaS will reply in the "
+        "confirm": "Language mode: {name}. ConfamAI will reply in {name} "
+                   "until you switch with another language command.",
+        "auto_confirm": "Language mode: Auto. ConfamAI will reply in the "
                         "language of each message.",
         "hint": "/hausa  /yoruba  /igbo  /english  /auto",
     },
@@ -108,9 +108,9 @@ UI = {
         "title": "Ụdọ akabọọga",
         "auto": "Akpọcha - ọ na-akpọ ụdọ ọ na-eme",
         "current": "Anyị na-ezighata na {name} ugbu a.",
-        "confirm": "Agbanyela ụdọ akabọọga: {name}. N-ATLaS ga-ezighata na "
-                   "{name} ruo mgbe ị gbanwee ụdọ site na nzọọụta ọzọ.",
-        "auto_confirm": "Agbanyela ụdọ akabọọga: Akpọcha. N-ATLaS ga-ezighata "
+        "confirm": "Agbanyela ụdọ akabọọga: {name}. ConfamAI ga-ezighata "
+                   "na {name} ruo mgbe ị gbanwee ụdọ site na nzọọụta ọzọ.",
+        "auto_confirm": "Agbanyela ụdọ akabọọga: Akpọcha. ConfamAI ga-ezighata "
                         "na ụdọ ọ na-eme maka ihe ọ bụla.",
         "hint": "/hausa  /yoruba  /igbo  /english  /auto",
     },

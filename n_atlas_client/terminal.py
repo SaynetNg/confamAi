@@ -46,10 +46,10 @@ def print_banner(client) -> None:
             gpu = "Tesla T4"
     width = 46
     print("=" * width)
-    print("N-ATLaS MULTILINGUAL AI")
+    print("CONFAM AI")
     print()
     print("Server: %s" % ("ONLINE" if client.api_connected else "OFFLINE"))
-    print("Model:  %s" % (
+    print("Model:  %s MULTILINGUAL MODEL" % (
         info.get("served_model_name") or info.get("model") or client.cfg.model
     ))
     print("Remote GPU: %s" % (gpu or "not reported"))
@@ -87,10 +87,10 @@ def print_help_text(client=None) -> None:
         "  /langueage  Show the current language mode",
         "  /exit    Exit the client",
         "",
-        "Anything else is sent to N-ATLaS.",
+        "Anything else is sent to ConfamAI.",
         "",
-        "N-ATLaS replies in English, Hausa, Igbo or Yoruba and follows your",
-        "language switches without resetting the conversation.",
+        "ConfamAI replies in English, Hausa, Igbo or Yoruba and follows",
+        "your language switches without resetting the conversation.",
         "",
         "A language command pins the reply, so it holds even if the next",
         "message is in another language. /auto hands the choice back.",
@@ -212,7 +212,7 @@ def run_repl(client) -> int:
         def on_token(text: str):
             nonlocal printed_header
             if not printed_header:
-                sys.stdout.write("Assistant: ")
+                sys.stdout.write("ConfamAI: ")
                 printed_header = True
             sys.stdout.write(text)
             sys.stdout.flush()
@@ -223,7 +223,7 @@ def run_repl(client) -> int:
             if printed_header:
                 print()
             else:
-                print("Assistant:", text)
+                print("ConfamAI:", text)
             text = str(text or "").strip()
             if text:
                 client.conversation.add("user", user_input)

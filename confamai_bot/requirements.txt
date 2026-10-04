@@ -1,0 +1,22 @@
+# Confam AI WhatsApp bot — runtime dependencies.
+#
+#     pip install -r confamai_bot/requirements.txt
+#
+# Deliberately short. This process is a webhook receiver and an HTTP client: it
+# runs no model, holds no greenbook data, and needs no GPU. Everything it knows
+# about product verification arrives over the network from the N-ATLaS server.
+#
+# NOT needed here, unlike n_atlas_server/requirements.txt:
+#   torch, transformers, bitsandbytes, accelerate  — the model runs on Kaggle
+#   pandas, openpyxl                             — the greenbook is the server's
+#   psycopg                                       — only for the supabase session
+#                                                   backend, and even then only
+#                                                   psycopg[binary]
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+
+# Optional: WHATSAPP_SESSION_BACKEND=supabase
+# psycopg[binary]>=3.1

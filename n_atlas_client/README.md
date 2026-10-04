@@ -76,29 +76,64 @@ N_ATLAS_API_KEY=YOUR_SECRET_KEY
 - The API key is read from the environment / .env and is NEVER printed or
   written into conversation files.
 
-### System prompt (Confam AI)
+### System prompt (ConfamAI)
 
-The client sends a system message on every request, so the model answers as
-**Confam AI**, the CONFAM verification assistant for saynet.ng, instead of the
-general-purpose N-ATLaS assistant the server was built for. The prompt lives in
-`prompt.py` (`CONFAM_AI_SYSTEM_PROMPT`) and is used when nothing overrides it.
+The model answers as **ConfamAI**, the CONFAM consumer-products verification
+assistant for saynet.ng, because both halves of this project read one file:
+**`confam_prompt.txt` at the project root**. Edit that file and the persona
+changes — no Python, no notebook cell, no constant to keep in step.
+
+How each side gets it:
+
+- **Client** — `.env` sets `N_ATLAS_SYSTEM_PROMPT_FILE=confam_prompt.txt`. The
+  resolver also finds that file beside the client or at the project root, so
+  running from another directory still works.
+- **Server** — `build_kaggle_dataset.py` puts the file in the uploaded dataset
+  as `prompt/confam_prompt.txt`, and Cell 2 finds it on disk. Edit the file,
+  rebuild the dataset, re-upload, re-run the notebook. Startup prints
+  `System prompt: bundled:/kaggle/input/.../confam_prompt.txt`; `builtin` there
+  means the dataset was not attached, so the notebook is serving its fallback
+  copy instead of yours.
+
+Precedence on either side, strongest first:
 
 ```
-N_ATLAS_SYSTEM_PROMPT=inline text      # wins over everything
-N_ATLAS_SYSTEM_PROMPT_FILE=path.txt    # used when the inline value is empty
-N_ATLAS_SYSTEM_PROMPT=none             # send no system message at all
+N_ATLAS_SYSTEM_PROMPT_FILE   a file (this is confam_prompt.txt)
+N_ATLAS_SYSTEM_PROMPT        inline text
+confam_prompt.txt            found on disk
+the constant in the code     fallback for a machine without the file
 ```
 
-Empty values count as unset, so the blank lines in `.env` mean "use the built-in
-Confam AI prompt". `none` (also `off`, `0`, `false`, `no`, `disabled`) switches
-the system message off and lets the server's own prompt take over.
+`N_ATLAS_SYSTEM_PROMPT=none` (also `off`, `0`, `false`, `no`, `disabled`) sends
+no client system message at all. The Kaggle server **drops client-supplied
+system messages** — only server code may set them — which is exactly why the
+prompt lives on the server side.
 
-The Kaggle server **drops client-supplied system messages** — only server code
-may set them (`n_atlas_server/natlas_notebook.py`, the chat-completions handler).
-So the persona has to live on the server, and it does: `DEFAULT_SYSTEM_PROMPT`
-there is the same Confam AI prompt, byte for byte. The client's copy is what a
-server that *does* honour client system messages sees, and it stays useful for
-testing a prompt without redeploying the notebook.
+Two Python constants still carry a copy (`CONFAM_AI_SYSTEM_PROMPT` in
+`prompt.py` and in `n_atlas.py`, `DEFAULT_SYSTEM_PROMPT` in the notebook) as a
+last resort for a machine where the text file was not copied. Nothing reads
+them when the file is present, so nothing complains when one goes stale:
+
+```bash
+python n_atlas_server/check_prompt_drift.py
+```
+
+Run it after editing the prompt. It prints `VALID` when every copy matches, and
+the first differing line when one does not.
+
+What each section of the file is for, when you adapt it to another sector:
+
+| Section | Job |
+|---|---|
+| IDENTITY | who it is, what it is for, what name it never uses |
+| CORE FUNCTION | step order, and that recorded data is the only source of facts |
+| DATA RULES | copy the verdict word verbatim; "not found" never means fake |
+| LANGUAGE RULES | match the user's language, obey a pinned mode, default English |
+| RESPONSE STYLE | length, tone, the greeting line |
+| BOUNDARIES | out-of-scope redirect, professional-advice redirect, endorsement line |
+
+Keep it under ~1200 tokens: the client counts the system message against
+`N_ATLAS_MAX_CONVERSATION_TOKENS` (3500), so a long prompt eats the history.
 
 ## 4. Startup
 
@@ -151,12 +186,12 @@ never reach the model, so they work with the server offline.
 Each language is its own command, so the mode is one keystroke away:
 
 ```
-/hausa        Language mode: Hausa. N-ATLaS will reply in Hausa until you switch...
+/hausa        Language mode: Hausa. ConfamAI will reply in Hausa until you switch...
 Báwo ni?      -> a reply in Hausa, not Yoruba
 /yoruba       Language mode: Yoruba...
 Sannu da yawa?  -> a reply in Yoruba, not Hausa
 /english      Language mode: English...
-/auto         Language mode: Auto. N-ATLaS will reply in the language of each message.
+/auto         Language mode: Auto. ConfamAI will reply in the language of each message.
 ```
 
 **The mode is a hard pin.** It is a choice about the *reply*, so it holds even
@@ -393,6 +428,7 @@ real, because that is a question about data, not language.
 
 ```
 confamAi/
+├── confam_prompt.txt                      # THE system prompt (persona)
 ├── .env                             # shared client configuration
 ├── .env.example                     # the same, with placeholders
 ├── n_atlas_client/                  # THIS FOLDER — the laptop client
@@ -400,7 +436,7 @@ confamAi/
 │   ├── __main__.py                  # python -m n_atlas_client
 │   ├── main.py                      # entry point
 │   ├── config.py                    # configuration
-│   ├── prompt.py                    # the Confam AI system prompt
+│   ├── prompt.py                    # resolves confam_prompt.txt
 │   ├── api.py                       # NAtlasClient (API client)
 │   ├── language.py                  # /hausa /yoruba /igbo /english /auto modes
 │   ├── nafdac.py                    # NAFDAC interception for chat
@@ -429,6 +465,9 @@ confamAi/
 │   ├── readme.md
 │   ├── natlas_notebook.py           # single source of truth (17 cells)
 │   ├── natlas_kaggle.ipynb          # build artefact — upload this to Kaggle
+│   ├── build_notebook.py            # regenerates the .ipynb
+│   ├── build_kaggle_dataset.py      # packages nafdac_source + confam_prompt.txt
+│   ├── check_prompt_drift.py        # prompt file vs the fallback constants
 │   ├── verify_nafdac.py             # checks Cell 18 without a GPU
 │   ├── requirements.txt
 │   └── kaggleserver.py, apiserver.py, kaggle.py, ...

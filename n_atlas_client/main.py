@@ -28,7 +28,7 @@ except Exception:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="n_atlas_client",
-        description="N-ATLaS laptop client — talks to the remote Kaggle "
+        description="ConfamAI laptop client — talks to the remote Kaggle "
                     "server (Tesla T4) over an OpenAI-compatible API.",
     )
     parser.add_argument(

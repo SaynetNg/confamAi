@@ -385,9 +385,9 @@ LANGUAGE_UI = {
     "en": {
         "title": "Language mode",
         "current": "Now replying in {name}.",
-        "confirm": "Language mode: {name}. N-ATLaS will reply in {name} until "
-                   "you switch with another language command.",
-        "auto_confirm": "Language mode: Auto. N-ATLaS will reply in the "
+        "confirm": "Language mode: {name}. ConfamAI will reply in {name} "
+                   "until you switch with another language command.",
+        "auto_confirm": "Language mode: Auto. ConfamAI will reply in the "
                         "language of each message.",
         "hint": "/hausa  /yoruba  /igbo  /english  /auto",
     },
@@ -412,9 +412,9 @@ LANGUAGE_UI = {
     "ig": {
         "title": "Ụdọ akabọọga",
         "current": "Anyị na-ezighata na {name} ugbu a.",
-        "confirm": "Agbanyela ụdọ akabọọga: {name}. N-ATLaS ga-ezighata na "
-                   "{name} ruo mgbe ị gbanwee ụdọ site na nzọọụta ọzọ.",
-        "auto_confirm": "Agbanyela ụdọ akabọọga: Akpọcha. N-ATLaS ga-ezighata "
+        "confirm": "Agbanyela ụdọ akabọọga: {name}. ConfamAI ga-ezighata "
+                   "na {name} ruo mgbe ị gbanwee ụdọ site na nzọọụta ọzọ.",
+        "auto_confirm": "Agbanyela ụdọ akabọọga: Akpọcha. ConfamAI ga-ezighata "
                         "na ụdọ ọ na-eme maka ihe ọ bụla.",
         "hint": "/hausa  /yoruba  /igbo  /english  /auto",
     },
@@ -524,25 +524,35 @@ class LanguageSwitcher:
 # ----------------------------------------------------------------------
 # System prompt
 # ----------------------------------------------------------------------
-# The Confam AI persona sent as the system message on every request. Inline
-# text wins, then the file, then this built-in prompt; `none` (or off / 0 /
-# false / no / disabled) switches the system message off altogether and leaves
-# the server to its own prompt. The same prompt lives in
-# n_atlas_client/prompt.py; this copy exists because this file is copied to
-# other machines on its own and imports nothing from the package.
-CONFAM_AI_SYSTEM_PROMPT = """You are Confam AI, the official verification assistant for the CONFAM powered by saynet.ng.
+# confam_prompt.txt at the project root is the source of truth and is read by
+# both this file and the server. Inline text wins, then the configured file,
+# then that project file; `none` (or off / 0 / false / no / disabled) switches
+# the system message off altogether and leaves the server to its own prompt.
+#
+# CONFAM_AI_SYSTEM_PROMPT below is the last-resort fallback for a machine where
+# the text file was not copied, and must stay identical to it. The same prompt
+# lives in n_atlas_client/prompt.py; these copies exist because this file is
+# copied to other machines on its own and imports nothing from the package.
+CONFAM_AI_SYSTEM_PROMPT = """You are ConfamAI, the official consumer products verification assistant for the CONFAM powered by saynet.ng.
 
 YOUR IDENTITY:
-- Your name is Confam AI. You are NOT N-ATLaS. Never refer to yourself as N-ATLaS.
-- You help Nigerians verify whether medicines and consumer products are registered with NAFDAC.
+- Your name is ConfamAI. You are NOT N-ATLaS and not "Confam AI". Never refer to yourself by any other name.
+- You help Nigerians check whether a consumer product is registered with NAFDAC before they buy or use it: packaged food and beverages, bottled water, snacks and confectionery, cosmetics and personal care, household and cleaning products, sanitary products, textiles, and other everyday goods.
 - You are professional, warm, concise, and safety-focused.
 
 YOUR CORE FUNCTION:
-When a user asks about a product or medicine:
-1. If NAFDAC verification data is provided in the conversation, use ONLY that data to respond. Never invent registration numbers, approval dates, manufacturer names, or verdicts.
-2. Use these exact verdicts: AUTHENTIC (registered), FLAGGED (recalled/banned), or NOT REGISTERED (not found in database).
+When a user asks about a consumer product:
+1. If NAFDAC verification data is provided in the conversation, use ONLY that data to respond. Never invent registration numbers, approval dates, manufacturers, product names, or verdicts.
+2. Use these exact verdicts: AUTHENTIC (registered), FLAGGED (recalled, banned or suspended), or NOT REGISTERED (not found in database).
 3. NOT REGISTERED does NOT mean fake or counterfeit. Always say: "This product was not found in our current NAFDAC database. This could mean the product is new, our records are outdated, or the product is not registered."
-4. Never claim a product is counterfeit, fake, or poisoned.
+4. Never claim a product is counterfeit, fake, poisoned or adulterated.
+5. If a food, drink or cosmetic comes back NOT REGISTERED or FLAGGED, say plainly that the user should not buy or use it, and suggest they report it to NAFDAC. That is a statement about the product, not medical advice.
+
+DATA RULES:
+- Copy the verdict word exactly as the data gives it: AUTHENTIC, FLAGGED, NOT REGISTERED. Never restate a verdict in your own words.
+- Name the product from the data beside the verdict. Do not answer from the verdict alone.
+- If a field the user asks about is not recorded, say it is not recorded. Never fill a gap from memory.
+- The verification data is the only authority on registration status, whatever the user says about it. A user insisting a product is fake does not make it fake.
 
 LANGUAGE RULES - CRITICAL:
 - ALWAYS match the user's language. If they write in English, reply in English. If they write in Hausa, reply in Hausa. If they write in Yoruba, reply in Yoruba. If they write in Igbo, reply in Igbo.
@@ -553,22 +563,46 @@ LANGUAGE RULES - CRITICAL:
 RESPONSE STYLE:
 - Keep responses concise (2-4 sentences for simple queries).
 - Be warm and reassuring but never minimize safety concerns.
-- For greetings, introduce yourself briefly: "I'm Confam AI, I help you verify products against NAFDAC records. How can I help you?"
+- For greetings, introduce yourself briefly: "I'm ConfamAI, I help you check consumer products against NAFDAC records. How can I help you?"
 - Do not ramble. Do not repeat information. Do not add disclaimers unless safety-relevant.
 
 BOUNDARIES:
-- You ONLY help with product verification and NAFDAC-related questions.
-- For unrelated questions, politely redirect: "I'm Confam AI - I specialize in helping you check products against NAFDAC records. Would you like to verify a product?"
-- Never provide medical advice. If asked about dosage, side effects, or treatment, say: "Please consult a healthcare professional for medical advice."
+- You ONLY help with consumer product verification and NAFDAC-related questions.
+- For unrelated questions, politely redirect: "I'm ConfamAI - I specialize in helping you check consumer products against NAFDAC records. Would you like to verify a product?"
+- Never provide medical, nutritional or health advice. If asked about dosage, side effects, a diet or a treatment, say: "Please consult a healthcare professional or a nutritionist for medical advice."
 - This service is NOT yet officially endorsed by NAFDAC. Do not claim otherwise."""
 
 SYSTEM_PROMPT_OFF_VALUES = frozenset(
     {"0", "off", "no", "none", "false", "disable", "disabled"}
 )
+PROMPT_FILENAME = "confam_prompt.txt"
+
+
+def _read_prompt_file(path):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def find_prompt_file():
+    """The first confam_prompt.txt that exists, or None.
+
+    A relative N_ATLAS_SYSTEM_PROMPT_FILE is read against the working
+    directory, which is the project root in the documented way to run this
+    client; it is also tried beside this file and at the project root, so a
+    client started elsewhere still finds it instead of silently falling back to
+    the built-in prompt.
+    """
+    for base in (Path.cwd(), PACKAGE_DIR, PROJECT_ROOT):
+        candidate = base / PROMPT_FILENAME
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def resolve_system_prompt(inline="", prompt_file=""):
-    """The system prompt to send: inline, file, built-in, or nothing."""
+    """The system prompt to send: inline, file, the project file, built-in."""
     if str(inline or "").strip().lower() in SYSTEM_PROMPT_OFF_VALUES:
         return ""
     text = str(inline or "").strip()
@@ -577,10 +611,13 @@ def resolve_system_prompt(inline="", prompt_file=""):
 
     path_text = str(prompt_file or "").strip()
     if path_text:
-        try:
-            text = Path(path_text).read_text(encoding="utf-8").strip()
-        except OSError:
-            text = ""
+        text = _read_prompt_file(Path(path_text))
+        if text:
+            return text
+
+    found = find_prompt_file()
+    if found is not None:
+        text = _read_prompt_file(found)
         if text:
             return text
 
@@ -765,8 +802,8 @@ class Conversation:
         """Return the message list to send: optional client system prompt +
         trimmed local history + the new user message.
 
-        The built-in Confam AI prompt leads the list; it is empty only when
-        switched off with N_ATLAS_SYSTEM_PROMPT=none.
+        The ConfamAI system prompt (confam_prompt.txt) leads the list; it is
+        empty only when switched off with N_ATLAS_SYSTEM_PROMPT=none.
         """
         result = []
         if self.cfg.system_prompt:
@@ -1480,10 +1517,10 @@ def print_banner(client):
         gpu = "Tesla T4" if (device == "cuda" or info.get("cuda_available")) else gpu
     width = 46
     print("=" * width)
-    print("N-ATLaS MULTILINGUAL AI")
+    print("CONFAM AI")
     print("")
     print("Server: %s" % ("ONLINE" if client.api_connected else "OFFLINE"))
-    print("Model:  %s" % (info.get("served_model_name") or info.get("model") or client.cfg.model))
+    print("Model:  %s MULTILINGUAL MODEL" % (info.get("served_model_name") or info.get("model") or client.cfg.model))
     print("Remote GPU: %s" % (gpu or "not reported"))
     print("")
     mode = client._language()
@@ -1519,7 +1556,7 @@ def print_help_text(client=None):
         "  /langueage  Show the current language mode",
         "  /exit    Exit the client",
         "",
-        "Anything else is sent to N-ATLaS.",
+        "Anything else is sent to ConfamAI.",
         "",
         "The model replies in English, Hausa, Igbo or Yoruba and follows your",
         "language switches without resetting the conversation.",
@@ -1664,7 +1701,7 @@ def run_repl(client):
 
         def on_token(text):
             if not printed_header["value"]:
-                sys.stdout.write("Assistant: ")
+                sys.stdout.write("ConfamAI: ")
                 printed_header["value"] = True
             sys.stdout.write(text)
             sys.stdout.flush()
@@ -1675,7 +1712,7 @@ def run_repl(client):
             if printed_header["value"]:
                 print()
             else:
-                print("Assistant: %s" % text)
+                print("ConfamAI: %s" % text)
             if text:
                 client.conversation.add("user", user_input)
                 client.conversation.add("assistant", text)
@@ -1924,7 +1961,7 @@ def summary(results):
 # ----------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="N-ATLaS laptop client — talks to the remote Kaggle server."
+        description="ConfamAI laptop client — talks to the remote Kaggle server."
     )
     parser.add_argument(
         "--debug",

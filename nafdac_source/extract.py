@@ -129,6 +129,16 @@ def fold(text: str) -> str:
 # trigger beyond the word NAFDAC so a user who asks "is this malaria tablet
 # genuine?" in their own language reaches the greenbook at all.
 #
+# The consumer-product block is for the CONFAM consumer-products pivot: food and
+# beverages, cosmetics and personal care, household and sanitary goods. They are
+# search terms, not triggers — nothing here decides whether a message is a
+# lookup (`mentions_nafdac` does that) — so adding one cannot make the client
+# intercept ordinary chat. It only means the word survives as a query when a
+# consumer-products export is loaded. The export currently on disk holds Drugs,
+# Medical devices, Vaccines and Biologics, Herbals and Nutraceuticals and
+# Veterinary, and no consumer category at all, so these words return nothing
+# until such a dataset is loaded.
+#
 # Written in the languages' own orthography, then folded at import time.
 # `fold()` strips diacritics, so `ọdụ` is matched as `odu` and a user who types
 # either form hits the same entry.
@@ -136,9 +146,11 @@ def fold(text: str) -> str:
 # Kept deliberately short and high-precision. A loose word like Yoruba `ewu`
 # (bag) or `ikun` (rope) would fire on unrelated conversation, and a trigger
 # that fires on ordinary chat is worse than no trigger at all, because every
-# ordinary message would then cost a greenbook lookup.
+# ordinary message would then cost a greenbook lookup. The same applies to
+# search terms: a noun added here becomes a query, so a generic word like `omi`
+# (water) is only safe because a query is never sent on its own.
 _MULTILINGUAL_PRODUCT_NOUNS = (
-    # English
+    # English — medicines
     "drug",
     "drugs",
     "medicine",
@@ -149,20 +161,80 @@ _MULTILINGUAL_PRODUCT_NOUNS = (
     "tablets",
     "capsule",
     "capsules",
-    # Hausa
+    # English — food and drink
+    "food",
+    "foods",
+    "drink",
+    "drinks",
+    "beverage",
+    "beverages",
+    "snack",
+    "snacks",
+    "biscuit",
+    "biscuits",
+    "chocolate",
+    "confectionery",
+    "flour",
+    "noodles",
+    # English — cosmetics and personal care
+    "cosmetic",
+    "cosmetics",
+    "lotion",
+    "perfume",
+    "deodorant",
+    "sunscreen",
+    # English — household, sanitary and textiles
+    "detergent",
+    "bleach",
+    "sanitizer",
+    "sanitiser",
+    "disinfectant",
+    "toothpaste",
+    "sanitary",
+    "diaper",
+    "diapers",
+    "tissue",
+    "textile",
+    "textiles",
+    # Hausa — medicines
     "magari",
     "kwayoyi",
     "ruwan tabo",
-    # Yoruba
+    # Hausa — food, drink and household
+    "abinci",
+    "ruwa",
+    "kofi",
+    "biskit",
+    "gari",
+    "shinkafa",
+    "sabuni",
+    "soap",
+    "shampoo",
+    "perfume",
+    # Yoruba — medicines
     "oro",
     "oogun",
     "abọ",
     "ojú",
-    # Igbo
+    # Yoruba — food, drink and household
+    "ounje",
+    "omi",
+    "biskit",
+    "suga",
+    "opo",
+    "perfume",
+    # Igbo — medicines
     "ọdụ",
     "ọdọ",
     "nwanwị",
     "ụdụ",
+    # Igbo — food, drink and household
+    "nri",
+    "mmiri",
+    "biskit",
+    "soap",
+    "shampoo",
+    "perfume",
 )
 
 

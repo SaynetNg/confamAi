@@ -80,7 +80,8 @@ class Config:
     conversations_dir: str = "conversations"   # N_ATLAS_CONVERSATIONS_DIR
 
     # --- system prompt ---------------------------------------------------
-    # The built-in Confam AI prompt (prompt.py) is sent unless
+    # The ConfamAI prompt from confam_prompt.txt (or the constant in
+    # prompt.py when that file is absent) is sent unless
     # N_ATLAS_SYSTEM_PROMPT / ..._FILE say otherwise, or the prompt is
     # switched off with N_ATLAS_SYSTEM_PROMPT=none.
     system_prompt: str = ""       # N_ATLAS_SYSTEM_PROMPT / ..._FILE

@@ -205,13 +205,28 @@ client as `https://<that-hostname>/v1`. Only now is Stage 2 reachable.
 
 Everything is an environment variable, so the core server never needs editing.
 
+The one thing that is *not* an environment variable is the persona: it is
+`confam_prompt.txt` at the project root, uploaded with the `n-atlas-source`
+dataset as `prompt/confam_prompt.txt` and found on disk by
+`find_bundled_prompt_file()`. The precedence is
+
+```
+N_ATLAS_SYSTEM_PROMPT_FILE > N_ATLAS_SYSTEM_PROMPT > confam_prompt.txt on disk
+                            > DEFAULT_SYSTEM_PROMPT in this notebook
+```
+
+Cell 3 prints which one won after `System prompt:`. `bundled:` means your file is
+being served; `builtin` means the dataset was not attached and the notebook fell
+back to its own copy, so an edit to the file is not live yet. Rebuild the dataset
+with `python build_kaggle_dataset.py`, re-upload it, and re-run the cells.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `N_ATLAS_API_KEY` | random ephemeral dev key | **Set this before exposing the server.** |
 | `N_ATLAS_DEV_KEY` | unset | Known temporary key, dev only. |
 | `N_ATLAS_ALLOW_EPHEMERAL_KEY` | `1` | Set `0` to hard-fail when no key is configured. |
-| `N_ATLAS_SYSTEM_PROMPT` | the built-in Confam AI prompt | Inline system prompt override. |
-| `N_ATLAS_SYSTEM_PROMPT_FILE` | unset | Path to a prompt file; wins over inline. |
+| `N_ATLAS_SYSTEM_PROMPT` | unset — `confam_prompt.txt` is served | Inline system prompt override. |
+| `N_ATLAS_SYSTEM_PROMPT_FILE` | unset — `confam_prompt.txt` is found on disk | Path to a prompt file; wins over inline. |
 | `N_ATLAS_MAX_NEW_TOKENS` | `512` | Hard ceiling on client `max_tokens`. |
 | `N_ATLAS_DEFAULT_MAX_TOKENS` | `512` | Used when the client omits it. |
 | `N_ATLAS_MAX_INPUT_TOKENS` | `4096` | Prompt ceiling. T4-safe — see below before raising. |

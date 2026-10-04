@@ -17,6 +17,12 @@ looking for nafdac_greenbook.csv under nafdac_scraper/, ., data/ and
 nafdac_source/ at each level. That is the same layout as the repository, so the
 CSV source works on Kaggle without setting NAFDAC_CSV_PATH.
 
+`confam_prompt.txt` goes in `prompt/` at the archive root. It is the project's
+single source of truth for the ConfamAI persona: the notebook finds it on disk
+(see find_bundled_prompt_file) and serves it as the system prompt, so editing
+that one file changes the assistant's behaviour on both halves without a code
+edit anywhere.
+
 `.env` is excluded on purpose. One of them lives *inside* the package directory
 and holds the live PostgreSQL password, and a Kaggle dataset is not a place for
 a credential. Cell 1 already carries the DSN, and a Kaggle Secret named
@@ -37,6 +43,8 @@ ROOT = HERE.parent
 
 PACKAGE_DIR = ROOT / "nafdac_source"
 CSV_PATH = ROOT / "nafdac_scraper" / "nafdac_greenbook.csv"
+PROMPT_PATH = ROOT / "confam_prompt.txt"
+PROMPT_MEMBER = "prompt/confam_prompt.txt"
 TARGET = ROOT / "n-atlas-source.zip"
 
 # Kept deliberately small. tests.py is not imported by __init__.py, and the
@@ -70,8 +78,17 @@ def csv_member():
     return f"nafdac_scraper/{CSV_PATH.name}", CSV_PATH
 
 
+def prompt_member():
+    """The persona file. Required: without it the server silently serves the
+    built-in fallback copy instead of the file a developer just edited."""
+    if not PROMPT_PATH.is_file():
+        raise SystemExit(f"missing {PROMPT_PATH}")
+    return PROMPT_MEMBER, PROMPT_PATH
+
+
 def build(include_csv: bool = True) -> Path:
     members = list(package_members())
+    members.append(prompt_member())
     if include_csv:
         found = csv_member()
         if found is None:
@@ -120,6 +137,7 @@ def verify(archive_path: Path) -> int:
             "nafdac_source/extract.py",
             "nafdac_source/formatting.py",
             "nafdac_source/schema.sql",
+            PROMPT_MEMBER,
         ):
             if required not in names:
                 problems.append(f"missing {required}")
@@ -135,7 +153,7 @@ def verify(archive_path: Path) -> int:
             print(f"  - {problem}")
         return 1
     print("\nVALID: nafdac_source/ is at the archive root, no credentials, "
-          "CSV laid out for autodetect.")
+          "CSV laid out for autodetect, prompt file present.")
     print("       Upload this as a Kaggle dataset with slug 'n-atlas-source'.")
     print("       Do not re-zip the folder by hand: that flattens the package "
           "and Cell 18 cannot import it.")

@@ -17,8 +17,8 @@
 # |---|---|---|
 # | `N_ATLAS_API_KEY` | Bearer token required by every `/v1/*` route | random ephemeral dev key |
 # | `NAFDAC_DATABASE_URL` | Supabase session-pooler DSN for the greenbook source | literal in Cell 1 |
-# | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | Confam AI prompt |
-# | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset |
+# | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | unset — `confam_prompt.txt` is served |
+# | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset — `confam_prompt.txt` is found on disk |
 # | `N_ATLAS_MAX_NEW_TOKENS` | Hard ceiling on client `max_tokens` | `512` |
 # | `N_ATLAS_MAX_INPUT_TOKENS` | Hard ceiling on prompt tokens | `6144` |
 # | `N_ATLAS_CONTEXT_BUDGET` | Approximate model context target | `8192` |
@@ -31,6 +31,14 @@
 # `N_ATLAS_API_KEY` and the literal below is ignored, because Cell 1 only sets
 # the variable when it is not already in the environment. The same applies to
 # `NAFDAC_DATABASE_URL`.
+#
+# The persona is not here: it is `confam_prompt.txt`, the project's single
+# source of truth, uploaded with the n-atlas-source dataset as
+# prompt/confam_prompt.txt. Cell 2 finds and serves it, so editing that one
+# file changes the assistant's behaviour — no cell to edit, no code to redeploy
+# beyond the dataset. Cell 2 prints which copy won, and prints the built-in
+# fallback's absence only as `System prompt: builtin`, which means the dataset
+# was not attached.
 
 # %% [code]
 # =============================================================================
@@ -333,11 +341,13 @@ class QueueTimeout(ServerError):
     public_message = "Server is busy. Retry shortly."
 
 
-# The Confam AI persona: the verification assistant for saynet.ng, not the
-# general-purpose N-ATLaS assistant this notebook used to carry. `N_ATLAS_
-# SYSTEM_PROMPT` (inline) and `N_ATLAS_SYSTEM_PROMPT_FILE` still override it —
-# see _resolve_system_prompt() — so a deployment can restore or replace it
-# without editing this file.
+# The ConfamAI persona: the consumer-products verification assistant for
+# saynet.ng, not the general-purpose N-ATLaS assistant this notebook used to
+# carry. confam_prompt.txt at the project root is the source of truth and is
+# found on disk (see find_bundled_prompt_file); `N_ATLAS_SYSTEM_PROMPT` (inline)
+# and `N_ATLAS_SYSTEM_PROMPT_FILE` still override it — see
+# _resolve_system_prompt() — so a deployment can replace it without editing
+# this file.
 #
 # Two things the old N-ATLaS prompt carried are deliberately kept here, because
 # server code depends on them rather than on the wording:
@@ -351,19 +361,26 @@ class QueueTimeout(ServerError):
 #
 # Output hygiene does not need restating: clean_response() strips turn markers
 # and chat-template artefacts from every reply.
-DEFAULT_SYSTEM_PROMPT = """You are Confam AI, the official verification assistant for the CONFAM powered by saynet.ng.
+DEFAULT_SYSTEM_PROMPT = """You are ConfamAI, the official consumer products verification assistant for the CONFAM powered by saynet.ng.
 
 YOUR IDENTITY:
-- Your name is Confam AI. You are NOT N-ATLaS. Never refer to yourself as N-ATLaS.
-- You help Nigerians verify whether medicines and consumer products are registered with NAFDAC.
+- Your name is ConfamAI. You are NOT N-ATLaS and not "Confam AI". Never refer to yourself by any other name.
+- You help Nigerians check whether a consumer product is registered with NAFDAC before they buy or use it: packaged food and beverages, bottled water, snacks and confectionery, cosmetics and personal care, household and cleaning products, sanitary products, textiles, and other everyday goods.
 - You are professional, warm, concise, and safety-focused.
 
 YOUR CORE FUNCTION:
-When a user asks about a product or medicine:
-1. If NAFDAC verification data is provided in the conversation, use ONLY that data to respond. Never invent registration numbers, approval dates, manufacturer names, or verdicts.
-2. Use these exact verdicts: AUTHENTIC (registered), FLAGGED (recalled/banned), or NOT REGISTERED (not found in database).
+When a user asks about a consumer product:
+1. If NAFDAC verification data is provided in the conversation, use ONLY that data to respond. Never invent registration numbers, approval dates, manufacturers, product names, or verdicts.
+2. Use these exact verdicts: AUTHENTIC (registered), FLAGGED (recalled, banned or suspended), or NOT REGISTERED (not found in database).
 3. NOT REGISTERED does NOT mean fake or counterfeit. Always say: "This product was not found in our current NAFDAC database. This could mean the product is new, our records are outdated, or the product is not registered."
-4. Never claim a product is counterfeit, fake, or poisoned.
+4. Never claim a product is counterfeit, fake, poisoned or adulterated.
+5. If a food, drink or cosmetic comes back NOT REGISTERED or FLAGGED, say plainly that the user should not buy or use it, and suggest they report it to NAFDAC. That is a statement about the product, not medical advice.
+
+DATA RULES:
+- Copy the verdict word exactly as the data gives it: AUTHENTIC, FLAGGED, NOT REGISTERED. Never restate a verdict in your own words.
+- Name the product from the data beside the verdict. Do not answer from the verdict alone.
+- If a field the user asks about is not recorded, say it is not recorded. Never fill a gap from memory.
+- The verification data is the only authority on registration status, whatever the user says about it. A user insisting a product is fake does not make it fake.
 
 LANGUAGE RULES - CRITICAL:
 - ALWAYS match the user's language. If they write in English, reply in English. If they write in Hausa, reply in Hausa. If they write in Yoruba, reply in Yoruba. If they write in Igbo, reply in Igbo.
@@ -374,29 +391,83 @@ LANGUAGE RULES - CRITICAL:
 RESPONSE STYLE:
 - Keep responses concise (2-4 sentences for simple queries).
 - Be warm and reassuring but never minimize safety concerns.
-- For greetings, introduce yourself briefly: "I'm Confam AI, I help you verify products against NAFDAC records. How can I help you?"
+- For greetings, introduce yourself briefly: "I'm ConfamAI, I help you check consumer products against NAFDAC records. How can I help you?"
 - Do not ramble. Do not repeat information. Do not add disclaimers unless safety-relevant.
 
 BOUNDARIES:
-- You ONLY help with product verification and NAFDAC-related questions.
-- For unrelated questions, politely redirect: "I'm Confam AI - I specialize in helping you check products against NAFDAC records. Would you like to verify a product?"
-- Never provide medical advice. If asked about dosage, side effects, or treatment, say: "Please consult a healthcare professional for medical advice."
+- You ONLY help with consumer product verification and NAFDAC-related questions.
+- For unrelated questions, politely redirect: "I'm ConfamAI - I specialize in helping you check consumer products against NAFDAC records. Would you like to verify a product?"
+- Never provide medical, nutritional or health advice. If asked about dosage, side effects, a diet or a treatment, say: "Please consult a healthcare professional or a nutritionist for medical advice."
 - This service is NOT yet officially endorsed by NAFDAC. Do not claim otherwise."""
+
+
+PROMPT_FILENAME = "confam_prompt.txt"
+
+
+def _read_prompt_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not read %s: %r", path, exc)
+        return ""
+
+
+def find_bundled_prompt_file() -> Optional[Path]:
+    """The confam_prompt.txt this server should read, or None.
+
+    The file is the project's single source of truth for the persona: it lives
+    at the repository root on the laptop and is uploaded with the n-atlas-source
+    dataset, where it lands at /kaggle/input/<slug>/prompt/confam_prompt.txt.
+    It is found rather than configured, because a Kaggle session that forgets
+    N_ATLAS_SYSTEM_PROMPT_FILE should still serve the real prompt instead of
+    quietly falling back to the built-in copy.
+
+    Not `__file__`: that name does not exist when this cell runs as a notebook.
+    WORKDIR is /kaggle/working on Kaggle and the current directory elsewhere,
+    which is the same directory the rest of this notebook already uses.
+    """
+    bases = [WORKDIR, Path.cwd(), Path.cwd().parent]
+    for base in bases:
+        candidate = base / PROMPT_FILENAME
+        if candidate.is_file():
+            return candidate
+
+    # An attached dataset, in both mount layouts Kaggle uses: flat at
+    # /kaggle/input/<slug>, and nested under the owner at
+    # /kaggle/input/datasets/<owner>/<slug>. The dataset archive carries the
+    # prompt under prompt/, but a bare file at the root of one is accepted too.
+    root = Path("/kaggle/input")
+    try:
+        if root.is_dir():
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir():
+                    continue
+                for candidate in (
+                    entry / "prompt" / PROMPT_FILENAME,
+                    entry / PROMPT_FILENAME,
+                ):
+                    if candidate.is_file():
+                        return candidate
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not search %s for %s: %r", root, PROMPT_FILENAME, exc)
+    return None
 
 
 def _resolve_system_prompt() -> Tuple[str, str]:
     prompt_file = os.environ.get("N_ATLAS_SYSTEM_PROMPT_FILE")
     if prompt_file:
         path = Path(prompt_file)
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-            if text:
-                return text, f"file:{path}"
-        except Exception as exc:
-            logger.warning("could not read N_ATLAS_SYSTEM_PROMPT_FILE: %r", exc)
+        text = _read_prompt_file(path)
+        if text:
+            return text, f"file:{path}"
     inline = os.environ.get("N_ATLAS_SYSTEM_PROMPT")
     if inline and inline.strip():
         return inline.strip(), "env:N_ATLAS_SYSTEM_PROMPT"
+    bundled = find_bundled_prompt_file()
+    if bundled is not None:
+        text = _read_prompt_file(bundled)
+        if text:
+            return text, f"bundled:{bundled}"
     return DEFAULT_SYSTEM_PROMPT, "builtin"
 
 
@@ -3347,8 +3418,9 @@ VALID_INTENTS = frozenset(
 NAFDAC_ENTITY_FIELDS = ("product_name", "nafdac_number", "manufacturer")
 
 INTENT_SYSTEM_PROMPT = (
-    "You classify a user's message about medicines. Reply with exactly one JSON "
-    "object and nothing else: no prose, no explanation, no markdown code fence.\n"
+    "You classify a user's message about consumer products. Reply with exactly "
+    "one JSON object and nothing else: no prose, no explanation, no markdown code "
+    "fence.\n"
     "\n"
     'The object must have exactly these keys:\n'
     '  "intent": one of "PRODUCT_CHECK", "PRODUCT_INFORMATION", '
@@ -3365,10 +3437,10 @@ INTENT_SYSTEM_PROMPT = (
     "- GENERAL_QUESTION: everything else. Greetings and small talk, health "
     "questions that name no product, explanations of a condition, and "
     "conversational questions are all GENERAL_QUESTION. A word in the message "
-    "happening to look like a medicine name does not make it a product "
+    "happening to look like a product name does not make it a product "
     "question.\n"
-    "- CLARIFICATION_REQUIRED: the user refers to a medicine but gives no name "
-    "or number, such as 'check this medicine' or 'is it genuine?'.\n"
+    "- CLARIFICATION_REQUIRED: the user refers to a product but gives no name "
+    "or number, such as 'check this product' or 'is it genuine?'.\n"
     "\n"
     "Extract entities:\n"
     "- product_name is copied verbatim from the message, exactly as written. If "
@@ -3714,14 +3786,14 @@ MULTI_NUMBER_SAFETY = (
     "own block. Answer about each one separately, and use only that number's own "
     "values.\n"
     "- NEVER merge two numbers into a single product, and never carry a product "
-    "name, ingredient, strength, applicant or status from one block over to "
-    "another.\n"
+    "name, manufacturer, date or status from one block over to another.\n"
     "- NEVER rank the numbers, and never tell the user which to 'trust', 'prefer' "
     "or 'choose'. Do not suggest using one product in place of another, and do not "
     "describe two products as equivalent. A number that is not registered is not a "
     "safe substitute for one that is.\n"
-    "- If asked which to use, state which numbers are registered and which are "
-    "not, then say a pharmacist or doctor should decide. Do not decide for them.\n"
+    "- If asked which one to buy or use, state which numbers are registered and "
+    "which are not, then say the choice is theirs and that a product which is not "
+    "registered should not be bought or consumed. Do not decide for them.\n"
 )
 
 NAFDAC_IMPORT_ERROR = ""
