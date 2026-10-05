@@ -7,7 +7,7 @@ is the **training** half of the project and serves nothing.
 |---|---|---|
 | Job | trains the adapter, pushes it, ends | serves chat requests on port 8000 |
 | Kaggle dataset attached | `confam-training` | `n-atlas-source` |
-| Lifetime | one run, ~3.5–4.5 h, then stop it | as long as you leave it running |
+| Lifetime | one run, ~1.5 h, then stop it | as long as you leave it running |
 | Your laptop client points at it | never | **only this one** |
 
 The only thing that crosses between them is the adapter on the Hugging Face Hub.
@@ -55,9 +55,8 @@ This folder also holds everything used to produce and check that file:
 4. **Accept N-ATLaS's licence on Hugging Face first.** `NCAIR1/N-ATLaS` is gated:
    `from_pretrained` fails with a 401 until your account has agreed to share
    contact information. The server notebook needs the same access.
-5. Budget **~4 hours** for the default 200 steps on one T4 — the arithmetic is
-   under "Timing" below. Start with a lower `N_ATLAS_TRAIN_STEPS` if this is your
-   first run.
+5. Budget **~1.5 hours** for the default 200 steps on one T4 — measured, see
+   "Timing" below.
 
 **Then**
 
@@ -124,21 +123,39 @@ below is the one to plan against. **Restart the kernel and re-run from Cell 1 if
 you ever edit that line**: torch caches the device count on first use, so Cell 1
 has to be the first cell that touches CUDA.
 
-That gives **~3.2 h of training plus 10-20 min of setup**, so budget **~4 h**.
+That gives **~1.3 h of training plus 10-20 min of setup**, so budget **~1.5 h**.
+
+That number is measured, not predicted: the first run did 12 optimizer steps in
+3 m 54 s, i.e. 19.5 s/step, which is 200 steps in 1.3 h. The 4-hour figure this
+section used to quote came from scaling a published RTX 3090 number down by the
+T4's bandwidth ratio, and it was 2.2× pessimistic — adapting `q_proj, k_proj,
+v_proj, o_proj` only skips most of the model, so a T4's spare compute goes
+further than the bandwidth ratio assumes. **time.md §2.1 has the arithmetic and
+§10 has the correction.**
 
 For the full arithmetic, the research anchors it is based on, the Kaggle limits it
-sits inside, and how to correct the estimate from the real `it/s` after the first
-run, see **[time.md](time.md)**.
+sits inside, and how to correct the estimate from the real `it/s` after a run,
+see **[time.md](time.md)**.
 
-**Levers, in the order I would pull them:** `N_ATLAS_TRAIN_STEPS=120` (about 1.5
-epochs, ~2 h — my recommendation for a first run), then lowering
-`MAX_SEQ_LENGTH` to whatever Cell 6 reports as the real maximum plus headroom,
-then Unsloth in place of stock TRL if you want roughly 2× at the cost of another
-dependency.
+**Levers, in the order I would pull them:** lower `MAX_SEQ_LENGTH` to whatever
+Cell 6 reports as the real maximum plus headroom (attention is quadratic in it,
+and it is also the VRAM lever — see below), then `N_ATLAS_TRAIN_STEPS` if the
+loss plateaus, then Unsloth in place of stock TRL if you want roughly 2× at the
+cost of another dependency. At 1.3 h the default 200 steps is cheap enough to
+just run.
+
+**The VRAM floor is per-device batch 1.** The peak is not the weights (~5 GB for
+4-bit NF4) but the logits: Llama-3's vocab is 128256, so one 2048-token sequence
+is 501 MB in fp16 and ~2 GB once `cross_entropy` has upcast it to fp32 and kept a
+softmax buffer for backward. Batch 2 does not fit a T4's 14.56 GB and dies in
+`ForCausalLMLoss` on step 1; batch 1 holds at 7.3 GiB. Do not raise
+`N_ATLAS_TRAIN_BATCH` — raise `N_ATLAS_TRAIN_ACCUM` alongside it if you need a
+larger effective batch.
 
 **Limits that are not negotiable:** Kaggle allows ~30 GPU-hours per week (reset
 Saturday 00:00 UTC) and caps a single GPU session at 12 hours, so this run fits
-both — but a 4-hour session is a third of your weekly budget.
+both comfortably — at 1.5 h it is 5% of the week's budget, which leaves plenty of
+room to iterate on the dataset and the prompt.
 
 ## What fine-tuning cannot do here
 

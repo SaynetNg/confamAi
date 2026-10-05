@@ -99,14 +99,13 @@ os.environ.setdefault(
     "@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
 )
 
-# Serve the fine-tuned ConfamAI weights instead of the base model. Leave this
-# commented out until the adapter actually exists: the training notebook's last
-# line (`trainer.model.push_to_hub(...)`) creates it, and a name that does not
-# resolve stops this server from starting rather than falling back. Prefer a
-# Kaggle Secret named N_ATLAS_ADAPTER_ID over the literal — setdefault means the
-# secret wins, the same as it does for the two variables above.
-#
-# os.environ.setdefault("N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter")
+# Serve the fine-tuned ConfamAI weights instead of the base model. The training
+# notebook's Cell 8 (`trainer.model.push_to_hub(...)`) creates this repo, and a
+# name that does not resolve stops this server from starting rather than falling
+# back. Prefer a Kaggle Secret named N_ATLAS_ADAPTER_ID over the literal —
+# setdefault means the secret wins, the same as it does for the two variables
+# above.
+os.environ.setdefault("N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter")
 
 from huggingface_hub import login  # noqa: E402 - imported after the key is set
 

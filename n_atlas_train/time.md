@@ -1,24 +1,28 @@
 # Training time estimate — ConfamAI QLoRA run
 
-**Answer: ~3.5 to 4.5 hours on Kaggle GPU T4 x2**, of which roughly 3–3.5 hours is
-training and 10–20 minutes is setup. Only one of the two T4s is used (§3).
+**Answer: ~1.5 hours on Kaggle GPU T4 x2**, of which ~1.3 h is training and
+10–20 minutes is setup. Only one of the two T4s is used (§3).
 
 Computed 5 October 2026 for the configuration in `train_notebook.py`:
-`max_steps=200`, effective batch 8 (per-device 2 × accumulation 4),
+`max_steps=200`, effective batch 8 (per-device 1 × accumulation 8),
 `MAX_SEQ_LENGTH=2048`, LoRA r=16 on `q_proj, k_proj, v_proj, o_proj`,
 643 records, stock HF Trainer + bitsandbytes + PEFT (no Unsloth).
 
+The first three sections of this document are the *prediction* as it stood
+before the run, left in place because the reasoning is what was wrong. §2.1
+records the measurement that replaced it.
+
 ---
 
-## 1. The calculation
+## 1. The calculation, as predicted
 
 | Quantity | Value | Where it comes from |
 |---|---|---|
-| Samples seen | **1600** | `max_steps=200` × effective batch 8 (2 × accum 4) |
+| Samples seen | **1600** | `max_steps=200` × effective batch 8 (1 × accum 8) |
 | Tokens per record | **~1200** | prompt is 3392 chars ≈ 950 Llama-3 tokens, plus block, turn, answer, ChatML |
 | Total tokens | **~2.0M** | × ~1.05 for padding |
-| Throughput, 1× T4 | **~200 tok/s** | derived in §2 |
-| Training time | **3.2 h** | 2.0M ÷ 200 on **one** T4 (2.8 h) plus ~15% for per-device batch 1 (§7); the second T4 idles, §3 |
+| Throughput, 1× T4 | **~200 tok/s** | derived in §2 — **wrong by 2.2×, see §2.1** |
+| Training time | **3.2 h** | predicted. **Measured 1.3 h** (§2.1) |
 
 ## 2. Where ~200 tok/s comes from
 
@@ -36,6 +40,37 @@ compute ratio.
 
 Published Llama-3 8B QLoRA throughput on an RTX 3090 is ~695 tok/s (1K examples
 in 24 minutes). Divided by ~3 that gives **~200 tok/s on one T4**.
+
+## 2.1 What the run actually measured
+
+From the first run, 5 October 2026: **12 optimizer steps in 3 m 54 s**, i.e.
+**19.5 s/step** at effective batch 8, which puts the full 200 steps at **1.3 h**.
+
+| Quantity | Measured | How |
+|---|---|---|
+| Seconds per optimizer step | **19.5** | 234 s ÷ 12 steps, from the progress bar |
+| Training time, 200 steps | **1.3 h** | 200 × 19.5 s |
+| Throughput, counting padding | **~705 tok/s** | 1600 × 2048 padded positions ÷ 4650 s |
+| Throughput, real tokens | **~430 tok/s** | the ~2.0M of §1 ÷ 4650 s |
+| VRAM after the fix | **7.3 of 14.6 GiB** | Cell 7's own line, batch 1 |
+| Training loss at step 10 | **2.27** | healthy for LoRA SFT on a base model |
+
+**The prediction was 2.2× pessimistic**, and the bandwidth argument in §2 is what
+failed. The 695 tok/s 3090 figure is for full-finetune-shaped work — all linear
+layers adapted, dense 4-bit dequantisation on every matmul. This run adapts
+`q_proj, k_proj, v_proj, o_proj` only, so most of the model is frozen and
+skipped, and a T4's spare compute goes further than the 1/3 bandwidth ratio
+assumes. Per-device batch 1, which cost ~15% on paper, turned out to cost
+nothing measurable: the loss peak is halved but the forward pass is not the
+bottleneck.
+
+The first 12 steps also include bitsandbytes kernel warm-up, so the steady-state
+rate is slightly better than 19.5 s/step.
+
+**Use 430 tok/s per T4 for this configuration** — LoRA on attention projections
+only, stock TRL — and not 200. For a heavier adaptation (`all-linear`, as
+Unsloth's defaults do) the original figure is closer to right, which is why the
+3090 anchor and this run disagree.
 
 ## 3. Does T4 x2 double it? No — it cannot be used at all
 
@@ -94,6 +129,12 @@ The two methods bracket **2.8–3.6 h on one T4**, which is where the ~2.8 h fig
 in §1 comes from. No published T4 x2 number for 8B QLoRA was found, which is why
 two independent anchors are used rather than a single table row.
 
+Both are wrong by about the same factor, and §2.1 says why: the 3B anchor was
+Unsloth with adapters on every linear layer, so scaling it by 8/3 and then
+doubling for "stock is half as fast" compounded two penalties. Measured, the
+1600-sample shape takes **1.3 h** on one T4. The third anchor — the only one that
+counts — is the one in §2.1.
+
 The AQLoRA paper ([arXiv 2608.23816](https://arxiv.org/pdf/2608.23816)) is worth
 knowing about for a second reason: it notes that QLoRA is *slower* than fp16 LoRA
 because of that on-the-fly dequantisation, and reports ~11% recoverable with a
@@ -125,8 +166,8 @@ the last 1 GB allocation, against a T4's usable 14.56 GB.
 
 Hence the two defaults that are now in the notebook: **per-device batch 1 with 8
 accumulation steps** (effective batch unchanged at 8, so the step count, the
-schedule and the 1600 samples all stay the same; wall clock is ~15% worse because
-there are 8 smaller forward passes per optimizer step instead of 4 larger ones),
+schedule and the 1600 samples all stay the same; 8 smaller forward passes per
+optimizer step instead of 4 larger ones, which §2.1 measures as costing nothing),
 and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which reclaims the 1.27 GB
 that was reserved-but-unallocated when it failed. Batch 1 is the floor — the next
 lever, if it is ever needed again, is `N_ATLAS_MAX_SEQ` lowered to Cell 6's
@@ -134,10 +175,11 @@ measured max, which saves VRAM linearly.
 
 ## 8. What I would actually run
 
-Start with **`N_ATLAS_TRAIN_STEPS=120`** — about 1.5 epochs, roughly 2 h.
-LoRA on 643 records rarely needs more, and the loss tells you within about 40
-steps whether 200 was ever going to help. If it plateaus early you have your
-answer and a third of your weekly GPU budget left.
+Run the **default 200 steps** — at the measured 19.5 s/step that is 1.3 h, cheap
+enough to iterate on, and 2.5 passes is the right amount for LoRA on 643 records.
+The loss at step 10 (2.27) and its slope over the next 40 steps are the real
+signal, not the step count; if it has plateaued by step 100, stop it there and
+keep the rest of the week's budget.
 
 Then, in order of value:
 
@@ -157,12 +199,13 @@ and [GPU tips](https://www.kaggle.com/page/GPU-tips-and-tricks):
 - **~30 GPU-hours per week**, resetting Saturday 00:00 UTC, sometimes higher under
   the "floating" quota.
 - **12 hours per GPU session** (the tips page still says 9 hours for older text).
-  A ~4-hour run is inside either figure.
+  A ~1.5-hour run is well inside either figure.
 - **60 minutes of idle time** before an interactive session ends. Logging every
   10 steps keeps the session alive on its own.
 
-So the run fits the platform, but at ~4 hours it consumes roughly a third of
-the week's GPU budget. That is the real constraint on iterating.
+So the run is now a small part of the week's budget: ~1.5 h of the ~30 available,
+which means iterating on the data and the prompt is cheap. That is a change from
+when this was costed at 4 h and looked like a third of the quota.
 
 ## 10. Correcting this estimate after the first run
 
@@ -178,5 +221,6 @@ and the measured average record length from Cell 6, give the same figure. If the
 real number is more than ~1.5× off from 200 tok/s per T4, this document's
 throughput figure is wrong and should be corrected here rather than left to drift.
 
-The docs in this folder now quote **~3.5–4.5 h**, replacing the original guide's
-"about 2 hours".
+**Done, 5 October 2026: it was 2.2× off, and §2.1 now carries the measured 430
+tok/s.** The quoted figure in this folder is **~1.5 h** total, replacing the
+original guide's "about 2 hours".
