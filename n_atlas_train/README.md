@@ -177,6 +177,25 @@ room to iterate on the dataset and the prompt.
   get. If you want a real measurement, hold out 10% before training and score
   both models on it.
 
+## Training configuration
+
+The values Cell 1, Cell 5 and Cell 7 actually run with:
+
+| Setting | Value | Where |
+|---|---|---|
+| Quantization | 4-bit NF4 with double quantization (`load_in_4bit=True`, `bnb_4bit_quant_type="nf4"`, `bnb_4bit_use_double_quant=True`) | Cell 5 |
+| Compute dtype | float16 (`bnb_4bit_compute_dtype=torch.float16`, `fp16=True`) — a T4 is Turing-class and has no bf16 support | Cell 5, Cell 7 |
+| LoRA rank (r) | 16 | Cell 1 `LORA_RANK` |
+| LoRA alpha | 32 | Cell 1 `LORA_ALPHA` |
+| LoRA dropout | 0.05 | Cell 5 `LoraConfig` |
+| LoRA targets | `q_proj, k_proj, v_proj, o_proj`, `bias="none"`, `task_type="CAUSAL_LM"` | Cell 1, Cell 5 |
+| Learning rate | 2e-4, cosine schedule, 10 warmup steps | Cell 1 `N_ATLAS_TRAIN_LR`, Cell 7 |
+| Epochs | `num_train_epochs=1`, but the run is step-limited: `max_steps=200` at effective batch 8, so ~2.5 passes over the 643 records | Cell 7 |
+| Max sequence | 2048 (`N_ATLAS_MAX_SEQ`); Cell 6 measures every record in tokens and fails the run if any exceeds it | Cell 1, Cell 6 |
+| Optimizer | `paged_adamw_8bit` | Cell 7 |
+| Batch | per-device 1 × gradient accumulation 8 = effective batch 8; 1 is the VRAM floor (see "Timing") | Cell 1, Cell 7 |
+| Other | gradient checkpointing with `use_reentrant=False`, `packing=False`, seed 42, `save_steps=50`, `save_total_limit=2`, `report_to="none"` | Cell 7 |
+
 ## Tuning knobs
 
 Set as environment variables in Cell 1, or edit `train_notebook.py` and rebuild:

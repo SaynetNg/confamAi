@@ -17,7 +17,8 @@
 # |---|---|---|
 # | `N_ATLAS_API_KEY` | Bearer token required by every `/v1/*` route | random ephemeral dev key |
 # | `NAFDAC_DATABASE_URL` | Supabase session-pooler DSN for the greenbook source | literal in Cell 1 |
-# | `N_ATLAS_ADAPTER_ID` | QLoRA adapter repo to serve on top of the base model | unset — base model only |
+# | `N_ATLAS_ADAPTER_ID` | QLoRA adapter repo to serve on top of the base model | `Saynetng/confam-ai-adapter` |
+# | `HF_TOKEN` | Hugging Face token for the gated base model | unset — required: Kaggle Secret or environment |
 # | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | unset — `confam_prompt.txt` is served |
 # | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset — `confam_prompt.txt` is found on disk |
 # | `N_ATLAS_MAX_NEW_TOKENS` | Hard ceiling on client `max_tokens` | `512` |
@@ -31,7 +32,9 @@
 # Kaggle. Prefer a Kaggle Secret when there is one: attach it as
 # `N_ATLAS_API_KEY` and the literal below is ignored, because Cell 1 only sets
 # the variable when it is not already in the environment. The same applies to
-# `NAFDAC_DATABASE_URL`.
+# `NAFDAC_DATABASE_URL`, and the same method — environment variable first,
+# then a Kaggle Secret — is how Cell 1 resolves `HF_TOKEN`, which the gated
+# base model needs before Cell 5 can download it.
 #
 # The persona is not here: it is `confam_prompt.txt`, the project's single
 # source of truth, uploaded with the n-atlas-source dataset as
@@ -51,11 +54,12 @@
 #   1. N_ATLAS_API_KEY, the bearer token every /v1/* route requires. Cell 2
 #      resolves it; if it is unset there it falls back to a random key written to
 #      natlas_api_key.txt, which means the laptop client cannot know it.
-#   2. The Hugging Face login, imported here and called in Cell 19. NCAIR1/N-ATLaS
-#      is a gated repo, so a token has to be in the environment before Cell 5
-#      downloads the weights: attach a Kaggle Secret named HF_TOKEN, or run
-#      login() yourself before Cell 5. The Cell 19 call covers a gated
-#      re-download.
+#   2. The Hugging Face login, resolved and called right here from
+#      HF_TOKEN — the environment variable first, then a Kaggle
+#      Secret of that name, the same method as the training
+#      notebook's Cell 3. NCAIR1/N-ATLaS is a gated repo, so Cell 5
+#      cannot download the weights without it. Cell 19's login() is
+#      only a re-login for a gated re-download later in the session.
 #   3. NAFDAC_DATABASE_URL, read by Cell 18 for the greenbook source. Prefer a
 #      Kaggle Secret named NAFDAC_DATABASE_URL; the literal below is ignored when
 #      one is attached, because this cell only sets the variable when it is not
@@ -107,7 +111,40 @@ os.environ.setdefault(
 # above.
 os.environ.setdefault("N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter")
 
+# The Hugging Face token, resolved the same way the training notebook
+# (confam_train_kaggle.ipynb, Cell 3) resolves it: the HF_TOKEN
+# environment variable first, then a Kaggle Secret named HF_TOKEN.
+# NCAIR1/N-ATLaS is a gated repo, so Cell 5 cannot download the base
+# weights without it, and the adapter repo belongs to the account that
+# trained it. Resolving it here — before the 5-minute model load —
+# means a missing token costs seconds, not a failed download.
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+_token_source = "environment"
+
+if not HF_TOKEN:
+    _token_source = "kaggle secret"
+    try:
+        from kaggle_secrets import UserSecretsClient
+
+        HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN").strip()
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(
+            "Could not get HF_TOKEN from the environment or Kaggle "
+            "secrets (%s).\n"
+            "Cell 5 downloads the gated NCAIR1/N-ATLaS weights, so a "
+            "token is required before the model loads.\n"
+            "Either add it as a Kaggle secret (Add-ons -> Secrets -> New "
+            "Secret, name HF_TOKEN),\n"
+            "or set HF_TOKEN in the environment before running this "
+            "notebook.\n"
+            "A token with read permission is enough: this notebook only "
+            "downloads, it never pushes."
+            % type(exc).__name__
+        )
+
 from huggingface_hub import login  # noqa: E402 - imported after the key is set
+
+login(token=HF_TOKEN)
 
 print("=" * 70)
 print("N-ATLaS SERVER — CREDENTIALS")
@@ -115,7 +152,7 @@ print("=" * 70)
 print(f"N_ATLAS_API_KEY:  set ({len(os.environ['N_ATLAS_API_KEY'])} chars)")
 _dsn = os.environ["NAFDAC_DATABASE_URL"]
 print(f"NAFDAC_DATABASE_URL: {_dsn.split('@')[-1]}  (session pooler, port 5432)")
-print("HF login:         imported; run login() in Cell 19 to reach a gated repo")
+print(f"HF login:         logged in with the HF_TOKEN {_token_source}")
 print("=" * 70)
 
 # %% [code]
@@ -2007,6 +2044,7 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, Request, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -2096,6 +2134,19 @@ app = FastAPI(
     description=f"{CONFIG.model_id} served as an OpenAI-compatible chat completion API.",
     docs_url="/docs",
     redoc_url=None,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://confamai.saynet.ng",
+        "https://confamweb.saynet.ng",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    max_age=600,
 )
 
 SERVER_START_TIME = time.time()
@@ -4643,8 +4694,10 @@ else:
 #     dashboard if it leaks, and remember that this notebook file contains it.
 #   * The tunnel blocks until interrupted. It is the last cell for that reason.
 #
-# login() prompts for a Hugging Face token on stdin. Nothing here needs it — the
-# weights are already loaded by Cell 5 — so an empty answer is not fatal.
+# login() prompts for a Hugging Face token on stdin. Cell 1 already
+# logged in with HF_TOKEN, so this is only a re-login for a gated
+# re-download; nothing here needs it — the weights are already loaded
+# by Cell 5 — so an empty answer is not fatal.
 try:
     login()
 except Exception as exc:  # noqa: BLE001 - the tunnel does not depend on it
