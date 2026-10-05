@@ -25,9 +25,11 @@
 #    environment before running. Do not paste it into a cell: a literal in this
 #    file travels with the notebook when it is uploaded or shared.
 # 3. Accelerator: **GPU T4 x2**. A T4 has no bfloat16 support, which is why Cell 5
-#    pins the compute dtype to float16.
-# 4. Run every cell in order. Cell 9 tells you whether it worked before you touch
-#    notebook B.
+#    pins the compute dtype to float16. The second T4 is deliberately left idle —
+#    Cell 1 explains why training on both of them does not work.
+# 4. Run every cell in order, starting from Cell 1. Cell 1 has to run before
+#    anything imports torch, because it is what limits the process to one GPU.
+#    Cell 9 tells you whether it worked before you touch notebook B.
 #
 # The dataset is checked in Cell 4, before the 5-minute model load, so a bad file
 # fails in seconds rather than after the weights are in VRAM.
@@ -44,6 +46,42 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# Pin the process to ONE GPU, here, before anything imports torch — Cell 2 is
+# what imports it, so this is the last cell that can still do this cheaply.
+#
+# It is not about fitting the model: a 4-bit 8B plus LoRA ranks fits one T4 with
+# room to spare. It is about the TRAINER. With more than one GPU visible in a
+# plain-notebook launch, transformers wraps the model in torch.nn.DataParallel
+# (Trainer._wrap_model, whenever args.n_gpu > 1), and Trainer.compute_loss adds
+# `num_items_in_batch` — a 0-dim tensor — to the batch before calling the model.
+# DataParallel.scatter cannot chunk a 0-dim tensor across replicas, so the FIRST
+# training step dies with:
+#
+#     RuntimeError: chunk expects at least a 1-dimensional tensor
+#
+# (huggingface/transformers#37151, huggingface/trl#2338.)
+#
+# `device_map` in Cell 5 does not save this run: it puts the weights on cuda:0,
+# but it is args.n_gpu — a count of VISIBLE devices, not of devices in use — that
+# decides whether the model gets wrapped at all.
+#
+# The cost is the second T4 sitting idle. DataParallel was the only way to reach
+# it from inside a notebook cell, and it is the thing that is broken; the
+# supported multi-GPU path is `accelerate launch` (DDP), which a Kaggle cell
+# cannot use. See time.md §3.
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# A T4 has 16 GB and this run needs about 14.5 of it at batch 2, so the CUDA
+# caching allocator spends the last gigabyte on fragmentation rather than on
+# tensors. expandable_segments lets it grow and shrink one segment instead of
+# carving up a fixed pool, which is what turns "1.02 GiB free" into a successful
+# step when the arithmetic is nearly — but not quite — enough. setdefault, so a
+# value already in the environment wins.
+#
+# Must be in place before the first allocation, which is another reason it lives
+# here rather than next to the trainer in Cell 7.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MODEL_ID = os.environ.get("N_ATLAS_MODEL_ID", "NCAIR1/N-ATLaS")
 
@@ -72,16 +110,32 @@ DATASET_MOUNT = (
     "/kaggle/input/datasets/sabuwa/confam-training/confam_training_dataset.jsonl"
 )
 
-# The system prompt length dominates this dataset: 643 records x ~1080 prompt
-# tokens. 2048 leaves room for the verified block and the answer; 1024 truncates
-# the assistant turn off the end, which is the only part that teaches anything.
-# Read from the environment because the Cell 6 failure below tells you to raise
-# N_ATLAS_MAX_SEQ; a hardcoded constant made that advice impossible to follow.
+# The system prompt length dominates this dataset: every record repeats it, and it
+# is the bulk of the ~1100 tokens a record comes to. 2048 leaves ample room for the
+# verified block and the answer; 1024 would truncate the assistant turn off the end,
+# which is the only part that teaches anything. Measured in Cell 6, in tokens.
 MAX_SEQ_LENGTH = int(os.environ.get("N_ATLAS_MAX_SEQ", "2048"))
 
 MAX_STEPS = int(os.environ.get("N_ATLAS_TRAIN_STEPS", "200"))
-BATCH_SIZE = int(os.environ.get("N_ATLAS_TRAIN_BATCH", "2"))
-GRAD_ACCUM = int(os.environ.get("N_ATLAS_TRAIN_ACCUM", "4"))
+
+# Per-device batch 1 with 8 accumulation steps, NOT 2 x 4, and the reason is
+# arithmetic rather than taste: the last thing before the loss is the logits
+# tensor, which is BATCH_SIZE x MAX_SEQ_LENGTH x vocab_size. Llama-3's vocab is
+# 128256, so at 2048 padded positions one sequence's fp16 logits are 501 MB, and
+# cross_entropy upcasts them to fp32 and keeps a softmax buffer alive for the
+# backward pass — about 2 GB of VRAM per sequence in the batch, on top of the
+# ~7 GB the 4-bit model and its fp32 embedding layer already hold.
+#
+# At batch 2 that is ~12 GB before the 1 GB final allocation, and a T4's usable
+# 14.56 GB is not enough: the first step dies in ForCausalLMLoss with CUDA OOM.
+# At batch 1 it fits, and because TRL pads to a fixed length rather than to the
+# longest record in the batch, batch 1 also means no padding at all.
+#
+# The effective batch is 8 either way, so 200 steps still means 1600 samples and
+# the learning-rate schedule is unchanged. The cost is wall clock: 8 sequential
+# micro-steps per optimizer step instead of 4 larger ones.
+BATCH_SIZE = int(os.environ.get("N_ATLAS_TRAIN_BATCH", "1"))
+GRAD_ACCUM = int(os.environ.get("N_ATLAS_TRAIN_ACCUM", "8"))
 LEARNING_RATE = float(os.environ.get("N_ATLAS_TRAIN_LR", "2e-4"))
 
 OUTPUT_DIR = os.environ.get(
@@ -154,6 +208,8 @@ print("CONFAMAI — QLoRA FINE-TUNING")
 print("=" * 70)
 print(f"base model:     {MODEL_ID}")
 print(f"adapter out:    {ADAPTER_ID}")
+print(f"gpus:            cuda:0 only "
+      f"(CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})")
 print(f"dataset:        {DATASET_PATH} "
       f"({DATASET_PATH.stat().st_size / 1024 / 1024:.1f} MB)")
 print(f"max_seq_length: {MAX_SEQ_LENGTH}")
@@ -204,6 +260,25 @@ print(f"[deps] torch       {torch.__version__}  cuda={torch.cuda.is_available()}
 if not torch.cuda.is_available():
     raise SystemExit(
         "No GPU. Set the notebook accelerator to GPU T4 x2 and re-run."
+    )
+
+# Exactly one visible GPU, checked here because it is the difference between a
+# run that works and one that dies on the first step. See Cell 1: with 2 visible
+# devices the trainer wraps the model in torch.nn.DataParallel, and DataParallel
+# cannot scatter the 0-dim num_items_in_batch tensor the loss divides by.
+#
+# torch caches the device count on first use, so if anything imported torch
+# before Cell 1 ran, this is 2 however Cell 1 was written. Failing here costs
+# seconds; the same mistake found in Cell 7 costs the 5-minute model load first.
+_gpu_count = torch.cuda.device_count()
+if _gpu_count != 1:
+    raise SystemExit(
+        "%d GPUs visible; this notebook trains on exactly 1. Cell 1 sets "
+        "CUDA_VISIBLE_DEVICES=0 for that reason, but torch has already cached "
+        "the device count.\n"
+        "Restart the kernel and run every cell in order from Cell 1 — the "
+        "notebook's first cell must be the one that hides cuda:1."
+        % _gpu_count
     )
 
 # %%
@@ -400,10 +475,36 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
 )
 
+# Pin the weights to ONE gpu as well.
+#
+# Cell 1 already hid cuda:1 from the process, so this is belt and braces — and it
+# is the half that governs the WEIGHTS. device_map="auto" does not replicate the
+# model, it SHARDS the layers across every visible GPU. With T4 x2 that puts the
+# last layers — and therefore the logits — on cuda:1, while the per-batch token
+# count the loss divides by is a scalar tensor living on cuda:0. transformers then
+# dies in the loss with "Expected all tensors to be on the same device, but found
+# at least two devices, cuda:1 and cuda:0". Pinning to a single device keeps the
+# logits and the loss scalar together, which is the only arrangement this trainer
+# supports.
+#
+# The trainer needs the same single-GPU arrangement for an unrelated reason, and
+# Cell 1 is where that is handled: what killed the previous run was DataParallel,
+# not sharding.
+#
+# The cost is throughput, not correctness: a 4-bit 8B model plus LoRA ranks fits
+# one T4, and time.md §3 explains why the second T4 is unreachable from here.
+_visible = torch.cuda.device_count()
+if _visible > 1:
+    print(f"[model] WARNING: {_visible} GPUs visible. Cell 1 sets "
+          "CUDA_VISIBLE_DEVICES=0 for this reason, and without it the trainer "
+          "wraps the model in DataParallel and the first step fails. The weights "
+          "are still pinned to cuda:0 below.")
+_device_map = {"": 0}
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     quantization_config=bnb_config,
-    device_map="auto",
+    device_map=_device_map,
 )
 model.config.use_cache = False
 model.gradient_checkpointing_enable()
@@ -422,7 +523,8 @@ model = get_peft_model(
 )
 
 print(f"[model] ready in {time.perf_counter() - _load_start:.0f}s")
-print(f"[model] gpu: {torch.cuda.get_device_name(0)}")
+print(f"[model] gpu: {next(model.parameters()).device} "
+      f"({_visible} visible)")
 model.print_trainable_parameters()
 print("Expect a trainable percentage near 0.1%. If it is much larger, LoRA is "
       "not attached to the frozen base and the VRAM budget will not hold.")
@@ -435,16 +537,26 @@ print("Expect a trainable percentage near 0.1%. If it is much larger, LoRA is "
 # hand-rolled format: records carrying a verified block have two system messages
 # in a row, which is exactly the shape notebook B builds at request time.
 #
-# The length measurement is not decoration. Every record repeats the same ~850
-# token system prompt, so a too-small max_seq_length truncates the ASSISTANT turn
-# off the end and silently trains on nothing. Measured here, before training.
+# The length measurement is not decoration. Every record repeats the same system
+# prompt, so a too-small max_seq_length truncates the ASSISTANT turn off the end
+# and silently trains on nothing. Measured here, before training, in tokens.
 from datasets import Dataset  # noqa: E402
 
 
 def render(example):
-    return tokenizer.apply_chat_template(
-        example["messages"], tokenize=False, add_generation_prompt=False
-    )
+    """One record as text, keyed so datasets.map can write it back.
+
+    The dict wrapper is required, not stylistic: map() only accepts a dict, a
+    pyarrow table or None, and returning the bare string this used to return
+    raises TypeError on the first record. The key has to be "text" because that
+    is what SFTConfig(dataset_text_field="text") reads in Cell 7, and what the
+    length measurement below indexes.
+    """
+    return {
+        "text": tokenizer.apply_chat_template(
+            example["messages"], tokenize=False, add_generation_prompt=False
+        )
+    }
 
 
 print("[data] rendering 643 records with the model's chat template…")
@@ -453,23 +565,30 @@ train_dataset = Dataset.from_list(records).map(
     render, remove_columns=["messages"], desc="rendering"
 )
 
+# Measure in TOKENS, not characters. train_dataset["text"] is a list of strings,
+# so len() on it returns a character count — which is roughly 4x the token count
+# and made every one of the 643 records look like it overflowed. The rendered
+# text already carries the template's own BOS/EOS markers as literal special
+# tokens, so add_special_tokens=False avoids counting a second BOS on top.
 lengths = [
-    len(ids)
-    for ids in train_dataset["text"]
+    len(tokenizer(text, add_special_tokens=False)["input_ids"])
+    for text in train_dataset["text"]
 ]
 lengths.sort()
+MEASURED_MAX_TOKENS = lengths[-1]
 print(f"[data] rendered in {time.perf_counter() - render_start:.0f}s")
 print(f"[data] tokens  p50={lengths[len(lengths) // 2]}  "
       f"p90={lengths[int(len(lengths) * 0.9)]}  max={lengths[-1]}")
 print(f"[data] max_seq_length={MAX_SEQ_LENGTH}, "
-      f"{sum(1 for n in lengths if n > MAX_SEQ_LENGTH)} records over it")
+      f"{sum(1 for n in lengths if n > MAX_SEQ_LENGTH)} records over it, "
+      f"every batch padded to {MAX_SEQ_LENGTH}")
 
-if lengths[-1] > MAX_SEQ_LENGTH:
+if MEASURED_MAX_TOKENS > MAX_SEQ_LENGTH:
     raise SystemExit(
         "%d tokens at the longest, over max_seq_length=%d. Truncation would cut "
         "the assistant turn — the only part of a record that teaches anything. "
         "Raise N_ATLAS_MAX_SEQ or shorten confam_prompt.txt."
-        % (lengths[-1], MAX_SEQ_LENGTH)
+        % (MEASURED_MAX_TOKENS, MAX_SEQ_LENGTH)
     )
 
 # %%
@@ -500,6 +619,12 @@ training_args = TrainingArguments(
     optim="paged_adamw_8bit",
     fp16=True,
     gradient_checkpointing=True,
+    # use_reentrant=False is the mode PEFT documents for adapters: the reentrant
+    # one silently drops adapter gradients in some PEFT versions and recomputes
+    # with a peak that is harder to reason about. Cell 5 already enabled
+    # checkpointing on the base model; this is the same switch, set where the
+    # trainer actually uses it.
+    gradient_checkpointing_kwargs={"use_reentrant": False},
     report_to="none",
     seed=42,
     run_name="confamai-qlora",
@@ -515,8 +640,36 @@ trainer = SFTTrainer(
     args=training_args,
 )
 
+# The one value that decides whether Trainer wraps the model in
+# torch.nn.DataParallel. With n_gpu > 1 the first step dies inside
+# DataParallel.scatter, which cannot chunk the 0-dim num_items_in_batch tensor
+# that compute_loss adds to the batch — "chunk expects at least a 1-dimensional
+# tensor". Cell 1 hides cuda:1 so this is 1; checking it here names the failure
+# in one line instead of leaving a stack trace to read. See Cell 1.
+if trainer.args.n_gpu != 1:
+    raise SystemExit(
+        "training args report n_gpu=%d. This notebook trains on one GPU, and "
+        "more than one visible device breaks the first step in DataParallel. "
+        "Run Cell 1 first, so CUDA_VISIBLE_DEVICES=0 reaches the process."
+        % trainer.args.n_gpu
+    )
+
+# Print the two numbers that decide whether the loss fits, because the failure
+# mode is an opaque CUDA OOM inside cross_entropy rather than anything the log
+# explains. The logits are the peak: fp16 from the lm_head, then an fp32
+# upcast plus a softmax buffer kept for the backward pass, which is the
+# "Tried to allocate 1.04 GiB" in the Cell 7 failure at batch 2.
+_logits_f16 = BATCH_SIZE * MAX_SEQ_LENGTH * model.config.vocab_size * 2
+_total = torch.cuda.get_device_properties(0).total_memory
+_loaded = torch.cuda.memory_allocated(0) / 1024**3
 print(f"[train] {len(train_dataset)} records, {MAX_STEPS} steps, "
-      f"effective batch {BATCH_SIZE * GRAD_ACCUM}")
+      f"effective batch {BATCH_SIZE * GRAD_ACCUM} "
+      f"({BATCH_SIZE} per step x {GRAD_ACCUM} accum)")
+print(f"[train] weights resident {_loaded:.1f} GiB of {_total / 1024**3:.1f} GiB; "
+      f"logits {_logits_f16 / 1024**2:.0f} MiB per sequence at "
+      f"{MAX_SEQ_LENGTH} padded positions, ~3x that in the loss")
+print("If this run OOMs, N_ATLAS_TRAIN_BATCH=1 is already the floor — lower "
+      "N_ATLAS_MAX_SEQ to Cell 6's measured max next, which is a linear saving.")
 trainer.train()
 
 print("=" * 70)

@@ -7,7 +7,7 @@ is the **training** half of the project and serves nothing.
 |---|---|---|
 | Job | trains the adapter, pushes it, ends | serves chat requests on port 8000 |
 | Kaggle dataset attached | `confam-training` | `n-atlas-source` |
-| Lifetime | one run, ~2.5–4 h, then stop it | as long as you leave it running |
+| Lifetime | one run, ~3.5–4.5 h, then stop it | as long as you leave it running |
 | Your laptop client points at it | never | **only this one** |
 
 The only thing that crosses between them is the adapter on the Hugging Face Hub.
@@ -50,11 +50,12 @@ This folder also holds everything used to produce and check that file:
 2. Create a Kaggle secret named `HF_TOKEN` with a Hugging Face token that has
    **write** permission. Cell 8 pushes the adapter and cannot work without it.
    The account on that token is the first half of `ADAPTER_ID`.
-3. Accelerator: **GPU T4 x2**.
+3. Accelerator: **GPU T4 x2**. The second T4 is deliberately left idle — see
+   "Timing" below for why training on both of them does not work.
 4. **Accept N-ATLaS's licence on Hugging Face first.** `NCAIR1/N-ATLaS` is gated:
    `from_pretrained` fails with a 401 until your account has agreed to share
    contact information. The server notebook needs the same access.
-5. Budget **~2.5–4 hours** for the default 200 steps on T4 x2 — the arithmetic is
+5. Budget **~4 hours** for the default 200 steps on one T4 — the arithmetic is
    under "Timing" below. Start with a lower `N_ATLAS_TRAIN_STEPS` if this is your
    first run.
 
@@ -70,7 +71,7 @@ This folder also holds everything used to produce and check that file:
 | Cell | Job | Fails loudly if |
 |---|---|---|
 | 1 | config, finds the dataset in `/kaggle/input/**` | the JSONL is not attached, listing what is mounted |
-| 2 | installs libraries, `trl` pinned to 0.12.2 | no GPU is available |
+| 2 | installs libraries, `trl` pinned to 0.12.2 | no GPU is available, or more than one is visible (Cell 1 must run first) |
 | 3 | Hugging Face login | `HF_TOKEN` is missing, before two hours are spent |
 | 4 | **dataset integrity checks** | personas are mixed, a verdict has no block, or a record claims counterfeit / safety |
 | 5 | base model in 4-bit NF4 + LoRA | the base model exposes no chat template |
@@ -102,18 +103,35 @@ silently disagree.
 ## Timing
 
 The default run is `max_steps=200` at effective batch 8, so **1600 samples** of
-~1200 tokens each — about **2.0M tokens**. N-ATLaS is **Llama-3 8B**, and a T4 has
-roughly a third of an RTX 3090's bandwidth, so a stock run lands near 200 tok/s
-on one T4; `nn.DataParallel` over two T4s adds 1.2–1.5×, not 2×.
+~1000 tokens each — about **1.6M tokens**. N-ATLaS is **Llama-3 8B**, and a T4 has
+roughly a third of an RTX 3090's bandwidth.
 
-That gives **~2–3 h of training plus 10–20 min of setup**, so budget **~2.5–4 h**.
+**Only one GPU is used, on purpose, and it is Cell 1 that decides it.**
+`device_map="auto"` does not replicate the model across the T4 x2, it shards the
+layers, which leaves the logits on `cuda:1` while the loss is divided by a scalar
+on `cuda:0` and training dies with *"Expected all tensors to be on the same
+device"* — Cell 5 pins the model to `cuda:0` for that. But pinning the weights is
+not enough on its own: with two GPUs *visible*, `Trainer` wraps the model in
+`torch.nn.DataParallel`, and `DataParallel` cannot scatter the 0-dim
+`num_items_in_batch` tensor that `compute_loss` adds to every batch, so step 1 dies
+with *"chunk expects at least a 1-dimensional tensor"*
+([transformers#37151](https://github.com/huggingface/transformers/issues/37151),
+[trl#2338](https://github.com/huggingface/trl/issues/2338)). Cell 1 therefore sets
+`CUDA_VISIBLE_DEVICES=0` before anything imports torch, so the count of visible
+devices is 1 and no wrapper is created. A 4-bit 8B model with LoRA ranks fits one
+T4, so this costs throughput rather than correctness — and the single-T4 estimate
+below is the one to plan against. **Restart the kernel and re-run from Cell 1 if
+you ever edit that line**: torch caches the device count on first use, so Cell 1
+has to be the first cell that touches CUDA.
+
+That gives **~3.2 h of training plus 10-20 min of setup**, so budget **~4 h**.
 
 For the full arithmetic, the research anchors it is based on, the Kaggle limits it
 sits inside, and how to correct the estimate from the real `it/s` after the first
 run, see **[time.md](time.md)**.
 
 **Levers, in the order I would pull them:** `N_ATLAS_TRAIN_STEPS=120` (about 1.5
-epochs, ~1.5–2 h — my recommendation for a first run), then lowering
+epochs, ~2 h — my recommendation for a first run), then lowering
 `MAX_SEQ_LENGTH` to whatever Cell 6 reports as the real maximum plus headroom,
 then Unsloth in place of stock TRL if you want roughly 2× at the cost of another
 dependency.
@@ -151,7 +169,7 @@ Set as environment variables in Cell 1, or edit `train_notebook.py` and rebuild:
 | `N_ATLAS_MODEL_ID` | `NCAIR1/N-ATLaS` | base model |
 | `N_ATLAS_ADAPTER_ID` | `Saynetng/confam-ai-adapter` | where this notebook pushes **and** what Notebook B reads |
 | `N_ATLAS_TRAIN_STEPS` | `200` | effective batch 8, so ~2.5 passes over 643 records |
-| `N_ATLAS_TRAIN_BATCH` / `N_ATLAS_TRAIN_ACCUM` | `2` / `4` | lower the batch before raising steps if VRAM is tight |
+| `N_ATLAS_TRAIN_BATCH` / `N_ATLAS_TRAIN_ACCUM` | `1` / `8` | effective batch 8, so 200 steps is 1600 samples either way. `1` is the VRAM floor: at batch 2 the logits alone outgrow a T4. Do not raise it without re-reading the Cell 1 arithmetic |
 | `N_ATLAS_TRAIN_LR` | `2e-4` | conventional LoRA rate; lower it if the answers drift from the prompt |
 | `N_ATLAS_TRAIN_OUTPUT` | `/kaggle/working/confam-ai-adapter` | local checkpoints, not the push target |
 | `N_ATLAS_MAX_SEQ` | `2048` | raise only if Cell 6 reports a record over the limit; lowering it truncates the assistant turn |
