@@ -3,6 +3,12 @@
 __pycache__/
 *.pyo
 
+# Build metadata from `pip install -e .`, created by pyproject.toml at the repo
+# root. Regenerated on every install and meaningless to anyone else.
+*.egg-info/
+build/
+dist/
+
 # --- Secrets -----------------------------------------------------------------
 # Every .env in every folder: confamAi/.env, n_atlas_client/.env,
 # n_atlas_server/.env. They hold the real tunnel URL, the bearer API key and

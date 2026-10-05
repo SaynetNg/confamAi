@@ -245,6 +245,8 @@ def run_notebook(port: int) -> dict:
     detect_language = namespace["detect_language"]
     fold_text = namespace["fold_text"]
     build_language_directive = namespace["build_language_directive"]
+    build_pidgin_directive = namespace["build_pidgin_directive"]
+    apply_language_directive = namespace["apply_language_directive"]
     LANGUAGE_NAMES = namespace["LANGUAGE_NAMES"]
 
     record(
@@ -276,6 +278,14 @@ def run_notebook(port: int) -> dict:
         ("Answer in Yoruba.", "yo"),
         ("Please respond in English", "en"),
         ("Sauraya a cikin Hausa", "ha"),
+        # Nigerian Pidgin is reported as `language: "en"` — the reply is English.
+        # These assert the language value only; PIDGIN_CASES below assert that the
+        # pidgin branch is what fired, so a plain-English fallback cannot pass
+        # them by accident.
+        ("Abeg check this product, I think say na fake.", "en"),
+        ("Wetin dey happen here?", "en"),
+        ("Na ba to be", "en"),
+        ("Abeg make this one dey sharp abeg", "en"),
     ]
     wrong = []
     for text, expected in DETECTOR_CASES:
@@ -299,6 +309,130 @@ def run_notebook(port: int) -> dict:
         detect_language("Say hello in Igbo")["confidence"] == "explicit",
         f"confidence={detect_language('Say hello in Igbo')['confidence']}",
     )
+
+    # --- Nigerian Pidgin -----------------------------------------------------
+    # Detection is pure Python table scoring, so it belongs in the offline suite
+    # rather than the GPU one: it costs nothing to assert here and everything to
+    # get wrong silently, because a miss just looks like the model ignoring the
+    # user.
+    PIDGIN_CASES = [
+        "Abeg check this product, I think say na fake.",
+        "Wetin dey happen here?",
+        "Abeg make this one dey sharp abeg",
+        "Wahala dey for this product",
+        "Omo, this one dey correct?",
+        # "Na ba to be" is deliberately absent: na/ba/to are evidence of no
+        # language at all now, so it cannot reach MIN_PIDGIN_SCORE and would only
+        # assert the wrong thing. It has its own record() below.
+    ]
+    missed = [
+        text
+        for text in PIDGIN_CASES
+        if detect_language(text).get("confidence") != "pidgin"
+    ]
+    record(
+        f"detector recognises Nigerian Pidgin in all {len(PIDGIN_CASES)} probes",
+        not missed,
+        "; ".join(missed) if missed else "all pidgin",
+    )
+
+    # The English words in PIDGIN_MARKERS are only safe while they cannot reach
+    # MIN_PIDGIN_SCORE alone. These are the probes that would break if one were
+    # raised, or if a Pidgin marker leaked into a Nigerian language table.
+    NOT_PIDGIN_CASES = [
+        "Is this correct?",
+        "Good morning",
+        "Kana lafiya?",
+        "Báwo ni?",
+        "Kedu ka ị mere?",
+        "How are you? Yaya kake?",
+        "Please tell me about NAFDAC numbers",
+        "Which product is this?",
+    ]
+    false_positives = [
+        text
+        for text in NOT_PIDGIN_CASES
+        if detect_language(text).get("confidence") == "pidgin"
+    ]
+    record(
+        "pidgin markers do not fire on any plain English or Nigerian probe",
+        not false_positives,
+        "; ".join(false_positives) if false_positives else "no false positives",
+    )
+
+    # "na", "ba" and "to" were Hausa markers and were removed: "Na ba to be"
+    # scored exactly 2.0 for Hausa, cleared MIN_LANGUAGE_SCORE, and drew
+    # "Write the entire reply in Hausa." The en-bias rule could not rescue it
+    # because that rule only fires when the top language is English.
+    #
+    # It lands on en/low rather than on the pidgin branch, and that is correct:
+    # none of na/ba/to is in PIDGIN_MARKERS. They are simply not evidence of any
+    # language now, and a three-word fragment carries nothing else to go on. The
+    # property under test is that it is not Hausa.
+    scrubbed = detect_language("Na ba to be")
+    record(
+        "'na', 'ba' and 'to' no longer scrape a Hausa verdict out of Pidgin",
+        scrubbed["language"] != "ha" and scrubbed["scores"].get("ha", 0.0) == 0.0,
+        f"Na ba to be -> {scrubbed['language']}/{scrubbed.get('confidence')} "
+        f"scores={scrubbed.get('scores')}",
+    )
+
+    record(
+        "an explicit language request still beats a pidgin message",
+        detect_language("Abeg, reply in Yoruba")["confidence"] == "explicit",
+        f"confidence="
+        f"{detect_language('Abeg, reply in Yoruba')['confidence']}",
+    )
+
+    pidgin_directive = build_pidgin_directive(True)
+    record(
+        "the pidgin directive permits plain English and forbids a language switch",
+        "Nigerian Pidgin" in pidgin_directive
+        and "not required to use formal standard English" in pidgin_directive
+        and "Do not switch to Hausa, Yoruba or Igbo." in pidgin_directive
+        # It must not tell the model to write formal English: that is the fence
+        # this branch exists to stand down.
+        and "Write the entire reply in English" not in pidgin_directive,
+        pidgin_directive[:160],
+    )
+
+    pidgin_prompt = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "Abeg check this product, I think say na fake."},
+    ]
+    updated, detection = apply_language_directive([dict(m) for m in pidgin_prompt])
+    injected = updated[0]["content"]
+    record(
+        "a pidgin message gets the pidgin directive, not the English fence",
+        detection.get("confidence") == "pidgin"
+        and detection.get("injected") is True
+        and "Nigerian Pidgin" in injected
+        and "Write the entire reply in English." not in injected,
+        f"confidence={detection.get('confidence')} injected={detection.get('injected')}",
+    )
+
+    # Regression guard: plain English must still get the standard-English
+    # directive. The pidgin branch is additive and must not swallow it.
+    #
+    # The probe is one of the DETECTOR_CASES above and scores en 9.0, so it
+    # clears MIN_LANGUAGE_SCORE and the en/low no-directive rule cannot mask the
+    # branch. A shorter probe such as "Is this product registered?" scores en 1.0
+    # and would assert nothing, because no directive is injected for it at all.
+    english_updated, english_detection = apply_language_directive(
+        [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "Please tell me about NAFDAC numbers"},
+        ]
+    )
+    record(
+        "plain English still gets the standard-English directive",
+        english_detection.get("confidence") in ("high", "medium")
+        and "Write the entire reply in English." in english_updated[0]["content"],
+        f"confidence={english_detection.get('confidence')} "
+        f"pidgin={english_detection.get('pidgin')}",
+    )
+
+
     record(
         "each directive names its target and forbids the others",
         all(

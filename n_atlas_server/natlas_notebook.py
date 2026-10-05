@@ -17,6 +17,7 @@
 # |---|---|---|
 # | `N_ATLAS_API_KEY` | Bearer token required by every `/v1/*` route | random ephemeral dev key |
 # | `NAFDAC_DATABASE_URL` | Supabase session-pooler DSN for the greenbook source | literal in Cell 1 |
+# | `N_ATLAS_ADAPTER_ID` | QLoRA adapter repo to serve on top of the base model | unset — base model only |
 # | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | unset — `confam_prompt.txt` is served |
 # | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset — `confam_prompt.txt` is found on disk |
 # | `N_ATLAS_MAX_NEW_TOKENS` | Hard ceiling on client `max_tokens` | `512` |
@@ -97,6 +98,15 @@ os.environ.setdefault(
     "postgresql://postgres.kbdwvutgzjxhqovcgrzu:vabTy7%40%40%26%26DD"
     "@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
 )
+
+# Serve the fine-tuned ConfamAI weights instead of the base model. Leave this
+# commented out until the adapter actually exists: the training notebook's last
+# line (`trainer.model.push_to_hub(...)`) creates it, and a name that does not
+# resolve stops this server from starting rather than falling back. Prefer a
+# Kaggle Secret named N_ATLAS_ADAPTER_ID over the literal — setdefault means the
+# secret wins, the same as it does for the two variables above.
+#
+# os.environ.setdefault("N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter")
 
 from huggingface_hub import login  # noqa: E402 - imported after the key is set
 
@@ -224,6 +234,10 @@ def _cuda_report() -> Dict[str, Any]:
 @dataclass
 class Settings:
     model_id: str = "NCAIR1/N-ATLaS"
+    # A QLoRA adapter repo, e.g. "Saynetng/confam-ai-adapter". Empty means the
+    # base model is served unchanged. Set N_ATLAS_ADAPTER_ID to serve the
+    # fine-tuned ConfamAI weights; see ../n_atlas_train/qlora_finetuning_guide.md.
+    adapter_id: str = os.environ.get("N_ATLAS_ADAPTER_ID", "").strip()
     served_model_name: str = os.environ.get("N_ATLAS_SERVED_MODEL_NAME", "n-atlas")
     owned_by: str = "NCAIR1"
 
@@ -276,6 +290,7 @@ class Settings:
     def public_dict(self) -> Dict[str, Any]:
         return {
             "model_id": self.model_id,
+            "adapter_id": self.adapter_id or None,
             "served_model_name": self.served_model_name,
             "host": self.host,
             "port": self.port,
@@ -361,20 +376,20 @@ class QueueTimeout(ServerError):
 #
 # Output hygiene does not need restating: clean_response() strips turn markers
 # and chat-template artefacts from every reply.
-DEFAULT_SYSTEM_PROMPT = """You are ConfamAI, the official consumer products verification assistant for the CONFAM powered by saynet.ng.
+DEFAULT_SYSTEM_PROMPT = """You are ConfamAI, the official product verification assistant for the CONFAM powered by saynet.ng, covering consumer products and packaged medicines.
 
 YOUR IDENTITY:
 - Your name is ConfamAI. You are NOT N-ATLaS and not "Confam AI". Never refer to yourself by any other name.
-- You help Nigerians check whether a consumer product is registered with NAFDAC before they buy or use it: packaged food and beverages, bottled water, snacks and confectionery, cosmetics and personal care, household and cleaning products, sanitary products, textiles, and other everyday goods.
+- You help Nigerians check whether a product is registered with NAFDAC before they buy or use it: packaged food and beverages, bottled water, snacks and confectionery, cosmetics and personal care, household and cleaning products, sanitary products, textiles, packaged medicines and drugs, and other everyday goods.
 - You are professional, warm, concise, and safety-focused.
 
 YOUR CORE FUNCTION:
-When a user asks about a consumer product:
+When a user asks about a product:
 1. If NAFDAC verification data is provided in the conversation, use ONLY that data to respond. Never invent registration numbers, approval dates, manufacturers, product names, or verdicts.
 2. Use these exact verdicts: AUTHENTIC (registered), FLAGGED (recalled, banned or suspended), or NOT REGISTERED (not found in database).
 3. NOT REGISTERED does NOT mean fake or counterfeit. Always say: "This product was not found in our current NAFDAC database. This could mean the product is new, our records are outdated, or the product is not registered."
 4. Never claim a product is counterfeit, fake, poisoned or adulterated.
-5. If a food, drink or cosmetic comes back NOT REGISTERED or FLAGGED, say plainly that the user should not buy or use it, and suggest they report it to NAFDAC. That is a statement about the product, not medical advice.
+5. If a food, drink, cosmetic or medicine comes back NOT REGISTERED or FLAGGED, say plainly that the user should not buy or use it, and suggest they report it to NAFDAC. That is a statement about the product, not medical advice.
 
 DATA RULES:
 - Copy the verdict word exactly as the data gives it: AUTHENTIC, FLAGGED, NOT REGISTERED. Never restate a verdict in your own words.
@@ -395,9 +410,9 @@ RESPONSE STYLE:
 - Do not ramble. Do not repeat information. Do not add disclaimers unless safety-relevant.
 
 BOUNDARIES:
-- You ONLY help with consumer product verification and NAFDAC-related questions.
+- You ONLY help with product verification and NAFDAC-related questions, for consumer products and for packaged medicines and drugs.
 - For unrelated questions, politely redirect: "I'm ConfamAI - I specialize in helping you check consumer products against NAFDAC records. Would you like to verify a product?"
-- Never provide medical, nutritional or health advice. If asked about dosage, side effects, a diet or a treatment, say: "Please consult a healthcare professional or a nutritionist for medical advice."
+- Checking whether a medicine is registered IS your job: report its NAFDAC registration record exactly like any other product. Advising on it is not. Never provide medical, nutritional or health advice. If asked about dosage, side effects, interactions, a diet or a treatment, say: "Please consult a healthcare professional or a nutritionist for medical advice."
 - This service is NOT yet officially endorsed by NAFDAC. Do not claim otherwise."""
 
 
@@ -516,6 +531,7 @@ print("=" * 70)
 print("N-ATLaS SERVER — ENVIRONMENT")
 print("=" * 70)
 print(f"Model:             {CONFIG.model_id}")
+print(f"Adapter:           {CONFIG.adapter_id or 'none (base model)'}")
 print(f"Served as:         {CONFIG.served_model_name}")
 print(f"PyTorch:           {GPU.get('torch_version', 'MISSING')}")
 print(f"Transformers:      {_dist_version('transformers')}")
@@ -580,6 +596,12 @@ NAFDAC_DEPS = {
     "psycopg": "psycopg[binary]",
 }
 
+# Only needed when serving a fine-tuned adapter (../n_atlas_train/qlora_finetuning_guide.md), so
+# it is not installed for a deployment that runs the base model.
+ADAPTER_DEPS = {
+    "peft": "peft",
+}
+
 
 def _missing_deps(deps: Dict[str, str]) -> List[Tuple[str, str]]:
     import importlib.util
@@ -627,6 +649,9 @@ if CONFIG.strict_gpu and DEVICE == "cuda":
 
 if os.environ.get("NAFDAC_DATABASE_URL", "").strip():
     ensure_dependencies(NAFDAC_DEPS, "greenbook PostgreSQL source")
+
+if CONFIG.adapter_id:
+    ensure_dependencies(ADAPTER_DEPS, "QLoRA adapter")
 
 import fastapi
 import pydantic
@@ -741,6 +766,12 @@ print("=" * 70)
 # =============================================================================
 # CELL 5 — Load N-ATLaS in 4-bit NF4
 # =============================================================================
+# Set N_ATLAS_ADAPTER_ID to a QLoRA adapter repo (see ../n_atlas_train/qlora_finetuning_guide.md)
+# and the ConfamAI fine-tuned weights are attached here, after the base model and
+# before the first generation. Left unset, this cell serves N-ATLaS unchanged,
+# which is how the server behaved before any fine-tuning existed. Clients see no
+# difference either way: `served_model_name` stays `n-atlas`, so nothing in the
+# laptop client or the bot has to be reconfigured.
 import gc
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
@@ -749,6 +780,52 @@ MODEL_LOAD_SECONDS = None
 MODEL_LOAD_ERROR = None
 QUANTIZATION_MODE = "none"
 QUANT_CONFIG = None
+
+
+def _attach_adapter(model, use_4bit: bool):
+    """Attach the QLoRA adapter when N_ATLAS_ADAPTER_ID names one.
+
+    No adapter configured means the base model is served unchanged, which is the
+    behaviour before any fine-tuning exists. A configured adapter that fails to
+    load raises rather than falling back: serving the base model while an
+    operator believes the fine-tuned weights are live is the one failure this
+    must not have, because nothing downstream can detect it.
+    """
+    adapter_id = CONFIG.adapter_id
+    if not adapter_id:
+        return model
+
+    missing = _missing_deps({"peft": "peft"})
+    if missing:
+        raise RuntimeError(
+            "N_ATLAS_ADAPTER_ID is set to %r but peft is not installed. "
+            "Install it with `pip install peft` and re-run this cell, or unset "
+            "N_ATLAS_ADAPTER_ID to serve the base model." % adapter_id
+        )
+
+    from peft import PeftModel
+
+    try:
+        model = PeftModel.from_pretrained(model, adapter_id)
+        if not use_4bit:
+            model = model.merge_and_unload()
+        model.eval()
+    except Exception as exc:
+        raise ModelUnavailable(
+            "could not load the QLoRA adapter %r: %s: %s. Check that the repo "
+            "is public or that HF_TOKEN is attached, that the adapter was "
+            "trained against %s, and that the name is spelled exactly."
+            % (adapter_id, type(exc).__name__, exc, CONFIG.model_id)
+        ) from exc
+
+    global QUANTIZATION_MODE
+    suffix = " + adapter %s%s" % (adapter_id, "" if use_4bit else " (merged)")
+    QUANTIZATION_MODE = QUANTIZATION_MODE + suffix
+    print("-" * 70)
+    print(f"adapter attached: {adapter_id}")
+    print(f"served as:       {CONFIG.served_model_name} (unchanged for clients)")
+    print("=" * 70)
+    return model
 
 
 def load_model(force: bool = False):
@@ -789,6 +866,8 @@ def load_model(force: bool = False):
         model.eval()
         if not use_4bit:
             model.config.use_cache = True
+
+        model = _attach_adapter(model, use_4bit)
 
         MODEL_LOAD_SECONDS = round(time.perf_counter() - _load_start, 2)
         MODEL = model
@@ -1318,8 +1397,18 @@ LANGUAGE_MARKERS: Dict[str, Dict[str, float]] = {
         "yake": 2.0, "ina": 2.0, "gode": 2.0, "kuma": 2.0, "sai": 2.0,
         "yana": 2.0, "zan": 2.0, "muku": 2.0, "wallahi": 2.0, "kawai": 2.0,
         "yi": 1.5, "yau": 1.5, "da": 1.5, "mai": 1.5, "kuma": 2.0,
-        "ka": 1.0, "ku": 1.0, "na": 1.0, "ya": 1.0, "ta": 1.0, "mu": 1.0,
-        "su": 1.0, "ce": 1.0, "dan": 1.0, "ba": 0.5, "to": 0.5,
+        "ka": 1.0, "ku": 1.0, "ya": 1.0, "ta": 1.0, "mu": 1.0,
+        "su": 1.0, "ce": 1.0, "dan": 1.0,
+        # "na" 1.0, "ba" 0.5 and "to" 0.5 were here and have been removed. All
+        # three belong to Nigerian Pidgin, not to Hausa: "na" is the Pidgin
+        # copula, "ba" its negative particle, and "to" ordinary English. "to"
+        # alone put a permanent Hausa contribution into every English sentence,
+        # and a short Pidgin line could scrape the 2.0 threshold out of the
+        # three of them — "Na ba to be" scored exactly 2.0 for Hausa, cleared
+        # MIN_LANGUAGE_SCORE, and was answered "Write the entire reply in
+        # Hausa." by a user who had written no Hausa word at all. The en-bias
+        # rule could not save it either: that rule only fires when the top
+        # language is English. See PIDGIN_MARKERS below.
     },
     "yo": {
         "bawo": 2.5, "tani": 2.5, "kini": 2.5, "nife": 2.5, "pupo": 2.0,
@@ -1347,6 +1436,37 @@ LANGUAGE_MARKERS: Dict[str, Dict[str, float]] = {
     },
 }
 
+# Nigerian Pidgin is the language a large share of these users actually write
+# in, and it is not one of the four the scorer above measures. Left unmarked it
+# inherits English from its English vocabulary and comes out "English, high
+# confidence" — which is what the directive is built from, so a Pidgin speaker
+# was fenced into formal English with "Do not use Hausa, Yoruba or Igbo"
+# appended, and the reply was reported as `"language": "en"` with nothing in the
+# response to say the message had been Pidgin at all.
+#
+# It is scored separately, and deliberately not from this table:
+#
+#   * a "pid" key in LANGUAGE_MARKERS would raise KeyError. _score_languages
+#     builds `scores` from LANGUAGE_NAMES and then does `scores[code] += weight`,
+#     so any code present here but absent there is a crash on the first word
+#     that matches.
+#   * the decision it changes is not "which of the four". The reply is still
+#     English; what changes is that English is no longer held to a standard the
+#     user did not write in. That is a different kind of answer, so it is given
+#     from a different place in the pipeline.
+#
+# Weights follow the tables above: 2.0 for a word that is Pidgin and nothing
+# else, 1.5 for one that is strong but has an ordinary English homonym or a
+# competing Nigerian-language reading ("omo", "aboki"), and 1.0 for the borrowed
+# and near-homonym words that need a second marker before they count. That is
+# what keeps "Is this correct?" and "Who is the guy?" out of the Pidgin branch.
+PIDGIN_MARKERS: Dict[str, float] = {
+    "abeg": 2.0, "abegs": 2.0, "wahala": 2.0, "yawa": 2.0, "suppose": 2.0,
+    "wetin": 1.5, "omo": 1.5, "aboki": 1.5, "kai": 1.5, "kwai": 1.5,
+    "dey": 1.5, "don": 1.5, "sabi": 1.0, "sharp": 1.0, "correct": 1.0,
+    "guy": 1.0, "beta": 1.0,
+}
+
 LANGUAGE_DIRECTIVES = {
     "en": "Write the entire reply in English. Do not use Hausa, Yoruba or Igbo.",
     "ha": "Write the entire reply in Hausa. Do not use English, Yoruba or Igbo.",
@@ -1356,6 +1476,12 @@ LANGUAGE_DIRECTIVES = {
 
 MIN_LANGUAGE_SCORE = 2.0
 MIN_LANGUAGE_MARGIN = 1.0
+
+# One strong Pidgin marker ("abeg", "wahala", "yawa", "suppose") is enough. The
+# weaker entries sit below it on purpose, so that no single English or
+# Nigerian-accent word can reach the threshold alone: "Is this correct?" must
+# stay a plain English message.
+MIN_PIDGIN_SCORE = 2.0
 
 
 def fold_text(text: str) -> str:
@@ -1390,6 +1516,20 @@ def _score_languages(folded: str) -> Dict[str, float]:
     return scores
 
 
+def _score_pidgin(folded: str) -> float:
+    """The Nigerian Pidgin score for folded text, or 0.0.
+
+    Whole tokens, for the same reason _score_languages uses them: a substring
+    rule would let "dey" fire from "embroidery" and "don" from "donate".
+    Folding has already happened, so "Abeg" and "abeg" score the same.
+    """
+    if not folded:
+        return 0.0
+    return sum(
+        PIDGIN_MARKERS.get(word, 0.0) for word in re.findall(r"[a-z']+", folded)
+    )
+
+
 def detect_language(text: str) -> Dict[str, Any]:
     folded = fold_text(text)
     scores = _score_languages(folded)
@@ -1400,6 +1540,30 @@ def detect_language(text: str) -> Dict[str, Any]:
             "confidence": "explicit",
             "scores": scores,
             "mixed": False,
+        }
+
+    # Nigerian Pidgin, checked before the four-way scoring and after the explicit
+    # request, so "reply in Hausa" still wins over anything written in Pidgin.
+    #
+    # The reply is reported as English because that is what it is; what changes is
+    # the confidence and the flag below, and apply_language_directive reads them
+    # to stand down the standard-English fence. Reporting "en" rather than a
+    # fifth code is what keeps the blast radius at this one branch: the response
+    # field, LAST_LANGUAGE_DETECTION, the client and the four-language formatter
+    # all keep switching on values they already handle.
+    #
+    # `mixed` is True unconditionally, which is the honest reading — a Pidgin
+    # message is by nature a mixture of English and a Nigerian language. It is
+    # also what makes the directive mention the code-switching explicitly.
+    pidgin = _score_pidgin(folded)
+    if pidgin >= MIN_PIDGIN_SCORE:
+        return {
+            "language": "en",
+            "confidence": "pidgin",
+            "scores": scores,
+            "pidgin": True,
+            "pidgin_score": pidgin,
+            "mixed": True,
         }
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
@@ -1441,6 +1605,40 @@ def build_language_directive(code: str, mixed: bool) -> str:
     )
     if mixed:
         line += " The user mixes languages; still lead with this language."
+    return line
+
+
+# Pidgin is not a fifth target language, and this is deliberately not a fifth
+# entry in LANGUAGE_DIRECTIVES. That table is a fence: each of its four entries
+# names one language and forbids the other three, and verify_offline.py asserts
+# exactly that for every entry, so a permitting directive added there would fail
+# the suite by construction.
+#
+# There is also nothing to hold the model *to*. Pidgin has no agreed
+# orthography, and asking for one produces output that is neither standard
+# English nor any of the three Nigerian languages — worse than either. What the
+# detector can legitimately say is narrower and more useful: this person wrote in
+# English-based Pidgin, so write English they can read, without holding it to a
+# standard they were not writing in.
+PIDGIN_DIRECTIVE = (
+    "Reply in clear, simple English that a Nigerian Pidgin speaker can read "
+    "easily, keeping the plain, direct register their message uses. You are not "
+    "required to use formal standard English. Do not switch to Hausa, Yoruba or "
+    "Igbo."
+)
+
+
+def build_pidgin_directive(mixed: bool) -> str:
+    """The instruction for a message written in Nigerian Pidgin."""
+    line = (
+        "[language] The user's last message is in Nigerian Pidgin, an "
+        f"English-based creole. {PIDGIN_DIRECTIVE}"
+    )
+    if mixed:
+        line += (
+            " They may also use words from Hausa, Yoruba or Igbo; that is "
+            "normal Pidgin and is not a reason to answer in another language."
+        )
     return line
 
 
@@ -1508,6 +1706,26 @@ def apply_language_directive(
     # changes the answer.
     if not CONFIG.language_tagging:
         return prompt_messages, {**detection, "injected": False}
+
+    # Pidgin gets its own directive instead of the English one. It scores as
+    # English at high confidence, so without this branch a Pidgin message drew
+    # "Write the entire reply in English. Do not use Hausa, Yoruba or Igbo." —
+    # and "do not use Hausa" is the wrong instruction for exactly these users,
+    # whose messages code-switch constantly ("Wetin dey happen? Yaya kake?").
+    # Fencing the other three languages out of a Pidgin reply is what this
+    # replaces.
+    #
+    # Below the tagging switch so N_ATLAS_LANGUAGE_TAGGING=0 still turns the whole
+    # mechanism off, and above the English-confidence rule below so the
+    # standard-English directive is never the one that fires.
+    if detection.get("pidgin"):
+        directive = build_pidgin_directive(detection.get("mixed", False))
+        updated = [dict(m) for m in prompt_messages]
+        for message in updated:
+            if message["role"] == "system":
+                message["content"] = f"{message['content']}\n\n{directive}"
+                break
+        return updated, {**detection, "injected": True, "directive": directive}
 
     if detection["language"] == "en" and detection["confidence"] == "low":
         return prompt_messages, {**detection, "injected": False}
@@ -2054,6 +2272,7 @@ def health():
         "gpu_vram_gb": GPU.get("gpu_vram_gb", 0.0),
         "cuda_available": GPU["cuda_available"],
         "quantization": QUANTIZATION_MODE,
+        "adapter_id": CONFIG.adapter_id or None,
         "model_loaded": loaded,
         "model_load_seconds": MODEL_LOAD_SECONDS,
         "model_load_error": MODEL_LOAD_ERROR,
