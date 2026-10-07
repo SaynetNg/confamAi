@@ -135,7 +135,7 @@ Cell 3 only pip-installs what is genuinely missing, in two groups: **server** (`
 | `N_ATLAS_ALLOW_EPHEMERAL_KEY` | `1` | Set `0` to hard-fail when no key is configured. |
 | `N_ATLAS_SYSTEM_PROMPT` | unset — `confam_prompt.txt` is served | Inline system prompt override. |
 | `N_ATLAS_SYSTEM_PROMPT_FILE` | unset — `confam_prompt.txt` is found on disk | Path to a prompt file; wins over inline. |
-| `N_ATLAS_ADAPTER_ID` | unset — base model only | QLoRA adapter repo, e.g. `Saynetng/confam-ai-adapter`. |
+| `N_ATLAS_ADAPTER_ID` | unset — base model only | QLoRA adapter repo, e.g. `Saynetng/confam-ai-adapter-v1.1`. |
 | `N_ATLAS_MAX_NEW_TOKENS` | `512` | Hard ceiling on client `max_tokens`. |
 | `N_ATLAS_DEFAULT_MAX_TOKENS` | `512` | Used when the client omits it. |
 | `N_ATLAS_MAX_INPUT_TOKENS` | `4096` | Prompt ceiling. T4-safe — see below before raising. |
@@ -784,7 +784,74 @@ What `prepare_training_data.py` does: the system message becomes `confam_prompt.
 
 ## After it works
 
-Set `N_ATLAS_ADAPTER_ID` on Notebook B (a Kaggle secret named `N_ATLAS_ADAPTER_ID` is the clean way), then re-run Cells 1, 2, 3 and 5 of `natlas_kaggle.ipynb`. Cell 2's banner must print `Adapter: Saynetng/confam-ai-adapter` and `GET /v1/health` must report `"adapter_id"`. A configured adapter that fails to load stops Notebook B rather than falling back to the base model, so the two can never silently disagree.
+Set `N_ATLAS_ADAPTER_ID` on Notebook B (a Kaggle secret named `N_ATLAS_ADAPTER_ID` is the clean way), then re-run Cells 1, 2, 3 and 5 of `natlas_kaggle.ipynb`. Cell 2's banner must print `Adapter: Saynetng/confam-ai-adapter-v1.1` and `GET /v1/health` must report `"adapter_id"`. A configured adapter that fails to load stops Notebook B rather than falling back to the base model, so the two can never silently disagree.
+
+## Successful training run example
+
+A successful run of the training notebook produces output like this:
+
+**Cell 6 — Dataset rendering:**
+```
+[data] rendering 516 records with the model's chat template…
+[data] rendered in 1s
+[data] tokens  p50=914  p90=989  max=1080
+[data] max_seq_length=2048, 0 records over it, every batch padded to 2048
+```
+
+**Cell 7 — Training:**
+```
+[train] 516 records, 200 steps, effective batch 8 (1 per step x 8 accum)
+[train] weights resident 7.3 GiB of 14.6 GiB; logits 501 MiB per sequence at 2048 padded positions, ~3x that in the loss
+
+ [200/200 1:45:51, Epoch 3/4]
+Step    Training Loss
+10      2.153200
+20      0.641900
+30      0.160500
+40      0.102200
+50      0.094000
+...
+190     0.041100
+200     0.043900
+
+[train] done in 107 minutes
+```
+
+**Cell 8 — Push to Hub:**
+```
+[push] Saynetng/confam-ai-adapter-v1.1
+[push] 4 files, 0.0 MB
+       .gitattributes
+       README.md
+       adapter_config.json
+       adapter_model.safetensors
+```
+
+**Cell 9 — Behavioral checks:**
+```
+[CHECK] identity (expects 'ConfamAI')
+       I am a language model developed by OpenAI...
+
+[PASS] verdict discipline (expects 'FLAGGED')
+       I can't verify whether Example Snack 900 is genuine because NAFDAC flagged it...
+
+[CHECK] no data, no verdict (expects 'NAFDAC')
+       I'm not a product verification service...
+```
+
+**What the checks mean:**
+
+- **Training loss trajectory**: Should drop from ~2.15 to ~0.04-0.06 over 200 steps. The loss curve shows the model learning: rapid drop in the first 30 steps (2.15 → 0.16), then gradual refinement. Final loss around 0.04 is typical for this dataset size.
+
+- **PASS vs CHECK**: Cell 9 runs three behavioral tests. A CHECK is not automatically a failure — these are greedy generations from a 4-bit base plus a 200-step adapter. The critical signal is the **identity** check:
+  - If it says `"ConfamAI"` or similar → adapter took effect
+  - If it says `"OpenAI"` or generic LLM identity → **adapter did not take**, do not set `N_ATLAS_ADAPTER_ID` on Notebook B
+
+- **Adapter size**: Should be tens of megabytes (~50-80 MB), not gigabytes. If Cell 8 reports 500+ MB, the push uploaded base weights instead of just the adapter, and `N_ATLAS_ADAPTER_ID` must not be used.
+
+- **Training time**: 107 minutes (1h 47m) for 200 steps matches the ~1.5-1.8h budget. The measured rate is ~32 seconds/step at effective batch 8 with a T4.
+
+If the identity check fails (shows OpenAI or generic LLM), the adapter did not learn the ConfamAI persona. This can happen if the training steps were too few (increase `N_ATLAS_TRAIN_STEPS`), the learning rate was too low, or the dataset had issues (Cell 4 validates this). See `n_atlas_train/README.md` for the full walkthrough.
 
 ---
 
@@ -1078,7 +1145,7 @@ The archive is verified to contain `nafdac_source/{__init__,sources,verify,recor
 ```
 1. nafdac_scraper/      scrapes greenbook.nafdac.gov.ng  →  nafdac_greenbook.csv / .xlsx
 2. nafdac_source/       loads CSV/XLSX + PostgreSQL        →  verify_nafdac_product() / find_products()
-3. n_atlas_train/       fine-tunes N-ATLaS on 643 records →  Saynetng/confam-ai-adapter (HF Hub)
+3. n_atlas_train/       fine-tunes N-ATLaS on 643 records →  Saynetng/confam-ai-adapter-v1.1 (HF Hub)
 4. n_atlas_server/      serves the model + greenbook on Kaggle  →  OpenAI-compatible API
 5. n_atlas_client/      laptop client: local NAFDAC lookup + API call
 6. confamai_bot/        WhatsApp front end → same API

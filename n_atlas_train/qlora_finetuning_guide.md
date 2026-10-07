@@ -180,13 +180,13 @@ print("Starting training! This will take a while...")
 trainer.train()
 
 # Push the final adapter to Hugging Face Hub!
-trainer.model.push_to_hub("Saynetng/confam-ai-adapter", token=hf_token)
+trainer.model.push_to_hub("Saynetng/confam-ai-adapter-v1.1", token=hf_token)
 print(f"Training complete! Adapter uploaded to Hugging Face Hub successfully.")
 ```
 
 Check it worked before moving on:
 
-1. Open `https://huggingface.co/Saynetng/confam-ai-adapter`. You should see
+1. Open `https://huggingface.co/Saynetng/confam-ai-adapter-v1.1`. You should see
    `adapter_config.json` and `adapter_model.safetensors`. Change the account name
    if your push went somewhere else — the serving step needs the exact id that
    exists.
@@ -202,7 +202,7 @@ variable — no client change, no code edit. In **Cell 1** (or as a Kaggle secre
 set:
 
 ```python
-os.environ["N_ATLAS_ADAPTER_ID"] = "Saynetng/confam-ai-adapter"
+os.environ["N_ATLAS_ADAPTER_ID"] = "Saynetng/confam-ai-adapter-v1.1"
 ```
 
 Cell 5 then loads the base model as usual and attaches the adapter on top of it,
@@ -210,11 +210,11 @@ before the first generation. Cell 2's banner confirms it:
 
 ```
 Model:             NCAIR1/N-ATLaS
-Adapter:           Saynetng/confam-ai-adapter
+Adapter:           Saynetng/confam-ai-adapter-v1.1
 Served as:         n-atlas
 ```
 
-and `/v1/health` reports `"adapter_id": "Saynetng/confam-ai-adapter"`.
+and `/v1/health` reports `"adapter_id": "Saynetng/confam-ai-adapter-v1.1"`.
 
 Three things worth knowing:
 

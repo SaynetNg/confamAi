@@ -94,7 +94,7 @@ MODEL_ID = os.environ.get("N_ATLAS_MODEL_ID", "NCAIR1/N-ATLaS")
 # token together, or the push will fail with a permission error after the
 # training has run.
 ADAPTER_ID = os.environ.get(
-    "N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter"
+    "N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter-v1.1"
 )
 
 DATASET_FILENAME = "confam_training_dataset.jsonl"

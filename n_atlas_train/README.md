@@ -91,13 +91,93 @@ Set `N_ATLAS_ADAPTER_ID` on Notebook B (a Kaggle secret named
 `natlas_kaggle.ipynb`. Cell 2's banner must print:
 
 ```
-Adapter:           Saynetng/confam-ai-adapter
+Adapter:           Saynetng/confam-ai-adapter-v1.1
 ```
 
 and `GET /v1/health` must report `"adapter_id"`. If either says `none`, the
 variable did not reach the process. A configured adapter that fails to load stops
 Notebook B rather than falling back to the base model, so the two can never
 silently disagree.
+
+## Successful training run example
+
+A successful run of the training notebook produces output like this:
+
+**Cell 6 — Dataset rendering:**
+```
+[data] rendering 516 records with the model's chat template…
+[data] rendered in 1s
+[data] tokens  p50=914  p90=989  max=1080
+[data] max_seq_length=2048, 0 records over it, every batch padded to 2048
+```
+
+**Cell 7 — Training:**
+```
+[train] 516 records, 200 steps, effective batch 8 (1 per step x 8 accum)
+[train] weights resident 7.3 GiB of 14.6 GiB; logits 501 MiB per sequence at 2048 padded positions, ~3x that in the loss
+
+ [200/200 1:45:51, Epoch 3/4]
+Step    Training Loss
+10      2.153200
+20      0.641900
+30      0.160500
+40      0.102200
+50      0.094000
+...
+190     0.041100
+200     0.043900
+
+[train] done in 107 minutes
+```
+
+**Cell 8 — Push to Hub:**
+```
+[push] Saynetng/confam-ai-adapter-v1.1
+[push] 4 files, 0.0 MB
+       .gitattributes
+       README.md
+       adapter_config.json
+       adapter_model.safetensors
+```
+
+**Cell 9 — Behavioral checks:**
+```
+[CHECK] identity (expects 'ConfamAI')
+       I am a language model developed by OpenAI...
+
+[PASS] verdict discipline (expects 'FLAGGED')
+       I can't verify whether Example Snack 900 is genuine because NAFDAC flagged it...
+
+[CHECK] no data, no verdict (expects 'NAFDAC')
+       I'm not a product verification service...
+```
+
+**What the checks mean:**
+
+- **Training loss trajectory**: Should drop from ~2.15 to ~0.04-0.06 over 200 steps. The
+  loss curve shows the model learning: rapid drop in the first 30 steps (2.15 → 0.16),
+  then gradual refinement. Final loss around 0.04 is typical for this dataset size.
+
+- **PASS vs CHECK**: Cell 9 runs three behavioral tests. A CHECK is not automatically a
+  failure — these are greedy generations from a 4-bit base plus a 200-step adapter.
+  The critical signal is the **identity** check:
+  - If it says `"ConfamAI"` or similar → adapter took effect
+  - If it says `"OpenAI"` or generic LLM identity → **adapter did not take**, do not
+    set `N_ATLAS_ADAPTER_ID` on Notebook B
+
+- **Adapter size**: Should be tens of megabytes (~50-80 MB), not gigabytes. If Cell 8
+  reports 500+ MB, the push uploaded base weights instead of just the adapter, and the
+  `N_ATLAS_ADAPTER_ID` must not be used.
+
+- **Training time**: 107 minutes (1h 47m) for 200 steps matches the ~1.5-1.8h budget.
+  The measured rate is ~32 seconds/step at effective batch 8 with a T4.
+
+If the identity check fails (shows OpenAI or generic LLM), the adapter did not learn
+the ConfamAI persona. This can happen if:
+- The training steps were too few (increase `N_ATLAS_TRAIN_STEPS`)
+- The learning rate was too low (default 2e-4 is usually fine)
+- The dataset had issues (Cell 4 validates this)
+- The adapter was not saved correctly (check Cell 8 output)
 
 ## Timing
 
@@ -203,7 +283,7 @@ Set as environment variables in Cell 1, or edit `train_notebook.py` and rebuild:
 | Variable | Default | Note |
 |---|---|---|
 | `N_ATLAS_MODEL_ID` | `NCAIR1/N-ATLaS` | base model |
-| `N_ATLAS_ADAPTER_ID` | `Saynetng/confam-ai-adapter` | where this notebook pushes **and** what Notebook B reads |
+| `N_ATLAS_ADAPTER_ID` | `Saynetng/confam-ai-adapter-v1.1` | where this notebook pushes **and** what Notebook B reads |
 | `N_ATLAS_TRAIN_STEPS` | `200` | effective batch 8, so ~2.5 passes over 643 records |
 | `N_ATLAS_TRAIN_BATCH` / `N_ATLAS_TRAIN_ACCUM` | `1` / `8` | effective batch 8, so 200 steps is 1600 samples either way. `1` is the VRAM floor: at batch 2 the logits alone outgrow a T4. Do not raise it without re-reading the Cell 1 arithmetic |
 | `N_ATLAS_TRAIN_LR` | `2e-4` | conventional LoRA rate; lower it if the answers drift from the prompt |

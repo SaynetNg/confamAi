@@ -17,7 +17,7 @@
 # |---|---|---|
 # | `N_ATLAS_API_KEY` | Bearer token required by every `/v1/*` route | random ephemeral dev key |
 # | `NAFDAC_DATABASE_URL` | Supabase session-pooler DSN for the greenbook source | literal in Cell 1 |
-# | `N_ATLAS_ADAPTER_ID` | QLoRA adapter repo to serve on top of the base model | `Saynetng/confam-ai-adapter` |
+# | `N_ATLAS_ADAPTER_ID` | QLoRA adapter repo to serve on top of the base model | `Saynetng/confam-ai-adapter-v1.1` |
 # | `HF_TOKEN` | Hugging Face token for the gated base model | unset — required: Kaggle Secret or environment |
 # | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | unset — `confam_prompt.txt` is served |
 # | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset — `confam_prompt.txt` is found on disk |
@@ -109,7 +109,7 @@ os.environ.setdefault(
 # back. Prefer a Kaggle Secret named N_ATLAS_ADAPTER_ID over the literal —
 # setdefault means the secret wins, the same as it does for the two variables
 # above.
-os.environ.setdefault("N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter")
+os.environ.setdefault("N_ATLAS_ADAPTER_ID", "Saynetng/confam-ai-adapter-v1.1")
 
 # The Hugging Face token, resolved the same way the training notebook
 # (confam_train_kaggle.ipynb, Cell 3) resolves it: the HF_TOKEN
@@ -270,7 +270,7 @@ def _cuda_report() -> Dict[str, Any]:
 @dataclass
 class Settings:
     model_id: str = "NCAIR1/N-ATLaS"
-    # A QLoRA adapter repo, e.g. "Saynetng/confam-ai-adapter". Empty means the
+    # A QLoRA adapter repo, e.g. "Saynetng/confam-ai-adapter-v1.1". Empty means the
     # base model is served unchanged. Set N_ATLAS_ADAPTER_ID to serve the
     # fine-tuned ConfamAI weights; see ../n_atlas_train/qlora_finetuning_guide.md.
     adapter_id: str = os.environ.get("N_ATLAS_ADAPTER_ID", "").strip()
