@@ -683,6 +683,27 @@ Trains the ConfamAI adapter with QLoRA and pushes it to Hugging Face. This folde
 
 The only thing that crosses between them is the adapter on the Hugging Face Hub. Notebook B picks it up by setting `N_ATLAS_ADAPTER_ID`; nothing else changes, and `served_model_name` stays `n-atlas` so no client is reconfigured.
 
+## Available Adapter Versions
+
+Two versions of the Confam AI adapter are available on Hugging Face:
+
+| Version | Repository | Status | Notes |
+|---------|-----------|--------|-------|
+| **v1.1** | [Saynetng/confam-ai-adapter-v1.1](https://huggingface.co/Saynetng/confam-ai-adapter-v1.1) | **Recommended** | Improved release with refined and more accurate training data. Better factual accuracy, enhanced instruction following, and improved NAFDAC product verification. |
+| **v1** | [Saynetng/confam-ai-adapter](https://huggingface.co/Saynetng/confam-ai-adapter) | Initial release | First version. Use v1.1 for better performance. |
+
+**Use v1.1 for production deployments.** It provides significant improvements over v1 through refined training data quality, resulting in more accurate and reliable responses, particularly for NAFDAC product verification scenarios.
+
+To use v1.1, set:
+```bash
+N_ATLAS_ADAPTER_ID=Saynetng/confam-ai-adapter-v1.1
+```
+
+To use v1, set:
+```bash
+N_ATLAS_ADAPTER_ID=Saynetng/confam-ai-adapter
+```
+
 ## Files
 
 | File | Size | Role |
