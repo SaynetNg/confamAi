@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from .assay import LEAK_MARKERS, evaluate
+from .audio import transcriber as real_transcriber
 from .config import Config, normalize_phone
 from .languages import (
     confirm,
@@ -128,6 +129,9 @@ class RecordingWhatsApp:
 
     async def mark_read(self, message_id: str) -> None:
         return None
+
+    async def download_media(self, media_id: str) -> bytes:
+        return b"stub-ogg-audio"
 
     async def set_typing(self, message_id: str, on: bool = True) -> None:
         return None
@@ -397,6 +401,18 @@ def test_parsing():
     check("an image is not treated as text", parse_inbound(image)[0]["type"] == "image")
     check("an image is collected as unsupported", len(parse_unsupported(image)) == 1)
 
+    # A voice note: the audio payload must survive parsing, because the
+    # router needs the media id inside it to download the note.
+    voice = payload("", mid="d")
+    voice["entry"][0]["changes"][0]["value"]["messages"][0] = {
+        "id": "d", "from": "2348012345678", "timestamp": "1", "type": "audio",
+        "audio": {"id": "media-2", "mime_type": "audio/ogg"},
+    }
+    voice_items = parse_unsupported(voice)
+    check("a voice note is collected as unsupported", len(voice_items) == 1)
+    check("a voice note carries its media id",
+          voice_items[0]["audio"]["id"] == "media-2")
+
 
 def test_framing():
     section("verification framing")
@@ -602,6 +618,77 @@ async def test_router(tmp):
     check("an image costs no model call", len(natlas.calls) == 0)
     check("the image answer asks for the number",
           "A4-100160" in whatsapp.bodies()[0], whatsapp.bodies()[0])
+
+    section("router — a voice note is transcribed and answered")
+    from . import router as router_module
+    _cfg10, natlas, whatsapp, _store10, router = await build(
+        tmp, reply="It is registered."
+    )
+
+    class StubTranscriber:
+        """Stands in for the NCAIR1 models: no torch, no GPU."""
+
+        def __init__(self):
+            self.calls: list[tuple[bytes, str]] = []
+
+        def transcribe(self, audio_bytes, language_code="en"):
+            self.calls.append((audio_bytes, language_code))
+            return "Is A4-100160 genuine?"
+
+    stub = StubTranscriber()
+    router_module.transcriber = stub
+    try:
+        voice = {
+            "id": "vn1", "from": "2348012345678", "type": "audio",
+            "audio": {"id": "media-audio-1"},
+        }
+        await router.handle_non_text(voice)
+    finally:
+        router_module.transcriber = real_transcriber
+
+    check("a voice note says it is listening",
+          "Listening" in whatsapp.bodies()[0], whatsapp.bodies()[0])
+    check("a voice note is downloaded once", len(stub.calls) == 1)
+    check("the downloaded bytes reach the transcriber",
+          stub.calls[0][0] == b"stub-ogg-audio")
+    check("the user's language reaches the transcriber",
+          stub.calls[0][1] == "en")
+    check("a voice note costs one model call", len(natlas.calls) == 1)
+    # The transcription takes the ordinary text path, so the
+    # verification frame is attached to it — the user's own
+    # words are still what the model sees.
+    check("the transcription is what the model sees",
+          "Is A4-100160 genuine?" in natlas.calls[0]["messages"][-1]["content"],
+          str(natlas.calls[0]["messages"][-1]["content"])[:80])
+    check("a voice note is answered",
+          whatsapp.bodies()[-1] == "It is registered.", whatsapp.bodies()[-1])
+
+    # A Meta retry of the same note must not transcribe or reply twice.
+    await router.handle_non_text(dict(voice))
+    check("a replayed voice note is ignored", len(stub.calls) == 1)
+    check("a replayed voice note sends nothing more", len(whatsapp.sent) == 2)
+
+    section("router — a voice note that cannot be transcribed is reported")
+    _cfg10b, natlas_b, whatsapp_b, _store10b, router_b = await build(tmp)
+
+    class FailingTranscriber:
+        def transcribe(self, audio_bytes, language_code="en"):
+            raise RuntimeError("model not installed")
+
+    router_module.transcriber = FailingTranscriber()
+    try:
+        await router_b.handle_non_text({
+            "id": "vn2", "from": "2348012345678", "type": "audio",
+            "audio": {"id": "media-audio-2"},
+        })
+    finally:
+        router_module.transcriber = real_transcriber
+
+    bodies_b = whatsapp_b.bodies()
+    check("a failed transcription still replies", len(bodies_b) == 2, str(bodies_b))
+    check("a failed transcription says it could not hear",
+          "could not hear" in bodies_b[-1].lower(), bodies_b[-1])
+    check("a failed transcription costs no model call", len(natlas_b.calls) == 0)
 
     section("router — the allowlist refuses without a model call")
     _cfg9, natlas, whatsapp, _store10, router = await build(

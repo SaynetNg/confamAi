@@ -186,6 +186,90 @@ class WhatsAppClient:
                 await asyncio.sleep(delay)
         raise last or WhatsAppError("The message could not be sent.")
 
+    async def download_media(self, media_id: str) -> bytes:
+        """Download a voice note or image from Meta's servers.
+
+        Two hops, both needing the bearer token: the media id resolves
+        to a short-lived URL, and that URL serves the raw bytes. Voice
+        notes arrive as .ogg/opus; the bytes pass through untouched,
+        because decoding them is the transcriber's job.
+        """
+        if not media_id:
+            raise WhatsAppError("Refusing to download media without an id.")
+        if self._client is None:
+            await self.start()
+
+        headers = {"Authorization": "Bearer %s" % self.cfg.access_token}
+        try:
+            url_resp = await self._client.get(
+                "https://graph.facebook.com/%s/%s"
+                % (self.cfg.graph_version, media_id),
+                headers=headers,
+            )
+        except httpx.TimeoutException as exc:
+            raise WhatsAppError(
+                "WhatsApp did not respond in time.", retryable=True
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise WhatsAppError(
+                "Could not reach the WhatsApp API.", retryable=True
+            ) from exc
+
+        problem = self._media_problem(url_resp)
+        if problem is not None:
+            raise problem
+        try:
+            media_url: str = url_resp.json()["url"]
+        except (ValueError, KeyError) as exc:
+            raise WhatsAppError(
+                "Media %s has no download URL." % media_id
+            ) from exc
+
+        try:
+            media_resp = await self._client.get(media_url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise WhatsAppError(
+                "WhatsApp did not respond in time.", retryable=True
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise WhatsAppError(
+                "Could not reach the WhatsApp API.", retryable=True
+            ) from exc
+
+        problem = self._media_problem(media_resp)
+        if problem is not None:
+            raise problem
+        return media_resp.content
+
+    @staticmethod
+    def _media_problem(response: httpx.Response) -> WhatsAppError | None:
+        """Classify a media download response. None means it is fine.
+
+        The same rule as `_post`: retry 5xx and the rate limits, never
+        retry anything else. A media id that was never valid will not
+        start working on a retry.
+        """
+        if response.status_code >= 500:
+            return WhatsAppError(
+                "The WhatsApp API returned %d while downloading media."
+                % response.status_code,
+                retryable=True,
+            )
+        try:
+            body: Any = response.json()
+        except ValueError:
+            return None
+        error = body.get("error") if isinstance(body, dict) else None
+        if not error:
+            return None
+        code = error.get("code")
+        details = error.get("message") or "the request was rejected"
+        return WhatsAppError(
+            "WhatsApp error %s: %s" % (code, details),
+            code=code,
+            retryable=code in _RETRY_CODES,
+        )
+
     async def mark_read(self, message_id: str) -> None:
         """Show the blue ticks. Never fatal if it fails."""
         if not message_id:
@@ -280,10 +364,14 @@ def parse_inbound(payload: dict) -> list[dict]:
 def parse_unsupported(payload: dict) -> list[dict]:
     """Non-text messages, so they can be answered rather than dropped.
 
-    A user photographing a medicine pack is the single most likely thing a real
-    person does with a verification bot, and `image` is what arrives. OCR is a
-    separate feature; this only makes the bot say something useful instead of
-    going silent, which reads as broken.
+    A user photographing a medicine pack is the single most likely thing a
+    real person does with a verification bot, and `image` is what arrives.
+    OCR is a separate feature; this only makes the bot say something useful
+    instead of going silent, which reads as broken.
+
+    The type's own payload rides along under its key, so a voice note's
+    media id is reachable as `item["audio"]["id"]` — which is what the
+    router needs to download the note.
     """
     unsupported: list[dict] = []
     for entry in payload.get("entry") or []:
@@ -292,11 +380,14 @@ def parse_unsupported(payload: dict) -> list[dict]:
             for message in value.get("messages") or []:
                 if message.get("type") == "text":
                     continue
-                unsupported.append(
-                    {
-                        "id": message.get("id", ""),
-                        "from": message.get("from", ""),
-                        "type": message.get("type", "unknown"),
-                    }
-                )
+                kind = message.get("type", "unknown")
+                item = {
+                    "id": message.get("id", ""),
+                    "from": message.get("from", ""),
+                    "type": kind,
+                }
+                media = message.get(kind)
+                if isinstance(media, dict):
+                    item[kind] = media
+                unsupported.append(item)
     return unsupported

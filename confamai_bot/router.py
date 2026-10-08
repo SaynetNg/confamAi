@@ -38,10 +38,12 @@ ingredients nobody put in the database.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
 from . import framing, languages, render
+from .audio import transcriber
 from .config import Config, normalize_phone
 from .natlas import (
     FATAL,
@@ -330,22 +332,68 @@ class Router:
         return await self._send(phone, languages.message("optout", lang))
 
     async def handle_non_text(self, item: dict) -> str:
-        """A photo, document, audio or sticker.
+        """A photo, document, sticker or voice note.
 
-        A photograph of a medicine pack is the most likely thing a real person
-        sends a verification bot, so going silent here would be the worst
-        possible response. OCR is a separate feature; until it exists the bot
-        says what it can do instead of nothing.
+        A voice note is the one non-text message this bot understands:
+        it is downloaded, transcribed with the model for the user's
+        language, and the resulting text is fed through the ordinary
+        text path — so a spoken "stop" opts out and a spoken NAFDAC
+        number is verified exactly as if it had been typed.
+
+        Everything else gets the local "I can only read text" answer.
+        A photograph of a medicine pack is the most likely thing a real
+        person sends, and silence would read as a broken bot, but OCR
+        is a separate feature.
         """
         phone = normalize_phone(item.get("from", ""))
         if not phone or phone in self.opted_out or not self.cfg.is_allowed(phone):
             return ""
         if not await self.store.mark_seen(item.get("id", ""), DEDUPE_TTL):
             return ""
+
+        if item.get("type") != "audio":
+            session = await self.store.get(phone)
+            return await self._send(
+                phone, languages.message("image", session.language or "en")
+            )
+
         session = await self.store.get(phone)
-        return await self._send(
-            phone, languages.message("image", session.language or "en")
-        )
+        lang = session.language or "en"
+        audio_id = (item.get("audio") or {}).get("id") or ""
+        if not audio_id:
+            return await self._send(phone, languages.message("blank", lang))
+
+        await self._send(phone, languages.message("voice_listening", lang))
+
+        try:
+            audio_bytes = await self.whatsapp.download_media(audio_id)
+            # Transcription is CPU/GPU-bound and can take tens of
+            # seconds; off the event loop, so every other user's
+            # webhook keeps flowing while this one note is heard.
+            transcribed = await asyncio.to_thread(
+                transcriber.transcribe, audio_bytes, lang
+            )
+        except Exception as exc:
+            self.stats["errors"] += 1
+            print("[router] voice note failed: %r" % (exc,), flush=True)
+            return await self._send(phone, languages.message("voice_failed", lang))
+
+        if not transcribed:
+            return await self._send(phone, languages.message("blank", lang))
+
+        print("[router] transcribed voice note: %s" % transcribed, flush=True)
+
+        # The transcription becomes an ordinary text message, so it takes
+        # the whole text path: opt-out words, language commands, the
+        # verification frame, the model. The id is prefixed because the
+        # dedupe table already holds this note's own id from the
+        # mark_seen above — reusing it would make handle_text treat the
+        # turn as a Meta retry and drop it.
+        mock_text_item = dict(item)
+        mock_text_item["id"] = "audio-%s" % item.get("id", "")
+        mock_text_item["type"] = "text"
+        mock_text_item["text"] = transcribed
+        return await self.handle_text(mock_text_item)
 
     # ------------------------------------------------------------------
     async def _send(self, phone: str, body: str) -> str:

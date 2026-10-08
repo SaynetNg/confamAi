@@ -93,6 +93,11 @@ _UI = {
             "I can only read text messages for now. Please type the NAFDAC "
             "number from the pack — it looks like A4-100160."
         ),
+        "voice_listening": "🎧 Listening to your voice note...",
+        "voice_failed": (
+            "Sorry, I could not hear that clearly. Please type the NAFDAC "
+            "number instead — it looks like A4-100160."
+        ),
         "optout": (
             "You have been unsubscribed and your conversation was deleted. "
             "No messages will be sent. Send START to begin again."
@@ -117,6 +122,11 @@ _UI = {
             "Na iya karanta saƙo mai rubanni kawai. Ka buga lamarin NAFDAC daga "
             "karkashin mai'amfani, kamar A4-100160."
         ),
+        "voice_listening": "🎧 Ina sauraron saƙon muryarka...",
+        "voice_failed": (
+            "Ku yi haƙuri, ba na iya ji da kyau ba. Ka buga lambar NAFDAC "
+            "maimakon haka — kamar A4-100160."
+        ),
         "optout": (
             "An soke rajinka kuma an delete sabisawa. Za a iya tura saƙo kai. "
             "Aika START don sake farawa."
@@ -139,6 +149,11 @@ _UI = {
             "Mo lè kà nàkoko tí ó jẹ́ ọ̀rọ̀ nìkan. Jọ̀wọ́ kọ ìlà NRN láti inú "
             "ìjàngbọ̀n, bí A4-100160."
         ),
+        "voice_listening": "🎧 Ń gbọ́ ìkọ̀kọ̀ rẹ...",
+        "voice_failed": (
+            "Ẹ jọ̀wọ́, èmi kò lè gbọ́ ọ̀rọ̀ yẹn dáadáa. Jọ̀wọ́ kọ ìlà NAFDAC "
+            "lẹ́ẹ̀kansí — bí A4-100160."
+        ),
         "optout": (
             "A yí ọ kúnáàti. A ti fagilé ìjẹ́rìí rẹ̀. A kò ní fi ìránṣẹ́ sí i. "
             "Fi ìránṣẹ́ START láti bẹ̀rẹ̀ sí i."
@@ -160,6 +175,11 @@ _UI = {
         "image": (
             "Enweghị ike ịgụ naanị ederede. Biko pụta nọ́mba NAFDAC dị "
             "na ngọ́ ọrụ, dịka A4-100160."
+        ),
+        "voice_listening": "🎧 Na-anụ olu gị...",
+        "voice_failed": (
+            "Nnọọ, enweghị m ike ịnụ ya nke ọma. Biko pụta nọ́mba NAFDAC "
+            "kama — dịka A4-100160."
         ),
         "optout": (
             "Aka-akịkwela gị site-na-naanị. Akagbuola akụkọ gị. Enweghị "

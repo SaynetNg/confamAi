@@ -315,7 +315,7 @@ class Settings:
 
     generation_timeout: float = _env_float("N_ATLAS_GENERATION_TIMEOUT", 300.0)
     log_content: bool = _env_flag("N_ATLAS_LOG_CONTENT", False)
-    language_tagging: bool = _env_flag("N_ATLAS_LANGUAGE_TAGGING", True)
+    language_tagging: bool = False
     strict_gpu: bool = _env_flag("N_ATLAS_STRICT_GPU", True)
     auto_install: bool = _env_flag("N_ATLAS_AUTO_INSTALL", True)
     allow_ephemeral_key: bool = _env_flag("N_ATLAS_ALLOW_EPHEMERAL_KEY", True)

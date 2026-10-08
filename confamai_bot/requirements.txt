@@ -27,3 +27,17 @@ python-dotenv>=1.0.0
 # should not have a working image and a broken one depending on which
 # requirements file someone remembered to build with.
 psycopg[binary]>=3.1
+
+# ---------------------------------------------------------------------------
+# Optional: voice notes (phase 2 of the WhatsApp integration).
+#
+# The bot boots and answers text without these. They are needed only when
+# a user sends a voice note, which is downloaded and transcribed with the
+# NCAIR1 models (confamai_bot/audio.py). The import is lazy, so a
+# text-only deployment stays small; a deployment that wants voice runs:
+#
+#     pip install torch transformers
+#
+# torch is multi-gigabyte and needs a matching CUDA build for GPU
+# transcription, which is why it is not a hard dependency of a process
+# whose job is receiving webhooks.
