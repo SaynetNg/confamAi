@@ -21,7 +21,7 @@
 # | `HF_TOKEN` | Hugging Face token for the gated base model | unset — required: Kaggle Secret or environment |
 # | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | unset — `confam_prompt.txt` is served |
 # | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset — `confam_prompt.txt` is found on disk |
-# | `N_ATLAS_MAX_NEW_TOKENS` | Hard ceiling on client `max_tokens` | `512` |
+# | `N_ATLAS_MAX_NEW_TOKENS` | Hard ceiling on client `max_tokens` | `200` |
 # | `N_ATLAS_MAX_INPUT_TOKENS` | Hard ceiling on prompt tokens | `6144` |
 # | `N_ATLAS_CONTEXT_BUDGET` | Approximate model context target | `8192` |
 # | `N_ATLAS_MAX_MESSAGES` | Hard ceiling on client message count | `64` |
@@ -292,11 +292,11 @@ class Settings:
     # inherit a default that quietly corrupts verification answers.
     default_temperature: float = _env_float("N_ATLAS_TEMPERATURE", 0.1)
     min_temperature: float = 0.0
-    max_temperature: float = _env_float("N_ATLAS_MAX_TEMPERATURE", 2.0)
+    max_temperature: float = _env_float("N_ATLAS_MAX_TEMPERATURE", 0.1)
     top_p: float = _env_float("N_ATLAS_TOP_P", 0.9)
     repetition_penalty: float = _env_float("N_ATLAS_REPETITION_PENALTY", 1.10)
 
-    max_new_tokens: int = _env_int("N_ATLAS_MAX_NEW_TOKENS", 512)
+    max_new_tokens: int = _env_int("N_ATLAS_MAX_NEW_TOKENS", 200)
     default_max_new_tokens: int = _env_int("N_ATLAS_DEFAULT_MAX_TOKENS", 512)
     min_max_new_tokens: int = 1
     # Measured on a Tesla T4 with this model: VRAM grows ~1.6 MB per prompt token
@@ -746,6 +746,16 @@ TOKENIZER_LOAD_SECONDS = round(time.perf_counter() - _tok_start, 2)
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token = tokenizer.eos_token if tokenizer.eos_token else tokenizer.unk_token
 
+# The Llama 3.1 end-of-turn token. The chat template closes the
+# assistant turn with it and the fine-tuned model emits it to signal
+# a complete reply, so the generation stop list has to include it
+# (see _resolve_eos_ids): a stop list without it lets generation run
+# on to the max_new_tokens cap after the model has already finished —
+# measured on the served prompt, <|eot_id|> is emitted mid-way and
+# the rest of the cap is wasted tokens. Resolved from the vocab
+# rather than hard-coded, so a model without it is unaffected.
+EOT_TOKEN_ID = tokenizer.get_vocab().get("<|eot_id|>")
+
 if not getattr(tokenizer, "chat_template", None):
     raise RuntimeError(
         f"{CONFIG.model_id} exposes no chat template. Refusing to hand-build a prompt."
@@ -760,6 +770,7 @@ print(f"vocab_size:     {tokenizer.vocab_size}")
 print(f"len(tokenizer): {len(tokenizer)}")
 print(f"eos_token_id:   {tokenizer.eos_token_id}  ({tokenizer.eos_token!r})")
 print(f"pad_token_id:   {tokenizer.pad_token_id}  ({tokenizer.pad_token!r})")
+print(f"eot_token_id:   {EOT_TOKEN_ID}  (<|eot_id|>)")
 print(f"model_max_len:  {tokenizer.model_max_length}")
 print(f"chat template:  present ({len(tokenizer.chat_template)} chars)")
 
@@ -1008,8 +1019,23 @@ def clamp_int(value: int, low: int, high: int) -> int:
 
 
 def _resolve_eos_ids() -> List[int]:
+    """Every token id that ends a turn.
+
+    eos and sep are the generic candidates. <|eot_id|> is the
+    end-of-turn token the chat template closes the assistant turn
+    with, and the one the fine-tuned model emits to say it is done.
+    A stop list without it lets generation run on to the
+    max_new_tokens cap after the model has already finished — the
+    run-on confam_diagnose.py measures on the served prompt. It is
+    deduplicated against eos, which is the same token on Llama
+    3.1-derived models, so those are unaffected.
+    """
     ids = []
-    for candidate in (tokenizer.eos_token_id, getattr(tokenizer, "sep_token_id", None)):
+    for candidate in (
+        tokenizer.eos_token_id,
+        getattr(tokenizer, "sep_token_id", None),
+        EOT_TOKEN_ID,
+    ):
         if isinstance(candidate, int) and candidate >= 0 and candidate not in ids:
             ids.append(candidate)
     return ids

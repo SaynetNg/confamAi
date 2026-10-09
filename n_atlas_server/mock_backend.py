@@ -44,6 +44,12 @@ class MockTokenizer:
     def __len__(self) -> int:
         return max(len(self._chars), self.vocab_size)
 
+    def get_vocab(self) -> Dict[str, int]:
+        # The real tokenizer's interface: Cell 4 resolves <|eot_id|>
+        # from it. The mock has no such token, so the lookup returns
+        # None and the stop list falls back to eos alone.
+        return dict(self._index)
+
     def _encode(self, text: str) -> List[int]:
         ids: List[int] = []
         for char in text:
