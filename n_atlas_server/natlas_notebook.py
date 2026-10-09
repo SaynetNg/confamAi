@@ -292,7 +292,11 @@ class Settings:
     # inherit a default that quietly corrupts verification answers.
     default_temperature: float = _env_float("N_ATLAS_TEMPERATURE", 0.1)
     min_temperature: float = 0.0
-    max_temperature: float = _env_float("N_ATLAS_MAX_TEMPERATURE", 0.1)
+    # The ceiling stays permissive on purpose: the low default above is
+    # the safety property, not this limit. A client that sends 0.7 is
+    # inside the documented range (README: N_ATLAS_MAX_TEMPERATURE
+    # defaults to 2.0) and must not be rejected with a 422.
+    max_temperature: float = _env_float("N_ATLAS_MAX_TEMPERATURE", 2.0)
     top_p: float = _env_float("N_ATLAS_TOP_P", 0.9)
     repetition_penalty: float = _env_float("N_ATLAS_REPETITION_PENALTY", 1.10)
 

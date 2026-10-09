@@ -57,7 +57,7 @@ class Config:
     model: str = "n-atlas"        # N_ATLAS_MODEL
     timeout: float = 180.0        # N_ATLAS_TIMEOUT    (seconds)
     max_tokens: int = 512         # N_ATLAS_MAX_TOKENS
-    temperature: float = 0.7      # N_ATLAS_TEMPERATURE
+    temperature: float = 0.1      # N_ATLAS_TEMPERATURE (server default; low by design)
     stream: bool = True           # N_ATLAS_STREAM     (auto-fallback)
 
     # --- language --------------------------------------------------------
@@ -147,7 +147,7 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
         model=_env_str("N_ATLAS_MODEL", "n-atlas"),
         timeout=max(1.0, _env_float("N_ATLAS_TIMEOUT", 180.0)),
         max_tokens=max(1, _env_int("N_ATLAS_MAX_TOKENS", 512)),
-        temperature=_env_float("N_ATLAS_TEMPERATURE", 0.7),
+        temperature=_env_float("N_ATLAS_TEMPERATURE", 0.1),
         stream=_env_bool("N_ATLAS_STREAM", True),
         language=_env_str("N_ATLAS_LANGUAGE", "auto") or "auto",
         max_conversation_messages=max(4, _env_int("N_ATLAS_MAX_CONVERSATION_MESSAGES", 40)),
