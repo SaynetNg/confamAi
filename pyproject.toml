@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confamai-bot"
+version = "1.0.0"
+description = "Confam AI — WhatsApp bot for the N-ATLaS NAFDAC verification API."
+readme = "confamai_bot/README.md"
+requires-python = ">=3.10"
+# Mirrors confamai_bot/requirements.txt (the single source of truth).
+# Keep the two in step when adding a dependency.
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "psycopg[binary]>=3.1",
+]
+
+# Explicit on purpose: the repository root holds several top-level
+# packages (confamai_bot, n_atlas_client, n_atlas_server,
+# nafdac_source, nafdac_scraper, n_atlas_train), and setuptools'
+# auto-discovery refuses to guess between them. Only the bot is
+# installable from here.
+[tool.setuptools]
+packages = ["confamai_bot"]
