@@ -300,6 +300,31 @@ directory the start command runs from. That is the fix for the deploy
 failure `No module named confamai_bot`: the module must be **installed**,
 not merely present beside the working directory.
 
+**Root directory must be empty.** If the service has a Root Directory set
+to anything (commonly `confamai_bot`), the start command runs from inside
+the package and cannot find `confamai_bot` as a package — this produces the
+exact `No module named confamai_bot` error. Clear that setting.
+
+## What to do if you are STILL getting "No module named confamai_bot"
+
+The repository now ships `render.yaml`, which declares the exact build and
+start commands plus the env vars the bot needs. Importing it overwrites a
+manually-typed configuration (which is usually the source of the mismatch).
+
+1. In the Render dashboard, open the service → **Settings** (gear icon).
+2. Click **Sync Infrastructure** and choose **Import from render.yaml**.
+3. When prompted, copy the entire content of `render.yaml` and choose
+   **Replace** to overwrite the existing build/start commands and env vars.
+4. If you prefer, you can also delete this service and create a new one from
+   the repository: on creation Render auto-imports `render.yaml`.
+5. After the config is applied, **trigger a fresh deploy** (Settings →
+   "Deploy" / "Redeploy", not a cached deployment).
+
+If you do not import the file, make sure the dashboard matches the table
+above exactly: build command `pip install -r requirements.txt`, start command
+`python -m confamai_bot --host 0.0.0.0 --port $PORT`, Root Directory empty,
+and the service building from the `main` branch. Then redeploy.
+
 **Environment variables** (set in the Render dashboard, not in a file —
 `.env` is gitignored and real env vars always win over any `.env` on
 disk). Copy the values from `confamai_bot/.env.example`:
