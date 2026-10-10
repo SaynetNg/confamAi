@@ -1,25 +1,43 @@
-# Render's default build command for a Python service is:
+# Confam AI WhatsApp bot — runtime dependencies.
 #
-#     pip install -r requirements.txt
+#     pip install -r confamai_bot/requirements.txt
 #
-# It runs at the repository root, where the dependencies do not live —
-# they are in confamai_bot/requirements.txt. Without this file the
-# default build command fails, so a service created with the defaults
-# never gets past the build step.
+# Deliberately short. This process is a webhook receiver and an HTTP client: it
+# runs no model, holds no greenbook data, and needs no GPU. Everything it knows
+# about product verification arrives over the network from the N-ATLaS server.
 #
-# `-e .` (pyproject.toml at this root) installs the confamai_bot
-# package itself into the virtualenv. That is what makes the start
-# command
+# NOT needed here, unlike n_atlas_server/requirements.txt:
+#   torch, transformers, bitsandbytes, accelerate  — the model runs on Kaggle
+#   pandas, openpyxl                             — the greenbook is the server's
+#   psycopg                                       — only for the supabase session
+#                                                   backend, and even then only
+#                                                   psycopg[binary]
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+
+# Required for WHATSAPP_SESSION_BACKEND=supabase, which is how the bot stores
+# sessions in production. Not optional any more: without it the import fails at
+# first boot rather than at install time, which is the worst place to find out.
 #
-#     python -m confamai_bot --host 0.0.0.0 --port $PORT
+# Installed unconditionally rather than behind an extra requirements file,
+# because a deployment that must not lose conversation history on a restart
+# should not have a working image and a broken one depending on which
+# requirements file someone remembered to build with.
+psycopg[binary]>=3.1
+
+# ---------------------------------------------------------------------------
+# Optional: voice notes (phase 2 of the WhatsApp integration).
 #
-# work regardless of the working directory Render runs it from: the
-# package is importable because it is installed, not because the
-# current directory happens to be the repository root. "No module
-# named confamai_bot" is the failure this prevents.
+# The bot boots and answers text without these. They are needed only when
+# a user sends a voice note, which is downloaded and transcribed with the
+# NCAIR1 models (confamai_bot/audio.py). The import is lazy, so a
+# text-only deployment stays small; a deployment that wants voice runs:
 #
-# The dependency list itself stays in confamai_bot/requirements.txt —
-# the single source of truth — and is mirrored in pyproject.toml for
-# packaging. Keep the two in step when adding a dependency.
--r confamai_bot/requirements.txt
--e .
+#     pip install torch transformers
+#
+# torch is multi-gigabyte and needs a matching CUDA build for GPU
+# transcription, which is why it is not a hard dependency of a process
+# whose job is receiving webhooks.
