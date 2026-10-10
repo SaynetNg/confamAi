@@ -1,0 +1,138 @@
+# Confam AI WhatsApp bot — Render service configuration.
+#
+# Import this into Render (or re-create the service) to apply the exact same
+# build and start commands that the README now references. This prevents the
+# exact error that occurs when the default "root directory" is non-empty or the
+# build command does not install the package.
+#
+# Imported config replaces all dashboard settings — Root Directory, Build
+# command, Start command, and any env vars — for a fresh service.
+#
+# 1. In the Render dashboard, click "Sync Infrastructure" (gear icon) and
+#    select "Import from render.yaml"
+# 2. Copy the entire content of this file when prompted
+# 3. If you have a live service, choose "Replace" to overwrite the existing
+#    build/start commands and env vars with these values.
+#
+# After import, the service will re-deploy. To avoid a prolonged downtime,
+# keep the old config available (e.g., backup the dashboard snapshot) or do
+# the import when you have a maintenance window.
+#
+# If the service was created from a previous render.yaml (none yet), the
+# import will still update the config but not delete the existing .env file,
+# because .env is gitignored and rendered env vars are not tracked.
+#
+# Add `WHATSAPP_SESSION_DSN` and other vars as needed, but the main ones from
+# the README are populated here. Copy-paste to `.env` or set as rendered env
+# vars in the dashboard, which always win over any `.env` on disk.
+#
+# With this config the service will start from the repository root (no Root
+# Directory set), run the default `pip install -r requirements.txt` to
+# install the bot's dependencies and the package itself, and then run the
+# start command. This exactly matches the fix in commit 7340520 that
+# eliminates the "No module named confamai_bot" error.
+#
+# All of these settings are overridden when you create/edit the service
+# manually in the dashboard; using this file ensures reproducibility.
+
+environment:
+  # Service metadata for Render
+  name: "confamai-bot"
+  region: "us-east-1"
+  runtime: "python"
+  pythonVersion: "3.12"
+  buildCommand: "pip install -r requirements.txt"
+  startCommand: "python -m confamai_bot --host 0.0.0.0 --port $PORT"
+
+  # Proxy headers and TLS settings
+  proxy:
+    # Allows the service to read X-Forwarded-* headers
+    trusted-proxy:
+      - "0.0.0.0/0"
+    # Enable this to allow the service to forward these headers
+    forward-headers: true
+
+  # Environment variables (dashboard overrides these when set)
+  env:
+    # WhatsApp Cloud API
+    - key: "WHATSAPP_PHONE_NUMBER_ID"
+      value: "placeholder"
+    - key: "WHATSAPP_ACCESS_TOKEN"
+      value: "placeholder"
+    - key: "WHATSAPP_VERIFY_TOKEN"
+      value: "placeholder"
+    - key: "WHATSAPP_APP_SECRET"
+      value: "placeholder"
+    - key: "WHATSAPP_GRAPH_VERSION"
+      value: "v21.0"
+    - key: "WHATSAPP_WEBHOOK_PATH"
+      value: "/webhook"
+
+    # N-ATLaS server (the verification backend)
+    - key: "N_ATLAS_BASE_URL"
+      value: "placeholder"
+    - key: "N_ATLAS_API_KEY"
+      value: "placeholder"
+    - key: "N_ATLAS_MODEL"
+      value: "n-atlas"
+    - key: "N_ATLAS_TIMEOUT"
+      value: "180"
+    - key: "N_ATLAS_MAX_TOKENS"
+      value: "512"
+    - key: "N_ATLAS_TEMPERATURE"
+      value: "0.7"
+    - key: "N_ATLAS_MAX_RETRIES"
+      value: "2"
+
+    # Throughput (global queue, 3 slots per GPU)
+    - key: "WHATSAPP_MAX_CONCURRENCY"
+      value: "3"
+    - key: "WHATSAPP_PER_USER_TIMEOUT"
+      value: "120"
+
+    # Sessions (sqlite by default, supabase when needed)
+    - key: "WHATSAPP_SESSION_BACKEND"
+      value: "sqlite"
+    - key: "WHATSAPP_SESSION_TTL_HOURS"
+      value: "24"
+    - key: "WHATSAPP_MAX_HISTORY_MESSAGES"
+      value: "12"
+    - key: "WHATSAPP_MAX_HISTORY_TOKENS"
+      value: "2000"
+    - key: "WHATSAPP_MAX_MESSAGE_CHARS"
+      value: "4000"
+    - key: "WHATSAPP_SQLITE_PATH"
+      value: "sessions.db"
+
+    # Behaviour (acknowledgements, framing)
+    - key: "WHATSAPP_SEND_ACK"
+      value: "true"
+    - key: "WHATSAPP_ACK_TEXT"
+      value: ""
+    - key: "WHATSAPP_DEBUG"
+      value: "false"
+    - key: "WHATSAPP_VERIFICATION_FRAME"
+      value: "true"
+    - key: "WHATSAPP_VERIFICATION_FRAME_TEXT"
+      value: ""
+
+    # Optional allowlist (empty = allow everyone)
+    - key: "WHATSAPP_ALLOWED_NUMBERS"
+      value: ""
+
+    # Supabase session backend (if ever used)
+    # - key: "WHATSAPP_SESSION_DSN"
+    #   value: "postgresql://..."
+
+    # Others omitted for brevity; see confamAi/confamai_bot/.env.example for
+    # every available key.
+
+  # Health checks (default is fine)
+  healthCheck:
+    path: "/healthz"
+    interval: 30
+    timeout: 10
+    threshold: 3
+
+  # Scaling (single instance by default)
+  instances: 1
