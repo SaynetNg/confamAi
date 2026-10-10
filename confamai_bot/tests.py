@@ -1205,7 +1205,7 @@ async def amain() -> int:
         print("Confam AI WhatsApp bot — offline test suite")
         print("=" * 72)
 
-        test_config()
+        await test_config()
         test_render()
         test_languages()
         test_parsing()

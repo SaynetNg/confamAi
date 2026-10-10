@@ -282,3 +282,40 @@ have shipped:
 | `assay.py` | the live question battery |
 | `tests.py` | the offline suite |
 | `config.py` | configuration, with `describe()` that never prints a secret |
+
+## 11. Deploying on Render
+
+The service is a plain Python web service. Settings:
+
+| Setting | Value |
+|---|---|
+| **Root Directory** | **leave empty** (the repository root) |
+| **Build command** | `pip install -r requirements.txt` (the default) |
+| **Start command** | `python -m confamai_bot --host 0.0.0.0 --port $PORT` |
+
+The root `requirements.txt` installs `confamai_bot/requirements.txt` and
+then the package itself (`pip install -e .` via the root `pyproject.toml`),
+so `confamai_bot` is importable from the virtualenv no matter which
+directory the start command runs from. That is the fix for the deploy
+failure `No module named confamai_bot`: the module must be **installed**,
+not merely present beside the working directory.
+
+**Environment variables** (set in the Render dashboard, not in a file —
+`.env` is gitignored and real env vars always win over any `.env` on
+disk). Copy the values from `confamai_bot/.env.example`:
+
+- `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN` (System User
+  **permanent** token), `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`
+- `N_ATLAS_BASE_URL` (`https://ai.saynet.ng/v1`), `N_ATLAS_API_KEY`
+- `WHATSAPP_SESSION_BACKEND` and, for `supabase`, `WHATSAPP_SESSION_DSN`
+  (session pooler, `:5432`, password percent-encoded)
+
+The bot **refuses to start** (exit code 2, naming every missing variable)
+without the WhatsApp and N-ATLaS variables, so a deploy with an empty
+dashboard fails fast instead of serving silently. With the default
+`sqlite` session backend one instance is fine; use `supabase` if the
+service ever scales past one instance or the disk is ephemeral.
+
+After pushing, redeploy from the Render dashboard and check
+`https://<service>.onrender.com/healthz` — `"bot": "up"` with
+`"natlas": "ready"` means the whole chain works.
