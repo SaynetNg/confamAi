@@ -20,6 +20,14 @@ MOCK_STATE: Dict[str, Any] = {
     "force_error": False,
     "calls": 0,
     "last_prompt_text": "",
+    # Voice: set by verify_offline.py to simulate a first-load failure, and
+    # read by the fake ASR pipeline below.
+    "force_transcribe_error": False,
+    "force_long_form": False,
+    "transcribe_calls": 0,
+    "last_audio_bytes": 0,
+    "last_transcribe_language": "",
+    "last_chunk_length_s": 0,
 }
 
 PAD_ID = 0
@@ -258,4 +266,89 @@ def install() -> MockTokenizer:
         fake_model_from_pretrained
     )
 
+    # Cell 1 calls huggingface_hub.login(token=HF_TOKEN), which validates the
+    # token against huggingface.co/whoami. The offline suite runs with a dummy
+    # token and no network, so the call is stubbed to a no-op. This only affects
+    # the verifier: mock_backend is never imported by the notebook on Kaggle.
+    try:
+        import huggingface_hub
+
+        huggingface_hub.login = lambda *a, **k: None
+    except Exception:  # noqa: BLE001 - absence just means Cell 1 will fail loudly
+        pass
+
     return tokenizer
+
+
+class MockASR:
+    """A deterministic stand-in for one NCAIR1 ASR pipeline.
+
+    Cell 6 builds one pipeline per language on first use. The offline suite
+    injects a factory returning this in place of the notebook's `_voice_pipeline`
+    (see verify_offline.py), which is the same seam verify_nafdac.py uses for the
+    intent extractor — it avoids the lazy `from transformers import pipeline`
+    import entirely. Records enough to prove the route passes the clip and the
+    language through, and returns a fixed transcript so no real model or ffmpeg
+    is needed. `force_transcribe_error` simulates a corrupt clip.
+    """
+
+    def __init__(self, language: str = "en") -> None:
+        self.language = language
+
+    def __call__(self, audio, **kwargs):
+        if MOCK_STATE["force_transcribe_error"]:
+            raise ValueError("mock: could not decode the audio")
+        # Mirror the real pipeline's contract: it accepts raw bytes, a path or a
+        # numpy array, but NOT a file object. Rejecting BytesIO here is what
+        # stops the mock from hiding a `asr(BytesIO(...))` bug in Cell 6.
+        if isinstance(audio, (bytes, bytearray)):
+            data = bytes(audio)
+        elif hasattr(audio, "read") and not isinstance(audio, (str, bytes, bytearray)):
+            raise TypeError(
+                "We expect a numpy ndarray or torch tensor as input, got "
+                f"`{type(audio)}`"
+            )
+        else:
+            data = audio
+        # Mirror Whisper's long-form behaviour: a single pass over >30 s audio
+        # raises and demands chunked generation, which the engine then retries
+        # with chunk_length_s. The mock raises on the first (unchunked) call when
+        # force_long_form is set, and succeeds once chunk_length_s arrives.
+        if MOCK_STATE["force_long_form"] and not kwargs.get("chunk_length_s"):
+            raise ValueError(
+                "You have passed more than 3000 mel input features (> 30 seconds) "
+                "which automatically enables long-form generation which requires "
+                "the model to predict timestamp tokens."
+            )
+        MOCK_STATE["transcribe_calls"] += 1
+        MOCK_STATE["last_audio_bytes"] = len(data or b"")
+        MOCK_STATE["last_transcribe_language"] = self.language
+        MOCK_STATE["last_chunk_length_s"] = kwargs.get("chunk_length_s") or 0
+        return {"text": f"mock transcript ({self.language})"}
+
+
+# The four gated NCAIR1 ASR repos, mapped to the language code Cell 4 loads them
+# under. install_voice() uses this to hand back the right MockASR.
+_VOICE_CODE_BY_MODEL_ID = {
+    "NCAIR1/NigerianAccentedEnglish": "en",
+    "NCAIR1/Hausa-ASR": "ha",
+    "NCAIR1/Yoruba-ASR": "yo",
+    "NCAIR1/Igbo-ASR": "ig",
+}
+
+
+def voice_asr_factory():
+    """Return a factory matching the notebook's VOICE_ASR_FACTORY signature.
+
+    verify_offline.py assigns this to the notebook global VOICE_ASR_FACTORY
+    before Cells 1-18 run, so Cell 4's eager preload builds MockASR pipelines
+    instead of downloading the four gated NCAIR1 models. Injecting the notebook
+    global is the seam the repo already uses for the NAFDAC hooks; patching
+    transformers.pipeline does not work because transformers is a lazy module
+    that restores tampered top-level attributes.
+    """
+
+    def factory(model_id: str, device_index: int, token) -> MockASR:
+        return MockASR(_VOICE_CODE_BY_MODEL_ID.get(model_id, "en"))
+
+    return factory

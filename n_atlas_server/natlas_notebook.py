@@ -320,6 +320,25 @@ class Settings:
     generation_timeout: float = _env_float("N_ATLAS_GENERATION_TIMEOUT", 300.0)
     log_content: bool = _env_flag("N_ATLAS_LOG_CONTENT", False)
     language_tagging: bool = False
+
+    # Voice: the browser mic at confamai.saynet.ng/ai.html records audio and
+    # POSTs it to /v1/audio/transcriptions. The route needs python-multipart to
+    # parse multipart/form-data (Cell 3 installs it), and the NCAIR1 ASR models
+    # to transcribe. Cell 6 loads them lazily on the first note; the chat engine
+    # is never affected when voice is switched off.
+    voice_enabled: bool = _env_flag("N_ATLAS_VOICE_ENABLED", True)
+    # "cuda" by default: the NCAIR1 ASR models are small (Whisper-small, ~1 GB in
+    # fp16) and a 70-second clip takes ~200 s on CPU but only a few seconds on the
+    # T4, which matters because the Cloudflare tunnel cancels a request that
+    # outstays its limit. Voice falls back to CPU automatically when no GPU is
+    # present, so a laptop dev run still works. Set N_ATLAS_VOICE_DEVICE=cpu to
+    # keep the T4's VRAM entirely for the chat model.
+    voice_device: str = os.environ.get("N_ATLAS_VOICE_DEVICE", "cuda").strip().lower() or "cuda"
+    # A recorded clip, as raw multipart, is far larger than a chat body. The
+    # browser refuses anything over 10 MB, so this is the cap that applies to
+    # /v1/audio/transcriptions instead of max_request_bytes.
+    voice_max_bytes: int = _env_int("N_ATLAS_VOICE_MAX_BYTES", 10 * 1024 * 1024)
+
     strict_gpu: bool = _env_flag("N_ATLAS_STRICT_GPU", True)
     auto_install: bool = _env_flag("N_ATLAS_AUTO_INSTALL", True)
     allow_ephemeral_key: bool = _env_flag("N_ATLAS_ALLOW_EPHEMERAL_KEY", True)
@@ -341,6 +360,9 @@ class Settings:
             "max_messages": self.max_messages,
             "log_content": self.log_content,
             "system_prompt_source": self.system_prompt_source,
+            "voice_enabled": self.voice_enabled,
+            "voice_device": self.voice_device,
+            "voice_max_bytes": self.voice_max_bytes,
         }
 
 
@@ -590,6 +612,7 @@ print(f"API key source:    {CONFIG.api_key_source}")
 print(f"System prompt:     {CONFIG.system_prompt_source}")
 print(f"Context budget:    {CONFIG.context_budget} tokens")
 print(f"Max new tokens:    {CONFIG.max_new_tokens}")
+print(f"Voice input:       {'on (' + CONFIG.voice_device + ')' if CONFIG.voice_enabled else 'off'}")
 print("=" * 70)
 
 if not GPU["torch_available"]:
@@ -642,6 +665,13 @@ ADAPTER_DEPS = {
     "peft": "peft",
 }
 
+# Only needed when voice is enabled, so a text-only deployment stays exactly as
+# it was. FastAPI refuses to define a File/Form route without this, which would
+# otherwise take the whole server down at Cell 10 rather than only voice.
+VOICE_DEPS = {
+    "multipart": "python-multipart",
+}
+
 
 def _missing_deps(deps: Dict[str, str]) -> List[Tuple[str, str]]:
     import importlib.util
@@ -692,6 +722,9 @@ if os.environ.get("NAFDAC_DATABASE_URL", "").strip():
 
 if CONFIG.adapter_id:
     ensure_dependencies(ADAPTER_DEPS, "QLoRA adapter")
+
+if CONFIG.voice_enabled:
+    ensure_dependencies(VOICE_DEPS, "voice transcription")
 
 import fastapi
 import pydantic
@@ -812,6 +845,262 @@ print("-" * 70)
 print("chat template probe (repr, first 400 chars):")
 print(repr(_probe)[:400])
 print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# Voice transcription engine — the NCAIR1 speech-to-text models
+# ---------------------------------------------------------------------------
+# The Confam browser chat (confamweb/js/ai-chat.js) records audio with
+# MediaRecorder and POSTs it to /v1/audio/transcriptions. Cell 10 owns that
+# route; this is the model it calls. One NCAIR1 ASR pipeline per language.
+#
+# All four are loaded here, in Cell 4, not lazily on the first note: the models
+# are needed for language transcription and a first request must not pay the
+# download-and-load cost (measured at ~2 minutes cold), so the server boots with
+# speech-to-text ready for any language. Cell 3 has already installed
+# python-multipart (the route cannot be defined without it) and Cell 4 runs
+# before the server starts in Cell 11, so a preload failure is visible at boot,
+# not on a user's first voice message.
+#
+# The four model ids match the language codes the server already speaks:
+# en/ha/yo/ig. Nigerian Pidgin is reported as "en" by the language detector, so
+# it is transcribed with the Nigerian-accented English model, which is exactly
+# right for it.
+VOICE_MODELS = {
+    "en": "NCAIR1/NigerianAccentedEnglish",
+    "ha": "NCAIR1/Hausa-ASR",
+    "yo": "NCAIR1/Yoruba-ASR",
+    "ig": "NCAIR1/Igbo-ASR",
+}
+
+VOICE_PIPELINES: Dict[str, Any] = {}
+VOICE_LOAD_ERRORS: Dict[str, str] = {}
+VOICE_LOAD_SECONDS: Dict[str, float] = {}
+VOICE_LOAD_LOCK = threading.Lock()
+
+
+def _voice_device() -> str:
+    """Where to run ASR.
+
+    Defaults to "cuda": the four NCAIR1 models are small and the T4 does a
+    70-second clip in seconds where CPU takes ~200 s, which is the difference
+    between a voice note being answered and the tunnel timing it out. Falls back
+    to CPU when no GPU is present, so N_ATLAS_VOICE_DEVICE=cuda is safe on a
+    laptop too. Set N_ATLAS_VOICE_DEVICE=cpu to leave the T4's VRAM entirely to
+    the chat model.
+    """
+    requested = CONFIG.voice_device
+    if requested.startswith("cuda") and not GPU.get("cuda_available"):
+        logger.warning("N_ATLAS_VOICE_DEVICE=%s but no CUDA device; using CPU", requested)
+        return "cpu"
+    return requested
+
+
+def _default_voice_asr_factory(model_id: str, device_index: int, token):
+    """Build a real transformers ASR pipeline. The production factory.
+
+    Overridable through VOICE_ASR_FACTORY so verify_offline.py can substitute a
+    test double. It is a hook rather than a patch of `transformers.pipeline`
+    because transformers is a lazy module that restores tampered top-level
+    attributes, so monkey-patching the factory does not stick.
+
+    On GPU the model is loaded in float16. The pipelines are preloaded and then
+    kept for the life of the process, so fp16 halves their VRAM (four models cost
+    ~4 GB instead of ~8 GB in fp32) and lets the 4-bit N-ATLaS weights keep the
+    rest of the T4 — the difference between voice and chat coexisting on one card
+    and one of them OOMing.
+    """
+    import transformers
+
+    pipeline_kwargs = {"device": device_index}
+    if device_index >= 0:
+        pipeline_kwargs["torch_dtype"] = torch.float16
+
+    try:
+        return transformers.pipeline(
+            "automatic-speech-recognition",
+            model=model_id,
+            token=token,
+            **pipeline_kwargs,
+        )
+    except TypeError:
+        # Older transformers accepts neither `token=` nor `torch_dtype=` here.
+        try:
+            return transformers.pipeline(
+                "automatic-speech-recognition", model=model_id, **pipeline_kwargs
+            )
+        except TypeError:
+            return transformers.pipeline(
+                "automatic-speech-recognition", model=model_id, device=device_index
+            )
+
+
+# Pre-seeded by verify_offline.py before Cells 1-18 run to force a test double;
+# otherwise the real factory above is used.
+if "VOICE_ASR_FACTORY" not in globals():
+    VOICE_ASR_FACTORY = _default_voice_asr_factory
+
+
+def _load_voice_model(code: str):
+    """Build and cache the ASR pipeline for one language. Idempotent.
+
+    Raises ModelUnavailable when the model cannot be built, so both the preload
+    below and the route map a failure to a clean 503 rather than a traceback.
+    """
+    if not CONFIG.voice_enabled:
+        return None
+    if code not in VOICE_MODELS:
+        code = "en"
+    if code in VOICE_PIPELINES:
+        return VOICE_PIPELINES[code]
+    if code in VOICE_LOAD_ERRORS:
+        raise ModelUnavailable(
+            f"the {code} speech-to-text model could not be loaded",
+            log_detail=VOICE_LOAD_ERRORS[code],
+        )
+
+    with VOICE_LOAD_LOCK:
+        if code in VOICE_PIPELINES:
+            return VOICE_PIPELINES[code]
+
+        device = _voice_device()
+        # transformers wants a device index: -1 is CPU, 0 is the first GPU.
+        device_index = 0 if device.startswith("cuda") else -1
+        model_id = VOICE_MODELS[code]
+        logger.info("loading NCAIR1 %s ASR model %s on %s", code, model_id, device)
+
+        started = time.perf_counter()
+        try:
+            VOICE_PIPELINES[code] = VOICE_ASR_FACTORY(
+                model_id, device_index, os.environ.get("HF_TOKEN") or None
+            )
+            VOICE_LOAD_ERRORS.pop(code, None)
+            VOICE_LOAD_SECONDS[code] = round(time.perf_counter() - started, 1)
+            return VOICE_PIPELINES[code]
+        except Exception as exc:  # noqa: BLE001 - reported, never leaked
+            VOICE_LOAD_ERRORS[code] = repr(exc)
+            logger.error("could not load the %s ASR model: %r", code, exc)
+            raise ModelUnavailable(
+                f"the {code} speech-to-text model could not be loaded",
+                log_detail=repr(exc),
+            ) from exc
+
+
+def transcribe_audio(audio_bytes: bytes, language: str = "auto") -> str:
+    """Transcribe one audio clip. The single entry point the route calls.
+
+    `audio_bytes` is whatever the browser recorded — webm/opus, ogg/opus, wav
+    or mp3. The ASR pipeline decodes it with ffmpeg, so the container does not
+    have to be declared. `language` is an en/ha/yo/ig code, or "auto" to try
+    each model in turn and keep the longest result.
+    """
+    if not CONFIG.voice_enabled:
+        raise ModelUnavailable("voice transcription is disabled on this server.")
+    if not audio_bytes:
+        raise InvalidRequest("The audio file is empty.")
+
+    requested = (language or "auto").strip().lower()
+    if requested not in VOICE_MODELS:
+        requested = "auto"
+
+    if requested != "auto":
+        return _run_voice_pipeline(_load_voice_model(requested), audio_bytes, requested)
+
+    # Auto: run every model that loads and keep the longest transcript. The
+    # transcriptions are not language-tagged, so transcribing a Yoruba clip with
+    # the English model still returns *something*, and that noise is always
+    # shorter than the correct model's output.
+    best_text = ""
+    best_code = ""
+    errors: List[str] = []
+    for code in ("en", "ha", "yo", "ig"):
+        try:
+            text = _run_voice_pipeline(_load_voice_model(code), audio_bytes, code)
+        except ModelUnavailable as exc:
+            errors.append(f"{code}: {exc.log_detail}")
+            continue
+        if len(text) > len(best_text):
+            best_text = text
+            best_code = code
+    if not best_text and errors:
+        raise ModelUnavailable(
+            "no speech-to-text model could be loaded",
+            log_detail="; ".join(errors)[:400],
+        )
+    if best_code:
+        logger.info("voice auto: chose %s (%d chars)", best_code, len(best_text))
+    return best_text
+
+
+def _run_voice_pipeline(asr, audio_bytes: bytes, code: str) -> str:
+    """Run one already-loaded pipeline over a clip. Raises InvalidRequest on a
+    clip that cannot be decoded, so the route answers 400 rather than 500."""
+    if asr is None:
+        raise ModelUnavailable("voice transcription is disabled on this server.")
+
+    # The pipeline decodes raw `bytes` itself (it writes them to an ffmpeg
+    # subprocess), and also accepts a path or a numpy array. It does NOT accept a
+    # file object: passing io.BytesIO raises "We expect a numpy ndarray or torch
+    # tensor". Hand it the bytes.
+    try:
+        result = asr(audio_bytes)
+    except Exception as exc:  # noqa: BLE001
+        # The NCAIR1 models are Whisper. A clip longer than 30 seconds (>3000 mel
+        # frames) makes Whisper refuse a single-pass decode and demand long-form
+        # generation, which needs chunking plus timestamps. A WhatsApp voice note
+        # is routinely longer than that, so fall back rather than fail.
+        logger.info(
+            "voice %s: single-pass decode failed (%r); retrying with long-form chunking",
+            code,
+            exc,
+        )
+        try:
+            result = asr(audio_bytes, chunk_length_s=30, return_timestamps=True)
+        except Exception as exc2:  # noqa: BLE001
+            logger.warning("voice %s transcription failed: %r", code, exc2)
+            raise InvalidRequest(
+                "The audio could not be transcribed. Send a webm, ogg, wav or mp3 clip."
+            ) from exc2
+
+    if isinstance(result, dict):
+        return str(result.get("text") or "").strip()
+    if isinstance(result, list) and result:
+        first = result[0]
+        if isinstance(first, dict):
+            return str(first.get("text") or "").strip()
+    return str(result or "").strip()
+
+
+def preload_voice_models() -> None:
+    """Load every ASR model now, so the first voice request is served warm.
+
+    A model that fails to load is recorded in VOICE_LOAD_ERRORS and does not
+    stop the others or the server: a language whose repo the token cannot reach
+    is reported on /health and refused with a 503, while the rest keep working.
+    """
+    if not CONFIG.voice_enabled:
+        print("Voice input:       off")
+        return
+    print("=" * 70)
+    print("VOICE MODELS — %d NCAIR1 speech-to-text pipelines" % len(VOICE_MODELS))
+    print("=" * 70)
+    for code in ("en", "ha", "yo", "ig"):
+        try:
+            _load_voice_model(code)
+            print(f"  {code}: {VOICE_MODELS[code]}  ready in {VOICE_LOAD_SECONDS.get(code)}s")
+        except ModelUnavailable as exc:
+            print(f"  {code}: {VOICE_MODELS[code]}  FAILED — {exc.log_detail[:160]}")
+    ready = sorted(VOICE_PIPELINES)
+    failed = sorted(VOICE_LOAD_ERRORS)
+    print("-" * 70)
+    print(f"voice ready: {ready or 'none'}  |  failed: {failed or 'none'}")
+    print("=" * 70)
+
+
+if CONFIG.voice_enabled:
+    preload_voice_models()
+else:
+    print("Voice input:       off (N_ATLAS_VOICE_ENABLED=0; ASR models not loaded)")
 
 # %% [code]
 # =============================================================================
@@ -2072,7 +2361,7 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
 import hmac
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, Request, status
+from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -2186,10 +2475,14 @@ SERVER_START_TIME = time.time()
 async def guard_request(request: Request, call_next):
     request_id = get_request_id(request)
     started = time.perf_counter()
+    # Audio uploads are legitimately larger than a chat body, so the audio route
+    # gets its own, higher cap rather than being refused by the chat limit.
+    is_audio_upload = request.url.path.rstrip("/").endswith("/v1/audio/transcriptions")
+    max_bytes = CONFIG.voice_max_bytes if is_audio_upload else CONFIG.max_request_bytes
     content_length = request.headers.get("content-length")
     if content_length:
         try:
-            if int(content_length) > CONFIG.max_request_bytes:
+            if int(content_length) > max_bytes:
                 return JSONResponse(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     content={
@@ -2197,7 +2490,7 @@ async def guard_request(request: Request, call_next):
                             "type": "request_too_large",
                             "message": (
                                 "Request body exceeds "
-                                f"{CONFIG.max_request_bytes} bytes."
+                                f"{max_bytes} bytes."
                             ),
                             "param": None,
                             "code": "request_too_large",
@@ -2367,6 +2660,17 @@ def health():
         # N_ATLAS_STREAM=true, so every message used to cost a wasted round trip
         # and a 400 before falling back. It now reads this and does not ask.
         "streaming": STREAMING_SUPPORTED,
+        # Advertised for the same reason as `streaming`: the browser mic on
+        # ai.html can read this before it records, and a deployment with voice
+        # switched off is then honestly reported instead of failing on upload.
+        "voice": {
+            "enabled": CONFIG.voice_enabled,
+            "endpoint": "/v1/audio/transcriptions",
+            # The resolved device, not the configured one: a cuda default on a
+            # host with no GPU reports "cpu" here, which is what actually runs.
+            "device": _voice_device() if CONFIG.voice_enabled else CONFIG.voice_device,
+            "languages": sorted(VOICE_MODELS) if CONFIG.voice_enabled else [],
+        },
         "nafdac": (
             NAFDAC_HOOKS["status"]()
             if callable(NAFDAC_HOOKS["status"])
@@ -2439,6 +2743,51 @@ def list_models():
             }
         ],
     }
+
+
+@app.post("/v1/audio/transcriptions", dependencies=[Depends(verify_api_key)])
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(default=""),
+    language: str = Form(default="auto"),
+):
+    """Transcribe one recorded clip. Backs the browser mic on ai.html.
+
+    OpenAI-compatible shape: multipart `file` plus optional `model` and
+    `language` fields, answering `{"text": "..."}`. The site records with
+    MediaRecorder (webm/opus) or uploads a voice note (ogg/opus); both decode
+    through the ASR pipeline, so the container is not constrained here.
+
+    `language` is an en/ha/yo/ig code, or "auto". The browser sends the
+    language selected in the UI, so auto only runs for Pidgin (which it reports
+    as `en`) or an unrecognised code.
+    """
+    if not CONFIG.voice_enabled:
+        raise ModelUnavailable("voice transcription is disabled on this server.")
+
+    audio_bytes = await file.read()
+    await file.close()
+    if not audio_bytes:
+        raise InvalidRequest("The audio file is empty.")
+    if len(audio_bytes) > CONFIG.voice_max_bytes:
+        raise InvalidRequest(
+            "The audio file is too large. Record a shorter clip."
+        )
+
+    requested = (language or "auto").strip().lower()
+    if requested not in VOICE_MODELS and requested != "auto":
+        requested = "auto"
+
+    started = time.perf_counter()
+    text = transcribe_audio(audio_bytes, requested)
+    logger.info(
+        "audio/transcriptions bytes=%d language=%s chars=%d seconds=%.2f",
+        len(audio_bytes),
+        requested,
+        len(text),
+        time.perf_counter() - started,
+    )
+    return {"text": text}
 
 
 # Server-sent events are not implemented: /v1/chat/completions answers a

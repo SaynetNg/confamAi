@@ -1,11 +1,25 @@
-"""The FastAPI app: one GET, one POST, one health endpoint.
+"""The FastAPI app: one GET, one POST, and two health endpoints.
 
-Three routes and nothing else. This is deliberately the thinnest possible
-surface, because everything interesting is a liability on a public endpoint:
+This is deliberately the thinnest possible surface, because everything
+interesting is a liability on a public endpoint:
 
     GET  {webhook_path}    Meta's subscription handshake
     POST {webhook_path}    inbound messages
-    GET  /healthz          for the operator, never for Meta
+    GET  /healthz          liveness — always 200, never touches upstream
+    GET  /readyz           readiness — live N-ATLaS probe, 200 or 503
+
+`/healthz` (aliased as `/health`) is the one Render's health check and any
+keep-alive pinger should hit. It answers instantly, from memory, and is 200
+whenever the process is up. It deliberately does not call N-ATLaS: the bot
+must stay alive and accepting the handshake even when the GPU server behind
+it is down or still loading, and a health check that blocks on an upstream
+with a 180-second timeout is a health check that gets the service restarted.
+The last-known N-ATLaS state is still reported, from the startup probe.
+
+`/readyz` carries the old behaviour — a real N-ATLaS round trip, 503 while
+the model or the greenbook is not ready — for an operator or a monitor that
+wants to know whether *answers* are possible, as opposed to whether the
+service is *running*.
 
 Two things are load-bearing here.
 
@@ -74,6 +88,7 @@ class State:
         self.sweeper = Sweeper(self.store, cfg)
         self.ready = False
         self.readiness = "starting"
+        self._probe: asyncio.Task | None = None
 
     async def startup(self) -> None:
         await self.natlas.start()
@@ -81,16 +96,39 @@ class State:
         await self.store.setup()
         self.sweeper.start()
 
-        # Probe the server once at boot. This does not gate startup: the bot
-        # must come up and accept the handshake even when N-ATLaS is down, so
-        # that /healthz can report why instead of the connection failing
-        # invisibly at Meta's end.
+        # Probe the server once at boot, but do NOT block startup on it. The
+        # bot must bind and answer /healthz within milliseconds even when
+        # N-ATLaS is down or still loading the model. Awaiting here would hold
+        # the port closed for up to a connect timeout, during which Render's
+        # health check and any keep-alive pinger see a dead service — and a
+        # slow deploy can be failed outright.
+        self._probe = asyncio.create_task(self._probe_ready())
+
+    async def _probe_ready(self) -> None:
         can_verify, reason = await self.natlas.verify_ready()
         self.ready = can_verify
         self.readiness = reason
+        if can_verify:
+            print("[bot] N-ATLaS: %s" % reason, flush=True)
+        else:
+            # Loud on purpose. A server that answers from memory instead of the
+            # greenbook is the failure that damages trust fastest, so it is
+            # named at boot rather than discovered by a customer.
+            print(
+                "[bot] N-ATLaS NOT READY: %s — replies will say verification is "
+                "temporarily unavailable" % reason,
+                flush=True,
+            )
 
     async def shutdown(self) -> None:
         await self.sweeper.stop()
+        probe = self._probe
+        if probe is not None and not probe.done():
+            probe.cancel()
+            try:
+                await probe
+            except asyncio.CancelledError:
+                pass
         await self.natlas.aclose()
         await self.whatsapp.aclose()
         await self.store.close()
@@ -116,17 +154,10 @@ def create_app(cfg: Config | None = None, env_file: str | None = None) -> FastAP
         print("[bot] webhook path: %s" % config.webhook_path, flush=True)
         print("[bot] signature check: %s"
               % ("ON" if config.app_secret else "OFF (no app secret)"), flush=True)
-        if state.ready:
-            print("[bot] N-ATLaS: %s" % state.readiness, flush=True)
-        else:
-            # Loud on purpose. A server that answers from memory instead of the
-            # greenbook is the failure that damages trust fastest, so it is
-            # named at boot rather than discovered by a customer.
-            print(
-                "[bot] N-ATLaS NOT READY: %s — replies will say verification is "
-                "temporarily unavailable" % state.readiness,
-                flush=True,
-            )
+        # N-ATLaS readiness is probed in the background (state._probe_ready) and
+        # announced there, because blocking here would keep the port closed.
+        print("[bot] N-ATLaS: probing in background; see /readyz for a live "
+              "answer", flush=True)
         try:
             yield
         finally:
@@ -196,8 +227,32 @@ def create_app(cfg: Config | None = None, env_file: str | None = None) -> FastAP
 
     # -- health ---------------------------------------------------------
     @app.get("/healthz")
+    @app.get("/health")
     async def healthz():
+        """Liveness. Always 200 while the process is up.
+
+        Never calls N-ATLaS. A keep-alive pinger and Render's health check
+        both use this, and either one blocking on a 180-second upstream
+        timeout would be worse than useless. The `natlas` field is the
+        last-known state from the startup probe; hit `/readyz` for a live one.
+        """
+        return JSONResponse(
+            {
+                "bot": "up",
+                "natlas": "ready" if state.ready else "not-ready",
+                "reason": state.readiness,
+                "config": config.describe(),
+                **state.router.snapshot(),
+            },
+            status_code=200,
+        )
+
+    @app.get("/readyz")
+    async def readyz():
+        """Readiness. A live probe, so it can be slow — and can say 503."""
         can_verify, reason = await state.natlas.verify_ready()
+        state.ready = can_verify
+        state.readiness = reason
         return JSONResponse(
             {
                 "bot": "up",
@@ -216,6 +271,7 @@ def create_app(cfg: Config | None = None, env_file: str | None = None) -> FastAP
                 "service": "confamai-bot",
                 "webhook": config.webhook_path,
                 "health": "/healthz",
+                "ready": "/readyz",
             }
         )
 

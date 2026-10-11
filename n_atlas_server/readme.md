@@ -239,6 +239,9 @@ with `python build_kaggle_dataset.py`, re-upload it, and re-run the cells.
 | `N_ATLAS_LOG_CONTENT` | `0` | `1` logs message text (off by default). |
 | `N_ATLAS_LANGUAGE_TAGGING` | `1` | `0` disables the deterministic language directive. |
 | `N_ATLAS_STRICT_GPU` | `1` | `0` permits CPU (dev only). |
+| `N_ATLAS_VOICE_ENABLED` | `1` | `0` removes `/v1/audio/transcriptions`, skips the ASR models and `python-multipart`, and leaves chat untouched. |
+| `N_ATLAS_VOICE_DEVICE` | `cuda` | Where the NCAIR1 ASR models run. On GPU they load in **fp16** to halve their VRAM. Falls back to CPU automatically when no GPU is present; set `cpu` to keep the T4 entirely for chat. |
+| `N_ATLAS_VOICE_MAX_BYTES` | `10485760` | Upload cap for `/v1/audio/transcriptions` (10 MB, matching the browser's own limit). The chat cap `N_ATLAS_MAX_REQUEST_BYTES` is unaffected. |
 | `N_ATLAS_HOST` / `N_ATLAS_PORT` | `0.0.0.0` / `8000` | Bind address. |
 
 `PYTORCH_ALLOC_CONF` is set to `expandable_segments:True` in Cell 2 before CUDA
@@ -382,14 +385,52 @@ print(reply.choices[0].message.content)
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status. |
+| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status, voice. |
 | `GET /v1/models` | bearer | OpenAI-compatible model list. |
 | `POST /v1/chat/completions` | bearer | Chat completion. Full message history. |
+| `POST /v1/audio/transcriptions` | bearer | Transcribe one recorded clip (multipart). Backs the browser mic. |
 | `POST /v1/nafdac/verify` | bearer | Check one NAFDAC number against the greenbook. |
 | `POST /v1/nafdac/search` | bearer | Free-text product search. |
 | `GET /v1/nafdac/sources` | bearer | Which greenbook sources are reachable. |
 
 Streaming (`stream=true`) is **not** supported and returns `400`.
+
+### Voice transcription (Cell 10, engine in Cell 6)
+
+`POST /v1/audio/transcriptions` is what the microphone on
+`confamai.saynet.ng/ai.html` uploads to. It is deliberately
+OpenAI-compatible, so the browser's existing `js/ai-chat.js` recorder needs no
+change:
+
+```bash
+curl -X POST https://YOUR-TUNNEL/v1/audio/transcriptions \
+  -H "Authorization: Bearer $N_ATLAS_API_KEY" \
+  -F "file=@clip.webm" -F "language=ha"
+# -> {"text": "..."}
+```
+
+- **Input** — multipart `file` (webm/opus, ogg/opus, wav or mp3), plus optional
+  `model` and `language` (`en`/`ha`/`yo`/`ig` or `auto`, the default). The ASR
+  pipeline decodes the container with ffmpeg, so the browser does not have to
+  declare it.
+- **Models** — one NCAIR1 ASR pipeline per language (`NigerianAccentedEnglish`,
+  `Hausa-ASR`, `Yoruba-ASR`, `Igbo-ASR`), loaded on the first clip and kept for
+  the life of the process. `auto` runs the four and keeps the longest
+  transcript.
+- **Where it runs** — the GPU by default (`N_ATLAS_VOICE_DEVICE=cuda`), in fp16,
+  so a 70-second clip takes seconds instead of ~200 s on CPU. Falls back to CPU
+  automatically when no GPU is present; set it back to `cpu` to keep the T4's
+  VRAM entirely for the chat model.
+- **Failure mapping** — an empty body or a clip over `N_ATLAS_VOICE_MAX_BYTES`
+  is a `400`; an undecodable clip is a `400`; a model that cannot load is a
+  `503`. Voice never affects the chat path: with `N_ATLAS_VOICE_ENABLED=0` the
+  route is absent, the models are never loaded, and chat is unchanged.
+
+`python-multipart` is required for the route to exist at all — FastAPI refuses
+to define a `File`/`Form` endpoint without it. Cell 3 installs it when voice is
+enabled, and calling `ensure_dependencies` before Cell 10 is what stops a
+missing package from taking the whole server down at import rather than only
+disabling voice.
 
 ### NAFDAC verification (Cell 18)
 

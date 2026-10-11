@@ -102,7 +102,7 @@ N_ATLAS_PORT=9000 N_ATLAS_API_KEY='…' python apiserver.py
 
 ## Dependencies
 
-`requirements.txt` lists everything: model runtime (`transformers>=5.0.0`, `accelerate>=1.0.0`, `safetensors>=0.4.3`, `huggingface-hub>=0.30.0`, `tokenizers>=0.21.0`, `bitsandbytes>=0.46.0`, `numpy>=1.26.0`), web server (`fastapi>=0.115.0`, `uvicorn[standard]>=0.30.0`, `pydantic>=2.9.0`, `requests>=2.32.0`, `nest-asyncio>=1.6.0`), and test tooling (`openai>=1.50.0`, `httpx>=0.27.0`, `nbformat>=5.10.0`). Three caveats:
+`requirements.txt` lists everything: model runtime (`transformers>=5.0.0`, `accelerate>=1.0.0`, `safetensors>=0.4.3`, `huggingface-hub>=0.30.0`, `tokenizers>=0.21.0`, `bitsandbytes>=0.46.0`, `numpy>=1.26.0`), web server (`fastapi>=0.115.0`, `uvicorn[standard]>=0.30.0`, `pydantic>=2.9.0`, `requests>=2.32.0`, `nest-asyncio>=1.6.0`, `python-multipart>=0.0.9` for the voice upload), and test tooling (`openai>=1.50.0`, `httpx>=0.27.0`, `nbformat>=5.10.0`). Three caveats:
 
 - **`torch` is deliberately not listed.** It must match your CUDA build. Kaggle already ships `torch 2.10.0+cu128` for the T4; reinstalling it is the most common way to break the notebook. Install with `pip install torch --index-url https://download.pytorch.org/whl/cu128`.
 - **`kaggle_secrets` is not on PyPI.** Kaggle injects it into the image.
@@ -151,6 +151,9 @@ Cell 3 only pip-installs what is genuinely missing, in two groups: **server** (`
 | `N_ATLAS_LANGUAGE_TAGGING` | `1` | `0` disables the deterministic language directive. |
 | `N_ATLAS_STRICT_GPU` | `1` | `0` permits CPU (dev only). |
 | `N_ATLAS_AUTO_INSTALL` | `1` | `0` makes a missing package a hard error. |
+| `N_ATLAS_VOICE_ENABLED` | `1` | `0` removes `/v1/audio/transcriptions`, skips the four NCAIR1 ASR models and `python-multipart`, and leaves chat untouched. |
+| `N_ATLAS_VOICE_DEVICE` | `cuda` | Where the NCAIR1 ASR models run. On GPU they load in fp16 to halve their VRAM; falls back to CPU automatically when no GPU is present. Set `cpu` to keep the T4 entirely for chat. |
+| `N_ATLAS_VOICE_MAX_BYTES` | `10485760` | Upload cap for `/v1/audio/transcriptions` (10 MB). The chat cap `N_ATLAS_MAX_REQUEST_BYTES` is unaffected. |
 | `N_ATLAS_HOST` / `N_ATLAS_PORT` | `0.0.0.0` / `8000` | Bind address. |
 | `N_ATLAS_TEMPERATURE` | `0.1` | Default sampling temperature (low by design — see below). |
 | `N_ATLAS_MAX_TEMPERATURE` | `2.0` | Ceiling on client temperature. |
@@ -229,14 +232,54 @@ print(reply.choices[0].message.content)
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status. |
+| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status, voice. |
 | `GET /v1/models` | bearer | OpenAI-compatible model list. |
 | `POST /v1/chat/completions` | bearer | Chat completion. Full message history. |
+| `POST /v1/audio/transcriptions` | bearer | Speech-to-text. Transcribes one recorded clip (multipart `file`). |
 | `POST /v1/nafdac/verify` | bearer | Check one NAFDAC number against the greenbook. |
 | `POST /v1/nafdac/search` | bearer | Free-text product search. |
 | `GET /v1/nafdac/sources` | bearer | Which greenbook sources are reachable. |
 
 Streaming (`stream=true`) is **not** supported and returns `400`.
+
+### Voice transcription (Cell 10)
+
+The microphone in the Confam web chat (`confamweb/js/ai-chat.js`) records audio and
+POSTs it to `POST /v1/audio/transcriptions`, which transcribes it back to text. It is
+OpenAI-compatible (multipart `file` + optional `model` and `language`), so the browser
+recorder needs no change:
+
+```bash
+curl -X POST https://ai.saynet.ng/v1/audio/transcriptions \
+  -H "Authorization: Bearer $N_ATLAS_API_KEY" \
+  -F "file=@clip.webm" -F "language=ha"
+# -> {"text": "..."}
+```
+
+Speech-to-text is done by the four **NCAIR1** automatic-speech-recognition models, one
+per supported language, used for **language transcription**:
+
+| Language | Model |
+|---|---|
+| English (and Nigerian Pidgin) | [NCAIR1/NigerianAccentedEnglish](https://huggingface.co/NCAIR1/NigerianAccentedEnglish) |
+| Hausa | [NCAIR1/Hausa-ASR](https://huggingface.co/NCAIR1/Hausa-ASR) |
+| Yoruba | [NCAIR1/Yoruba-ASR](https://huggingface.co/NCAIR1/Yoruba-ASR) |
+| Igbo | [NCAIR1/Igbo-ASR](https://huggingface.co/NCAIR1/Igbo-ASR) |
+
+- **Gated repos.** All four are `gated=auto` on Hugging Face, so the server's `HF_TOKEN`
+  must belong to an account that has been granted access to each one. Without it the
+  endpoint answers `503` (`the <lang> speech-to-text model could not be loaded`); the same
+  token also needs access to `NCAIR1/N-ATLaS` for the chat path.
+- **Loaded lazily, once per language.** The pipelines are built on the first clip and
+  kept for the life of the process. `language=auto` runs each model and keeps the longest
+  transcript; Pidgin is reported as `en` and transcribed with `NigerianAccentedEnglish`.
+- **Runs on the GPU by default** (`N_ATLAS_VOICE_DEVICE=cuda`, fp16), because a
+  70-second clip takes seconds on the T4 versus ~200 s on CPU — and the Cloudflare
+  tunnel cancels a request that outstays its limit. Falls back to CPU
+  automatically when no GPU is present; set `cpu` to keep the T4's VRAM for chat.
+- **Optional.** `N_ATLAS_VOICE_ENABLED=0` removes the route, never loads the ASR models,
+  skips `python-multipart`, and leaves chat exactly as it was. `N_ATLAS_VOICE_MAX_BYTES`
+  (default 10 MB) caps an upload.
 
 ### Error mapping
 

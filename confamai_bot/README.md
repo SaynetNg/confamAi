@@ -270,7 +270,7 @@ have shipped:
 
 | File | Purpose |
 |---|---|
-| `webhook.py` | FastAPI app: handshake, inbound, `/healthz` |
+| `webhook.py` | FastAPI app: handshake, inbound, `/healthz` (liveness), `/readyz` (readiness) |
 | `router.py` | orchestration — local commands vs the model |
 | `natlas.py` | the N-ATLaS client; the only module that talks upstream |
 | `whatsapp.py` | Graph API sender and webhook parsing |
@@ -344,3 +344,13 @@ service ever scales past one instance or the disk is ephemeral.
 After pushing, redeploy from the Render dashboard and check
 `https://<service>.onrender.com/healthz` — `"bot": "up"` with
 `"natlas": "ready"` means the whole chain works.
+
+`/healthz` (aliased as `/health`) is **liveness**: it always answers 200 while
+the process is up, from memory, and never calls N-ATLaS. Point Render's health
+check and any keep-alive pinger (e.g. cron-job.org, UptimeRobot) at it — that
+is what keeps a free-tier service from sleeping, and it will never be slow or
+flap because the GPU server behind the bot is down or still loading.
+
+`/readyz` is **readiness**: a live N-ATLaS probe that returns 503 while the
+model or the greenbook is not ready. Use it for a monitor that wants to know
+whether *answers* are possible, not for keeping the service awake.

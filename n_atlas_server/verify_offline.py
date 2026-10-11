@@ -73,6 +73,13 @@ def run_notebook(port: int) -> dict:
     namespace = {
         "__name__": "__natlas_notebook__",
         "__file__": str(NOTEBOOK_SOURCE),
+        # Injected before Cells 1-18 run. Cell 4 preloads all four NCAIR1 ASR
+        # pipelines at import time, and those repos are gated, so the factory is
+        # forced to MockASR here. This is the same seam verify_nafdac.py uses for
+        # the intent extractor; patching transformers.pipeline does not work
+        # because transformers is a lazy module that restores tampered
+        # attributes.
+        "VOICE_ASR_FACTORY": mock_backend.voice_asr_factory(),
     }
     # nafdac_source lives at the project root, one level up. Cell 18 finds it
     # via __file__, but putting the root on the path here too means the offline
@@ -725,6 +732,163 @@ def run_notebook(port: int) -> dict:
     )
 
     print("\n" + "#" * 70)
+    print("# VOICE TRANSCRIPTION (/v1/audio/transcriptions)")
+    print("#" * 70)
+    # The browser mic on ai.html POSTs a recorded clip here. The ASR models are
+    # mocked, so this proves the route, auth, the language pass-through and the
+    # error mapping — not ASR quality, which needs the real NCAIR1 models.
+    #
+    # The real ASR models are gated and are not downloadable here, so the
+    # notebook's per-language factory is replaced with one returning
+    # mock_backend.MockASR. This is the same seam verify_nafdac.py uses for the
+    # intent extractor: replacing a notebook global, not patching transformers,
+    # because Cell 6 does a lazy `from transformers import pipeline` that a
+    # module-attribute patch would not reach.
+    mock_backend.MOCK_STATE.update(
+        {"force_transcribe_error": False, "transcribe_calls": 0, "last_audio_bytes": 0}
+    )
+    # Cell 4 preloaded the four ASR pipelines through install_voice()'s fake
+    # factory, so VOICE_PIPELINES already holds a MockASR per language; nothing
+    # to inject here. Assert that preload happened, which is the point of moving
+    # the load into Cell 4.
+    _voice_ready = sorted(namespace.get("VOICE_PIPELINES", {}))
+    record(
+        "Cell 4 preloads all four ASR pipelines before the server starts",
+        _voice_ready == ["en", "ha", "ig", "yo"]
+        and not namespace.get("VOICE_LOAD_ERRORS"),
+        f"VOICE_PIPELINES={_voice_ready} errors={sorted(namespace.get('VOICE_LOAD_ERRORS', {}))}",
+    )
+
+    VOICE_URL = f"{BASE_URL}/v1/audio/transcriptions"
+    auth = {"Authorization": f"Bearer {TEST_API_KEY}"}
+
+    health = namespace["api"]("GET", "/health", key=None, timeout=30).json()
+    voice_info = health.get("voice", {})
+    record(
+        "health advertises the voice capability",
+        voice_info.get("enabled") is True
+        and voice_info.get("endpoint") == "/v1/audio/transcriptions"
+        and "en" in (voice_info.get("languages") or []),
+        f"voice={voice_info}",
+    )
+
+    mock_backend.MOCK_STATE["force_transcribe_error"] = False
+
+    good = requests.post(
+        VOICE_URL,
+        headers=auth,
+        files={"file": ("clip.webm", b"\x1a\x45\xdf\xa3" + b"x" * 400, "audio/webm")},
+        data={"model": "n-atlas", "language": "ha"},
+        timeout=60,
+    )
+    record(
+        "POST /v1/audio/transcriptions returns 200 with text",
+        good.status_code == 200 and bool(good.json().get("text", "").strip()),
+        f"status={good.status_code} body={good.text[:120]}",
+    )
+    record(
+        "the transcription carries the clip and its language",
+        mock_backend.MOCK_STATE["last_audio_bytes"] > 200
+        and mock_backend.MOCK_STATE["last_transcribe_language"] == "ha",
+        f"bytes={mock_backend.MOCK_STATE['last_audio_bytes']} "
+        f"language={mock_backend.MOCK_STATE['last_transcribe_language']}",
+    )
+
+    noauth = requests.post(
+        VOICE_URL,
+        files={"file": ("clip.webm", b"x" * 64, "audio/webm")},
+        timeout=30,
+    )
+    record(
+        "voice upload without a key returns 401",
+        noauth.status_code == 401,
+        f"status={noauth.status_code}",
+    )
+
+    empty = requests.post(
+        VOICE_URL,
+        headers=auth,
+        files={"file": ("clip.webm", b"", "audio/webm")},
+        timeout=30,
+    )
+    record(
+        "an empty audio file returns 400",
+        empty.status_code == 400,
+        f"status={empty.status_code} body={empty.text[:120]}",
+    )
+
+    mock_backend.MOCK_STATE["force_transcribe_error"] = True
+    undecodable = requests.post(
+        VOICE_URL,
+        headers=auth,
+        files={"file": ("clip.webm", b"not-audio" * 40, "audio/webm")},
+        timeout=60,
+    )
+    record(
+        "an undecodable clip returns 400, not 500",
+        undecodable.status_code == 400,
+        f"status={undecodable.status_code} body={undecodable.text[:120]}",
+    )
+    record(
+        "the 400 body does not leak the raw exception",
+        "Traceback" not in undecodable.text
+        and "ValueError" not in undecodable.text,
+        repr(undecodable.text[:140]),
+    )
+    mock_backend.MOCK_STATE["force_transcribe_error"] = False
+
+    auto = requests.post(
+        VOICE_URL,
+        headers=auth,
+        files={"file": ("clip.webm", b"\x1a\x45\xdf\xa3" + b"y" * 400, "audio/webm")},
+        data={"language": "auto"},
+        timeout=60,
+    )
+    record(
+        "an auto-language clip still transcribes",
+        auto.status_code == 200 and bool(auto.json().get("text", "").strip()),
+        f"status={auto.status_code} body={auto.text[:120]}",
+    )
+
+    # Regression: Cell 6 must hand the pipeline raw bytes, not a BytesIO. The
+    # real transformers pipeline rejects a file object, and MockASR mirrors that
+    # contract, so this fails if the engine ever passes one again.
+    try:
+        _raw_bytes_text = namespace["_run_voice_pipeline"](
+            mock_backend.MockASR("en"), b"x" * 128, "en"
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, not fatal
+        _raw_bytes_text = f"{type(exc).__name__}: {exc}"
+    record(
+        "the engine passes raw bytes to the ASR pipeline, not a file object",
+        _raw_bytes_text == "mock transcript (en)",
+        f"engine -> pipeline input contract: {_raw_bytes_text!r}",
+    )
+    mock_backend.MOCK_STATE["transcribe_calls"] = 0
+    mock_backend.MOCK_STATE["last_audio_bytes"] = 0
+
+    # Regression: a clip over 30 s makes Whisper refuse a single pass and demand
+    # long-form generation. The engine must retry with chunking, not 400. The
+    # mock raises on the unchunked call and succeeds once chunk_length_s arrives.
+    mock_backend.MOCK_STATE["force_long_form"] = True
+    try:
+        _long_text = namespace["_run_voice_pipeline"](
+            mock_backend.MockASR("ha"), b"x" * 4096, "ha"
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, not fatal
+        _long_text = f"{type(exc).__name__}: {exc}"
+    record(
+        "a clip over 30 s is retried with long-form chunking, not refused",
+        _long_text == "mock transcript (ha)"
+        and mock_backend.MOCK_STATE["last_chunk_length_s"] == 30,
+        f"long-form fallback: {_long_text!r} chunk_length_s="
+        f"{mock_backend.MOCK_STATE['last_chunk_length_s']}",
+    )
+    mock_backend.MOCK_STATE.update(
+        {"force_long_form": False, "transcribe_calls": 0, "last_audio_bytes": 0}
+    )
+
+    print("\n" + "#" * 70)
     print("# OPENAI SDK COMPATIBILITY (spec 24)")
     print("#" * 70)
 
@@ -834,6 +998,13 @@ def _child_env(port: int) -> dict:
             "PYTHONIOENCODING": "utf-8",
             "PYTHONPATH": str(HERE),
             "TOKENIZERS_PARALLELISM": "false",
+            # Voice is switched off for the script subprocesses. They boot the
+            # real entry points, whose module globals cannot receive the
+            # in-process mock ASR factory, and Cell 4 would otherwise try to
+            # download the four gated NCAIR1 models. Voice itself is fully
+            # exercised in-process above; these checks cover the legacy HTTP
+            # entry points only.
+            "N_ATLAS_VOICE_ENABLED": "0",
         }
     )
     return env

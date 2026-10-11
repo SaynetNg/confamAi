@@ -1135,9 +1135,18 @@ async def test_webhook(tmp):
         check("a status callback is accepted without error", status_response.status_code == 200)
 
         health = client.get("/healthz")
-        check("healthz reports on N-ATLaS", health.status_code in (200, 503))
+        check("healthz is liveness and always 200", health.status_code == 200)
         check("healthz never leaks a secret",
               "stub-key" not in health.text and "stub-token" not in health.text)
+
+        alias = client.get("/health")
+        check("/health is an alias of /healthz",
+              alias.status_code == 200 and alias.json().get("bot") == "up")
+
+        ready = client.get("/readyz")
+        check("readyz is readiness and may say 503", ready.status_code in (200, 503))
+        check("readyz never leaks a secret",
+              "stub-key" not in ready.text and "stub-token" not in ready.text)
 
     # A config with no app secret still serves, and says so.
     open_cfg = make_cfg(tmp / "open")
@@ -1147,6 +1156,8 @@ async def test_webhook(tmp):
         response = client.post(cfg.webhook_path, content=b"{}",
                                headers={"Content-Type": "application/json"})
         check("without an app secret the webhook still answers", response.status_code == 200)
+        health = client.get("/healthz")
+        check("health is reachable without an app secret", health.status_code == 200)
 
 
 async def test_render_integration(tmp):

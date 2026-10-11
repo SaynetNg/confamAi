@@ -9,7 +9,7 @@
 # `pip install -r` will not touch anything already satisfied, so this file is
 # safe to run as-is. To install only what Cell 2 would install, run:
 #     pip install fastapi uvicorn pydantic requests nest_asyncio \
-#                   bitsandbytes accelerate safetensors
+#                   python-multipart bitsandbytes accelerate safetensors
 #
 # `kaggle_secrets` is not on PyPI — Kaggle injects it into the image. Do not
 # list it here.
@@ -33,6 +33,11 @@ uvicorn[standard]>=0.30.0      # [standard] pulls uvloop/httptools/websockets
 pydantic>=2.9.0
 requests>=2.32.0
 nest-asyncio>=1.6.0            # lets uvicorn run inside the notebook kernel
+python-multipart>=0.0.9        # parses the voice upload to
+                               # POST /v1/audio/transcriptions (Cell 10). FastAPI
+                               # refuses to define a File/Form route without it,
+                               # so Cell 3 installs it when voice is enabled.
+                               # Set N_ATLAS_VOICE_ENABLED=0 for a text-only build.
 
 # --- Test and client tooling (verify_offline.py, build_notebook.py) --------
 openai>=1.50.0                  # live SDK round-trip check + laptop client
