@@ -1050,6 +1050,9 @@ async def test_voice():
     check("the file is sent as multipart under `file`", "file" in captured["files"])
     check("the file bytes are sent",
           captured["files"]["file"][1] == b"ogg-bytes")
+    check("the file sends with a multipart content type, not application/json",
+          "json" not in (captured["headers"].get("Content-Type") or "").lower(),
+          str(captured["headers"].get("Content-Type")))
     check("the pinned language is sent", captured["data"]["language"] == "ha")
     check("the model is sent", captured["data"]["model"] == "n-atlas")
 

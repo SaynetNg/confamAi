@@ -140,6 +140,19 @@ class NAtlasClient:
             "User-Agent": "confamai-bot/1.0 (+https://ai.saynet.ng)",
         }
 
+    def _multipart_headers(self) -> dict:
+        """Headers for a multipart upload — no Content-Type.
+
+        `_headers()` pins `Content-Type: application/json`, which is right for
+        the chat path and wrong here: it overrides the multipart content type
+        (with its boundary) that httpx generates, so the server cannot parse the
+        form and answers 422 "Field required". Everything except Content-Type is
+        kept, including the named User-Agent Cloudflare needs.
+        """
+        headers = self._headers()
+        headers.pop("Content-Type", None)
+        return headers
+
     def _client_or_start(self) -> httpx.AsyncClient:
         if self._client is None:
             raise ConnectionFailure(
@@ -346,7 +359,7 @@ class NAtlasClient:
         try:
             response = await client.post(
                 self.cfg.transcribe_url(),
-                headers=self._headers(),
+                headers=self._multipart_headers(),
                 files=files,
                 data=data,
             )
