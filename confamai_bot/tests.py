@@ -1292,6 +1292,12 @@ async def test_webhook(tmp):
         check("/health is an alias of /healthz",
               alias.status_code == 200 and alias.json().get("bot") == "up")
 
+        head = client.head("/health")
+        check("health answers a HEAD probe (UptimeRobot default)",
+              head.status_code == 200)
+        headz = client.head("/healthz")
+        check("healthz answers a HEAD probe", headz.status_code == 200)
+
         ready = client.get("/readyz")
         check("readyz is readiness and may say 503", ready.status_code in (200, 503))
         check("readyz never leaks a secret",

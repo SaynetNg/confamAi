@@ -226,8 +226,12 @@ def create_app(cfg: Config | None = None, env_file: str | None = None) -> FastAP
         return JSONResponse({"status": "ok"})
 
     # -- health ---------------------------------------------------------
-    @app.get("/healthz")
-    @app.get("/health")
+    # HEAD as well as GET: UptimeRobot's HTTP monitor defaults to a HEAD
+    # request, and a GET-only route answers that with a 405 — which the monitor
+    # reports as "down" even though the service is healthy. Registering both
+    # methods here is what makes the keep-alive ping succeed.
+    @app.api_route("/healthz", methods=["GET", "HEAD"])
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def healthz():
         """Liveness. Always 200 while the process is up.
 
@@ -247,7 +251,7 @@ def create_app(cfg: Config | None = None, env_file: str | None = None) -> FastAP
             status_code=200,
         )
 
-    @app.get("/readyz")
+    @app.api_route("/readyz", methods=["GET", "HEAD"])
     async def readyz():
         """Readiness. A live probe, so it can be slow — and can say 503."""
         can_verify, reason = await state.natlas.verify_ready()
