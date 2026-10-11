@@ -29,12 +29,16 @@ python-dotenv>=1.0.0
 psycopg[binary]>=3.1
 
 # ---------------------------------------------------------------------------
-# Optional: voice notes (phase 2 of the WhatsApp integration).
+# Optional: local voice transcription (fallback only).
 #
-# The bot boots and answers text without these. They are needed only when
-# a user sends a voice note, which is downloaded and transcribed with the
-# NCAIR1 models (confamai_bot/audio.py). The import is lazy, so a
-# text-only deployment stays small; a deployment that wants voice runs:
+# A voice note is transcribed by the N-ATLaS server's
+# /v1/audio/transcriptions endpoint by default, so this process needs no
+# torch and no model — the four NCAIR1 models run on the server's GPU.
+# See confamai_bot/audio.py and WHATSAPP_VOICE_TRANSCRIPTION.
+#
+# The local path (WHATSAPP_VOICE_TRANSCRIPTION=local, or the automatic
+# fallback when the server is unreachable) does load the models here, and
+# only then are these needed:
 #
 #     pip install torch transformers
 #

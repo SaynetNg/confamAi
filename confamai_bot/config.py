@@ -144,6 +144,9 @@ class Config:
     def chat_url(self) -> str:
         return self.base_url.rstrip("/") + "/chat/completions"
 
+    def transcribe_url(self) -> str:
+        return self.base_url.rstrip("/") + "/audio/transcriptions"
+
     def graph_base(self) -> str:
         return "https://graph.facebook.com/%s/%s/messages" % (
             self.graph_version,

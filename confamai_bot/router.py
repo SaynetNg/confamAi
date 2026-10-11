@@ -82,6 +82,11 @@ class Router:
         # restart gives an opted-out user a clean slate rather than a permanent
         # ban they cannot see or undo.
         self.opted_out: set[str] = set()
+        # Voice notes are transcribed server-first, through the same N-ATLaS
+        # client the chat path uses, so the bot needs no local model. The
+        # transcriber's local NCAIR1 fallback stays available for a deployment
+        # that points no server at voice or loses one (see audio.py).
+        transcriber.bind(natlas)
         self.stats = {
             "text": 0,
             "local": 0,

@@ -1009,6 +1009,152 @@ async def test_natas_payload():
         check("an error message never contains the API key", "stub-key" not in str(exc))
 
 
+async def test_voice():
+    section("N-ATLaS client — voice transcription request shape")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, response):
+            self.response = response
+
+        async def post(self, url, headers=None, files=None, data=None, json=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["files"] = files
+            captured["data"] = data
+            return self.response
+
+        async def aclose(self):
+            return None
+
+    cfg = make_cfg(tmp_dir)
+    natlas = NAtlasClient(cfg)
+    natlas._client = FakeClient(FakeResponse(200, {"text": "Is A4-100160 genuine?"}))
+
+    text = await natlas.transcribe(b"ogg-bytes", language="ha")
+    check("the transcript is returned", text == "Is A4-100160 genuine?")
+    check("the URL ends in /audio/transcriptions",
+          captured["url"].endswith("/audio/transcriptions"))
+    check("the URL keeps the /v1 prefix", "/v1/audio/transcriptions" in captured["url"])
+    check("the bearer token is sent",
+          captured["headers"]["Authorization"] == "Bearer stub-key")
+    check("the file is sent as multipart under `file`", "file" in captured["files"])
+    check("the file bytes are sent",
+          captured["files"]["file"][1] == b"ogg-bytes")
+    check("the pinned language is sent", captured["data"]["language"] == "ha")
+    check("the model is sent", captured["data"]["model"] == "n-atlas")
+
+    await natlas.transcribe(b"ogg-bytes")
+    check("no language field when unpinned", "language" not in captured["data"])
+
+    # An empty transcript and an undecodable clip must be told apart.
+    from .natlas import EmptyResponse, ValidationFailure
+
+    natlas._client = FakeClient(FakeResponse(200, {"text": "  "}))
+    try:
+        await natlas.transcribe(b"ogg-bytes")
+        check("an empty transcript raises", False, "no error raised")
+    except EmptyResponse:
+        check("an empty transcript raises", True)
+
+    natlas._client = FakeClient(FakeResponse(400, {"error": {"message": "bad clip"}}))
+    try:
+        await natlas.transcribe(b"ogg-bytes")
+        check("a 400 is a validation failure", False, "no error raised")
+    except ValidationFailure:
+        check("a 400 is a validation failure", True)
+
+    try:
+        await natlas.transcribe(b"")
+        check("an empty note is refused", False, "no error raised")
+    except ValidationFailure:
+        check("an empty note is refused", True)
+
+    section("the transcriber is server-first and falls back to the local model")
+
+    from .audio import VoiceTranscriber, VoiceTranscriptionError
+
+    class ServerClient:
+        def __init__(self, error=None):
+            self.calls: list[tuple[bytes, str]] = []
+            self.error = error
+
+        async def transcribe(self, audio_bytes, language=None):
+            self.calls.append((audio_bytes, language))
+            if self.error:
+                raise self.error
+            return "server transcript"
+
+    class LocalStub:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, audio_bytes, **kwargs):
+            self.calls.append((audio_bytes, kwargs))
+            return {"text": "local transcript"}
+
+    # auto: the server answers, so the local model is never touched. The router
+    # always calls transcribe() through asyncio.to_thread (it is blocking), so
+    # the same is done here — _server_transcribe uses asyncio.run(), which needs
+    # a thread with no running loop.
+    server = ServerClient()
+    transcriber = VoiceTranscriber().bind(server)
+    answer = await asyncio.to_thread(transcriber.transcribe, b"ogg", "yo")
+    check("auto uses the server when it can", answer == "server transcript")
+    check("the server gets the pinned language", server.calls == [(b"ogg", "yo")])
+
+    # auto: the server fails, so the local model answers.
+    failing = VoiceTranscriber().bind(ServerClient(error=NAtlasError("down")))
+    local = LocalStub()
+    failing._pipeline = lambda code: local
+    answer = await asyncio.to_thread(failing.transcribe, b"ogg", "ha")
+    check("auto falls back to the local model", answer == "local transcript")
+    check("the local model gets raw bytes, not a file object",
+          local.calls and local.calls[0][0] == b"ogg")
+
+    # The local path retries long-form when the single pass refuses.
+    class LongFormStub:
+        def __init__(self):
+            self.kwargs = None
+
+        def __call__(self, audio_bytes, **kwargs):
+            if not kwargs.get("chunk_length_s"):
+                raise ValueError("more than 3000 mel input features (> 30 seconds)")
+            self.kwargs = kwargs
+            return {"text": "long-form transcript"}
+
+    long_stub = LongFormStub()
+    lf = VoiceTranscriber()
+    lf._pipeline = lambda code: long_stub
+    answer = await asyncio.to_thread(lf.transcribe, b"ogg", "ha")
+    check("a >30s clip is retried with long-form chunking",
+          answer == "long-form transcript" and long_stub.kwargs.get("chunk_length_s") == 30)
+
+    # server-only mode must not silently fall back.
+    import os as _os
+
+    _os.environ["WHATSAPP_VOICE_TRANSCRIPTION"] = "server"
+    try:
+        only = VoiceTranscriber().bind(ServerClient(error=NAtlasError("down")))
+        only._pipeline = lambda code: LocalStub()
+        try:
+            await asyncio.to_thread(only.transcribe, b"ogg", "en")
+            check("server-only mode does not fall back", False, "no error raised")
+        except VoiceTranscriptionError:
+            check("server-only mode does not fall back", True)
+    finally:
+        _os.environ.pop("WHATSAPP_VOICE_TRANSCRIPTION", None)
+
+
 def test_reply_contract():
     section("reply contract — the rules this project exists to enforce")
     from .assay import CASES
@@ -1227,6 +1373,7 @@ async def amain() -> int:
         await test_sessions(tmp)
         await test_queue()
         await test_natas_payload()
+        await test_voice()
         await test_webhook(tmp)
         await test_render_integration(tmp)
 

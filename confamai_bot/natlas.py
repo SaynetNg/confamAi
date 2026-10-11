@@ -1,4 +1,4 @@
-"""The N-ATLaS server client. One method, one endpoint.
+"""The N-ATLaS server client. Two endpoints, and nothing else.
 
 Everything this bot knows about product verification arrives through
 `chat()`. It POSTs to `/v1/chat/completions` and returns text. There is no
@@ -27,6 +27,11 @@ on every message, so `stream` is always false.
 
 The error taxonomy mirrors n_atlas_client/api.py so the retry policy and the
 message a user sees are the same ones the laptop client already has.
+
+`transcribe()` is the second endpoint: a WhatsApp voice note is uploaded to
+`/v1/audio/transcriptions`, which the server answers with its four preloaded
+NCAIR1 models. It shares the same taxonomy, so the router's retry policy covers
+voice and text identically.
 """
 
 from __future__ import annotations
@@ -300,6 +305,79 @@ class NAtlasClient:
                 await asyncio.sleep(delay)
 
         raise last_error or ConnectionFailure("The N-ATLaS request failed.")
+
+    # ------------------------------------------------------------------
+    # speech-to-text
+    # ------------------------------------------------------------------
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        language: str | None = None,
+        filename: str = "voice-note.ogg",
+    ) -> str:
+        """POST one voice note to /v1/audio/transcriptions. Returns the text.
+
+        The same OpenAI-compatible endpoint the website's microphone uploads
+        to, so a WhatsApp voice note is transcribed by the four NCAIR1 models
+        the server preloads on the GPU — no local torch, no model download.
+
+        `language` is the pinned code ("en" | "ha" | "yo" | "ig"); pass None for
+        the server's `auto`, which tries each model and keeps the longest
+        transcript. The file is sent as multipart under the field name `file`,
+        which is what the server (and the OpenAI spec) expects.
+
+        Errors use the same taxonomy as `chat`, so the router's retry policy and
+        the message a user sees are identical: a 503 (the model could not load)
+        is transient, a 400 (an undecodable clip) is not.
+        """
+        if not audio_bytes:
+            raise ValidationFailure("The voice note is empty.")
+
+        client = self._client_or_start()
+        # Only the content type is named; the field is `file` because that is
+        # the server's contract. The container is left to `filename`, which the
+        # server does not constrain (the ASR pipeline decodes with ffmpeg).
+        files = {"file": (filename, audio_bytes, "audio/ogg")}
+        data = {"model": self.cfg.model}
+        if language:
+            data["language"] = language
+
+        started = time.monotonic()
+        try:
+            response = await client.post(
+                self.cfg.transcribe_url(),
+                headers=self._headers(),
+                files=files,
+                data=data,
+            )
+        except httpx.TimeoutException as exc:
+            raise TimeoutFailure(
+                "The N-ATLaS server is taking too long to transcribe the voice "
+                "note."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ConnectionFailure(
+                "Unable to reach the N-ATLaS server. Check the server or the "
+                "tunnel."
+            ) from exc
+
+        self._log(
+            "POST /v1/audio/transcriptions -> %d (%.1fs)"
+            % (response.status_code, time.monotonic() - started)
+        )
+
+        if response.status_code != 200:
+            raise self._raise_from_http(response)
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ServerFailure("The server sent a reply that was not JSON.") from exc
+
+        text = str((body.get("text") if isinstance(body, dict) else "") or "").strip()
+        if not text:
+            raise EmptyResponse("The server returned an empty transcript.")
+        return text
 
     # ------------------------------------------------------------------
     def _raise_from_http(self, response: httpx.Response) -> NAtlasError:

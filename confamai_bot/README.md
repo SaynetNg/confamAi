@@ -130,6 +130,31 @@ and registers the number; afterwards every message from it is dropped **in
 silence**, with no reply at all, because honouring an opt-out means sending
 nothing. Only `START` revokes it. NDPA 2023 requires this.
 
+## 6. Voice notes
+
+A voice note is downloaded from Meta and transcribed to text, then takes the
+ordinary text path — so a spoken "stop" opts out and a spoken NAFDAC number is
+verified exactly as if it had been typed.
+
+By default the note is transcribed by the **server**, POSTed to
+`/v1/audio/transcriptions` — the same OpenAI-compatible endpoint the website's
+microphone uses. The four NCAIR1 models already run there, preloaded on the
+server's GPU, so this bot needs no torch, no model download and no GPU. That is
+the whole point of the server endpoint.
+
+`WHATSAPP_VOICE_TRANSCRIPTION` selects the path:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | try the server, fall back to the local model if it is unreachable |
+| `server` | server only — no local fallback, so a server outage is reported rather than silently served by a local model |
+| `local` | load the NCAIR1 models in this process (needs `pip install torch transformers`) |
+
+Both paths handle the two traps a WhatsApp voice note hits: the clip is passed
+as **raw bytes** (never a file object, which the pipeline rejects), and a note
+over **30 seconds** is retried with long-form chunking, because Whisper refuses
+a single pass that long and a real voice note usually is.
+
 ## 7. A server defect this bot works around
 
 Found by `--assay` on 2026-10-04. The retrieval gate attaches a verified block
@@ -238,13 +263,19 @@ documented.
 python -m confamai_bot --test
 ```
 
-271 checks, no network, no WhatsApp account, no GPU. Two halves:
+324 checks, no network, no WhatsApp account, no GPU. Three halves:
 
 - **Payload replay.** Realistic webhook bodies through the router with a stubbed
   N-ATLaS. Asserts a retry sends nothing, a system message is never built,
   `language` travels only when pinned, `/hausa` never reaches the model, an
-  opted-out number gets silence, a photo costs no model call, and a server
-  failure is reported rather than guessed.
+  opted-out number gets silence, a photo costs no model call, a voice note is
+  transcribed then answered as text, and a server failure is reported rather
+  than guessed.
+- **Voice request shape.** The multipart `file` upload to
+  `/v1/audio/transcriptions`, the pinned language, and the error split: an empty
+  transcript and an undecodable clip are told apart. Plus the transcriber being
+  server-first and only falling back to the local NCAIR1 model, and the local
+  path retrying long-form for a clip over 30 seconds.
 - **Reply contract.** The safety rules are not stylistic. A reply calling an
   unregistered product counterfeit is the failure this project exists to
   prevent, so the same assertions the live assay uses are applied to fixtures
@@ -272,8 +303,9 @@ have shipped:
 |---|---|
 | `webhook.py` | FastAPI app: handshake, inbound, `/healthz` (liveness), `/readyz` (readiness) |
 | `router.py` | orchestration — local commands vs the model |
-| `natlas.py` | the N-ATLaS client; the only module that talks upstream |
+| `natlas.py` | the N-ATLaS client; the only module that talks upstream (chat and voice transcription) |
 | `whatsapp.py` | Graph API sender and webhook parsing |
+| `audio.py` | speech-to-text for voice notes — server-first, local NCAIR1 fallback |
 | `sessions.py` | per-phone history, SQLite or Supabase, TTL sweeper |
 | `languages.py` | language commands and the opt-out keyword |
 | `render.py` | WhatsApp-safe text, chunking, acknowledgement language |
