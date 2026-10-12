@@ -15,10 +15,11 @@
 #
 # | Variable | Purpose | Default |
 # |---|---|---|
-# | `N_ATLAS_API_KEY` | Bearer token required by every `/v1/*` route | random ephemeral dev key |
-# | `NAFDAC_DATABASE_URL` | Supabase session-pooler DSN for the greenbook source | literal in Cell 1 |
+# | `N_ATLAS_API_KEY` | Bearer token required by every `/v1/*` route | unset — Kaggle Secret or environment |
+# | `NAFDAC_DATABASE_URL` | Supabase session-pooler DSN for the greenbook source | unset — Kaggle Secret or environment |
 # | `N_ATLAS_ADAPTER_ID` | QLoRA adapter repo to serve on top of the base model | `Saynetng/confam-ai-adapter-v1.1` |
 # | `HF_TOKEN` | Hugging Face token for the gated base model | unset — required: Kaggle Secret or environment |
+# | `TUNNEL_TOKEN` | Cloudflare named-tunnel credential for Cell 19 | unset — required: Kaggle Secret or environment |
 # | `N_ATLAS_SYSTEM_PROMPT` | Inline override of the system prompt | unset — `confam_prompt.txt` is served |
 # | `N_ATLAS_SYSTEM_PROMPT_FILE` | Path to a prompt file (wins over inline) | unset — `confam_prompt.txt` is found on disk |
 # | `N_ATLAS_MAX_NEW_TOKENS` | Hard ceiling on client `max_tokens` | `200` |
@@ -28,13 +29,16 @@
 # | `N_ATLAS_LOG_CONTENT` | Set `1` to log message text (off by default) | `0` |
 # | `N_ATLAS_HOST` / `N_ATLAS_PORT` | Bind address | `0.0.0.0` / `8000` |
 #
-# Cell 1 holds the bearer key as a literal so the notebook is self-contained on
-# Kaggle. Prefer a Kaggle Secret when there is one: attach it as
-# `N_ATLAS_API_KEY` and the literal below is ignored, because Cell 1 only sets
-# the variable when it is not already in the environment. The same applies to
-# `NAFDAC_DATABASE_URL`, and the same method — environment variable first,
-# then a Kaggle Secret — is how Cell 1 resolves `HF_TOKEN`, which the gated
-# base model needs before Cell 5 can download it.
+# No secret is hardcoded in this notebook. Cell 1 resolves `N_ATLAS_API_KEY`,
+# `NAFDAC_DATABASE_URL` and `HF_TOKEN` the same way — environment variable
+# first, then a Kaggle Secret of that name — so attach them under Add-ons ->
+# Secrets (or set them in the environment) and the notebook picks them up.
+# `HF_TOKEN` is required: the gated base model needs it before Cell 5 can
+# download the weights. `N_ATLAS_API_KEY` and `NAFDAC_DATABASE_URL` are
+# optional — Cell 2 generates an ephemeral key and Cell 18 reads the
+# NAFDAC_CSV_PATH export when they are absent. Cell 19 resolves the
+# Cloudflare `TUNNEL_TOKEN` the same way, and it is required to open the
+# tunnel.
 #
 # The persona is not here: it is `confam_prompt.txt`, the project's single
 # source of truth, uploaded with the n-atlas-source dataset as
@@ -51,26 +55,61 @@
 # Runs before everything else. Two things have to exist before the model and the
 # server do:
 #
-#   1. N_ATLAS_API_KEY, the bearer token every /v1/* route requires. Cell 2
-#      resolves it; if it is unset there it falls back to a random key written to
-#      natlas_api_key.txt, which means the laptop client cannot know it.
+#   1. N_ATLAS_API_KEY, the bearer token every /v1/* route requires. Resolved
+#      here from the environment or a Kaggle Secret; if it is unset, Cell 2
+#      falls back to a random key written to natlas_api_key.txt, which means
+#      the laptop client cannot know it.
 #   2. The Hugging Face login, resolved and called right here from
 #      HF_TOKEN — the environment variable first, then a Kaggle
 #      Secret of that name, the same method as the training
 #      notebook's Cell 3. NCAIR1/N-ATLaS is a gated repo, so Cell 5
 #      cannot download the weights without it. Cell 19's login() is
 #      only a re-login for a gated re-download later in the session.
-#   3. NAFDAC_DATABASE_URL, read by Cell 18 for the greenbook source. Prefer a
-#      Kaggle Secret named NAFDAC_DATABASE_URL; the literal below is ignored when
-#      one is attached, because this cell only sets the variable when it is not
-#      already in the environment.
+#   3. NAFDAC_DATABASE_URL, read by Cell 18 for the greenbook source. Resolved
+#      from the environment or a Kaggle Secret of that name; when it is unset,
+#      Cell 18 falls back to the NAFDAC_CSV_PATH greenbook export.
 import json
 import os
 import unicodedata
 
-os.environ.setdefault(
+def _resolve_secret(name: str, required: bool = True, purpose: str = "") -> str:
+    """Resolve a secret: environment variable first, then a Kaggle Secret.
+
+    The same method HF_TOKEN uses. Nothing is hardcoded here — attach a
+    Kaggle Secret of this name (Add-ons -> Secrets) or set the variable in
+    the environment. When `required` is False and neither source has it, the
+    variable is left unset so a later cell can apply its own fallback.
+    """
+    value = os.environ.get(name, "").strip()
+    if not value:
+        try:
+            from kaggle_secrets import UserSecretsClient
+
+            value = (UserSecretsClient().get_secret(name) or "").strip()
+        except Exception:
+            value = ""
+    if not value and required:
+        raise SystemExit(
+            f"Could not get {name} from the environment or Kaggle secrets.\n"
+            f"{purpose}\n"
+            "Either add it as a Kaggle secret (Add-ons -> Secrets -> New "
+            f"Secret, name {name}),\n"
+            f"or set {name} in the environment before running this notebook."
+        )
+    if value:
+        os.environ[name] = value
+    return value
+
+
+# N_ATLAS_API_KEY, the bearer token every /v1/* route requires. Resolved from
+# the environment or a Kaggle Secret, never hardcoded. When it is absent, Cell 2
+# generates an ephemeral key written to natlas_api_key.txt, which means the
+# laptop client cannot know it — attach the secret so the client and the server
+# agree on the key.
+_resolve_secret(
     "N_ATLAS_API_KEY",
-    "KgRRl_6vEp7YRCY6agQ9HjH0RFk6T6hr9KYQq7YTRfRrKeWQIyFs_biogXFvK_Lo",
+    required=False,
+    purpose="Cell 2 falls back to an ephemeral key the laptop client cannot know.",
 )
 
 # Supabase **session** pooler, not the transaction pooler, and not the direct
@@ -93,14 +132,17 @@ os.environ.setdefault(
 #
 # The port is the selector: 5432 is session mode, 6543 is transaction mode.
 #
-# The password contains '@' and '&', so it MUST stay percent-encoded here. The
-# driver is handed this string as a DSN (psycopg.connect(dsn)), so an unencoded
-# '@' would truncate the netloc and produce an unresolvable hostname. Rotate the
-# password before any real deployment and keep the encoding in step.
-os.environ.setdefault(
+# The password contains '@' and '&', so it MUST stay percent-encoded in the
+# secret. The driver is handed this string as a DSN (psycopg.connect(dsn)), so
+# an unencoded '@' would truncate the netloc and produce an unresolvable
+# hostname. Keep the encoding in step when rotating the password.
+#
+# Resolved from the environment or a Kaggle Secret, never hardcoded. When it is
+# absent, Cell 18 falls back to the NAFDAC_CSV_PATH greenbook export.
+_resolve_secret(
     "NAFDAC_DATABASE_URL",
-    "postgresql://postgres.kbdwvutgzjxhqovcgrzu:vabTy7%40%40%26%26DD"
-    "@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
+    required=False,
+    purpose="Cell 18 falls back to NAFDAC_CSV_PATH, but the database is the live source.",
 )
 
 # Serve the fine-tuned ConfamAI weights instead of the base model. The training
@@ -149,9 +191,16 @@ login(token=HF_TOKEN)
 print("=" * 70)
 print("N-ATLaS SERVER — CREDENTIALS")
 print("=" * 70)
-print(f"N_ATLAS_API_KEY:  set ({len(os.environ['N_ATLAS_API_KEY'])} chars)")
-_dsn = os.environ["NAFDAC_DATABASE_URL"]
-print(f"NAFDAC_DATABASE_URL: {_dsn.split('@')[-1]}  (session pooler, port 5432)")
+_api_key = os.environ.get("N_ATLAS_API_KEY", "")
+if _api_key:
+    print(f"N_ATLAS_API_KEY:  set ({len(_api_key)} chars)")
+else:
+    print("N_ATLAS_API_KEY:  unset (Cell 2 generates an ephemeral key)")
+_dsn = os.environ.get("NAFDAC_DATABASE_URL", "")
+if _dsn:
+    print(f"NAFDAC_DATABASE_URL: {_dsn.split('@')[-1]}  (session pooler, port 5432)")
+else:
+    print("NAFDAC_DATABASE_URL: unset (Cell 18 uses NAFDAC_CSV_PATH)")
 print(f"HF login:         logged in with the HF_TOKEN {_token_source}")
 print("=" * 70)
 
@@ -5094,9 +5143,13 @@ CLOUDFLARED_DEB = WORKDIR / "cloudflared-linux-amd64.deb"
 CLOUDFLARED_FALLBACK = WORKDIR / "cloudflared"
 
 # Zero Trust -> Networks -> Tunnels -> <tunnel name> -> Install connector. The
-# token is pasted in as a literal rather than read from an env var so the cell
-# runs on Kaggle as-is; rotating it means editing this one line.
-TUNNEL_TOKEN = "eyJhIjoiZGQwYTIyYTI1N2NkZWUxMGQ2MzBjZjAzZjAwNmFlYTYiLCJ0IjoiNzQ4ODM4NzctZWZiNC00OTY4LWE5YjAtNGZjOTIzOTg2NTJlIiwicyI6IlpHSTBZVEJtWlRBdFlUWTNNeTAwTkdZNUxXSmhNbVV0TXpWbVpXWTNaamN4TldZeSJ9"
+# token is resolved from the environment or a Kaggle Secret, never hardcoded;
+# rotating it means updating the secret, not this cell.
+TUNNEL_TOKEN = _resolve_secret(
+    "TUNNEL_TOKEN",
+    required=True,
+    purpose="Cell 19 cannot open the Cloudflare tunnel without it.",
+)
 
 TUNNEL_TARGET = f"http://127.0.0.1:{CONFIG.port}"
 

@@ -428,7 +428,7 @@ N_ATLAS_API_KEY=YOUR_SECRET_KEY
 - Never use `localhost:8000` — localhost on your laptop is not the Kaggle server.
 - The API key is read from the environment / `.env` and is **never** printed or written into conversation files.
 
-Full `Config` fields (all from env, with defaults): `base_url`, `api_key`, `model` (`n-atlas`), `timeout` (180.0), `max_tokens` (512), `temperature` (0.7), `stream` (True), `language` (`auto`), `max_conversation_messages` (40), `max_conversation_tokens` (3500), `max_message_chars` (6000), `max_retries` (2), `save_conversations` (True), `conversations_dir` (`conversations`), `system_prompt`, `nafdac_enabled` (True), `nafdac_database_url`, `nafdac_csv_path`, `nafdac_xlsx_path`, `nafdac_show_data` (True), `nafdac_max_search_results` (10), `nafdac_server_authoritative` (True), `debug` (False).
+Full `Config` fields (all from env, with defaults): `base_url`, `api_key`, `model` (`n-atlas`), `timeout` (180.0), `max_tokens` (512), `temperature` (0.1), `stream` (True), `language` (`auto`), `max_conversation_messages` (40), `max_conversation_tokens` (3500), `max_message_chars` (6000), `max_retries` (2), `save_conversations` (True), `conversations_dir` (`conversations`), `system_prompt`, `nafdac_enabled` (True), `nafdac_database_url`, `nafdac_csv_path`, `nafdac_xlsx_path`, `nafdac_show_data` (True), `nafdac_max_search_results` (10), `nafdac_server_authoritative` (True), `debug` (False).
 
 `apply_nafdac_env()` pushes the NAFDAC settings into the environment so the shared `nafdac_source` package (which reads its config from the environment) works identically on the laptop and on Kaggle.
 
@@ -1111,7 +1111,7 @@ Copy `.env.example` to `.env` and fill in:
 | `N_ATLAS_MODEL` | `n-atlas` |
 | `N_ATLAS_TIMEOUT` | `180` (a Tesla T4 turn takes roughly 13 seconds including intent extraction; do not set this low) |
 | `N_ATLAS_MAX_TOKENS` | `512` (the server clamps at its own `max_new_tokens`) |
-| `N_ATLAS_TEMPERATURE` | `0.7` |
+| `N_ATLAS_TEMPERATURE` | `0.1` |
 | `N_ATLAS_MAX_RETRIES` | `2` (429/5xx/timeouts only, never 401/403/400/422) |
 
 Before going public, rotate both secrets in `confamAi/.env` — they are live plaintext on this machine, and the bot puts an internet-facing webhook in front of the N-ATLaS key.
@@ -1178,7 +1178,7 @@ These are used by `n_atlas_train/check_transcript_coverage.py` to measure what t
 
 | File | Purpose |
 |---|---|
-| `.env` | Client + server configuration: `N_ATLAS_BASE_URL=https://ai.saynet.ng/v1`, `N_ATLAS_API_KEY`, `N_ATLAS_MODEL=n-atlas`, `N_ATLAS_TIMEOUT=180`, `N_ATLAS_MAX_TOKENS=512`, `N_ATLAS_TEMPERATURE=0.7`, `N_ATLAS_STREAM=true`, context limits (`N_ATLAS_MAX_CONVERSATION_MESSAGES=40`, `N_ATLAS_MAX_CONVERSATION_TOKENS=3500`, `N_ATLAS_MAX_MESSAGE_CHARS=6000`), `N_ATLAS_MAX_RETRIES=2`, `N_ATLAS_SAVE_CONVERSATIONS=true`, `NAFDAC_ENABLED=true`, `NAFDAC_DATABASE_URL` (the Supabase session pooler DSN), `NAFDAC_CSV_PATH`/`NAFDAC_XLSX_PATH` (empty = auto-detect), `NAFDAC_SHOW_DATA=true`, `NAFDAC_MAX_SEARCH_RESULTS=10`. Gitignored. |
+| `.env` | Client + server configuration: `N_ATLAS_BASE_URL=https://ai.saynet.ng/v1`, `N_ATLAS_API_KEY`, `N_ATLAS_MODEL=n-atlas`, `N_ATLAS_TIMEOUT=180`, `N_ATLAS_MAX_TOKENS=512`, `N_ATLAS_TEMPERATURE=0.1`, `N_ATLAS_STREAM=true`, context limits (`N_ATLAS_MAX_CONVERSATION_MESSAGES=40`, `N_ATLAS_MAX_CONVERSATION_TOKENS=3500`, `N_ATLAS_MAX_MESSAGE_CHARS=6000`), `N_ATLAS_MAX_RETRIES=2`, `N_ATLAS_SAVE_CONVERSATIONS=true`, `NAFDAC_ENABLED=true`, `NAFDAC_DATABASE_URL` (the Supabase session pooler DSN), `NAFDAC_CSV_PATH`/`NAFDAC_XLSX_PATH` (empty = auto-detect), `NAFDAC_SHOW_DATA=true`, `NAFDAC_MAX_SEARCH_RESULTS=10`. Gitignored. |
 | `.gitignore` | Ignores `*.pyc`, `__pycache__/`, `*.egg-info/`, `build/`, `dist/`, every `.env` in every folder, `natlas_api_key.txt`, `conversations/`, and the parsed xlsx index `nafdac_greenbook.xlsx.nafdac_rows.csv` (+ `.stamp`) — the last because it is derived from a tracked file and rebuilt automatically (without it openpyxl takes ~40 s to read the workbook; with it, 1.5 s). |
 | `confam_prompt.txt` | The persona (see §7). |
 | `confam_training_dataset.jsonl` | The 643-record QLoRA training set (see §5). |

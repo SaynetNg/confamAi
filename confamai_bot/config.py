@@ -87,7 +87,7 @@ class Config:
     model: str = "n-atlas"         # N_ATLAS_MODEL
     timeout: float = 180.0         # N_ATLAS_TIMEOUT   (a T4 turn takes ~13s)
     max_tokens: int = 512          # N_ATLAS_MAX_TOKENS
-    temperature: float = 0.7       # N_ATLAS_TEMPERATURE
+    temperature: float = 0.1       # N_ATLAS_TEMPERATURE (server default; low by design)
     max_retries: int = 2           # N_ATLAS_MAX_RETRIES
 
     # --- throughput -------------------------------------------------------
@@ -227,7 +227,7 @@ def load_config(env_file: str | None = None, debug: bool = False) -> Config:
         model=_env_str("N_ATLAS_MODEL", "n-atlas"),
         timeout=max(1.0, _env_float("N_ATLAS_TIMEOUT", 180.0)),
         max_tokens=max(1, _env_int("N_ATLAS_MAX_TOKENS", 512)),
-        temperature=_env_float("N_ATLAS_TEMPERATURE", 0.7),
+        temperature=_env_float("N_ATLAS_TEMPERATURE", 0.1),
         max_retries=max(0, _env_int("N_ATLAS_MAX_RETRIES", 2)),
         max_concurrency=max(1, _env_int("WHATSAPP_MAX_CONCURRENCY", 3)),
         per_user_timeout=max(5.0, _env_float("WHATSAPP_PER_USER_TIMEOUT", 120.0)),

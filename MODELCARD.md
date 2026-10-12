@@ -359,7 +359,7 @@ with torch.no_grad():
     outputs = model.generate(
         **inputs,
         max_new_tokens=256,
-        temperature=0.7,
+        temperature=0.1,
         top_p=0.9,
         do_sample=True
     )
