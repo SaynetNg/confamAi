@@ -14,6 +14,17 @@ The only thing that crosses between them is the adapter on the Hugging Face Hub.
 Notebook B picks it up by setting `N_ATLAS_ADAPTER_ID`; nothing else changes, and
 `served_model_name` stays `n-atlas` so no client is reconfigured.
 
+## Hugging Face Hub
+
+The artefacts this project produces and consumes, all under the `Saynetng` account:
+
+- **Adapter v1.1** — the QLoRA adapter Notebook A pushes (Cell 8) and Notebook B serves (`N_ATLAS_ADAPTER_ID`):  
+  <https://huggingface.co/Saynetng/confam-ai-adapter-v1.1>
+- **Training dataset** — the 643-record JSONL that Cell 1 consumes:  
+  <https://huggingface.co/datasets/Saynetng/confam_training_dataset>
+- **Adapter (unversioned)** — the adapter repo without a version tag:  
+  <https://huggingface.co/Saynetng/confam-ai-adapter>
+
 ## Files
 
 | File | Role |
