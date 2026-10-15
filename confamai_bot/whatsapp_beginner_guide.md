@@ -1,5 +1,13 @@
 # The Ultimate Beginner's Guide: Confam AI WhatsApp + STT Integration
 
+> **Note (current behaviour).** The bot no longer transcribes locally and there
+> is no `audio.py`. A voice note is answered **voice-first**: it is downloaded
+> and POSTed to the N-ATLaS server's `/v1/audio/chat`, which transcribes it with
+> its preloaded NCAIR1 models *and* runs the chat model on the result, returning
+> the reply. See `README.md` section 6 and `router.py:_ask_voice`. The steps
+> below that build a local `audio.py` are kept only as background and are no
+> longer how the code works.
+
 This guide will walk you and your teammate through the entire process of connecting your `confamai_bot` to WhatsApp and enabling Speech-to-Text (STT) for voice notes, from absolutely zero.
 
 ---

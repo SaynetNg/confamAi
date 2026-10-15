@@ -28,15 +28,19 @@ on every message, so `stream` is always false.
 The error taxonomy mirrors n_atlas_client/api.py so the retry policy and the
 message a user sees are the same ones the laptop client already has.
 
-`transcribe()` is the second endpoint: a WhatsApp voice note is uploaded to
-`/v1/audio/transcriptions`, which the server answers with its four preloaded
-NCAIR1 models. It shares the same taxonomy, so the router's retry policy covers
-voice and text identically.
+Voice uses two endpoints on the same taxonomy. `voice_chat()` is the one the
+router calls: a WhatsApp voice note is uploaded to `/v1/audio/chat`, and the
+server transcribes it with its four preloaded NCAIR1 models *and* runs the chat
+model on the result, returning the reply. `transcribe()` is the transcript-only
+route (`/v1/audio/transcriptions`), kept for a caller that wants just the text.
+Both share the error taxonomy, so the router's retry policy covers voice and
+text identically.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import httpx
@@ -391,6 +395,130 @@ class NAtlasClient:
         if not text:
             raise EmptyResponse("The server returned an empty transcript.")
         return text
+
+    # ------------------------------------------------------------------
+    # speech-to-answer
+    # ------------------------------------------------------------------
+    async def voice_chat(
+        self,
+        audio_bytes: bytes,
+        messages: list[dict] | None = None,
+        language: str | None = None,
+        filename: str = "voice-note.ogg",
+    ) -> tuple[str, str]:
+        """POST one voice note to /v1/audio/chat. Returns (reply, transcript).
+
+        The voice-first endpoint: the server transcribes the clip with its
+        preloaded NCAIR1 models and runs the chat model on the result in one
+        request, so the bot gets the answer directly instead of a transcript it
+        would have to send back. That the same serverside NAFDAC enrichment runs
+        as for a typed message — a spoken NAFDAC number is verified exactly as a
+        typed one is.
+
+        `messages` is the prior conversation as user/assistant turns; the server
+        appends the spoken turn itself. `language` pins the reply ("en" | "ha" |
+        "yo" | "ig"); pass None to let the spoken language decide, which is what
+        a voice note normally wants.
+
+        Errors use the same taxonomy as `chat`, so the router's retry policy and
+        the message a user sees are identical.
+        """
+        if not audio_bytes:
+            raise ValidationFailure("The voice note is empty.")
+
+        client = self._client_or_start()
+        files = {"file": (filename, audio_bytes, "audio/ogg")}
+        data = {"model": self.cfg.model}
+        if language:
+            data["language"] = language
+        if messages:
+            data["messages"] = json.dumps(
+                [
+                    {"role": m.get("role"), "content": m.get("content")}
+                    for m in messages
+                    if m.get("role") in ("user", "assistant") and m.get("content")
+                ],
+                ensure_ascii=False,
+            )
+
+        started = time.monotonic()
+        try:
+            response = await client.post(
+                self.cfg.voice_chat_url(),
+                headers=self._multipart_headers(),
+                files=files,
+                data=data,
+            )
+        except httpx.TimeoutException as exc:
+            raise TimeoutFailure(
+                "The N-ATLaS server is taking too long to answer the voice note."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ConnectionFailure(
+                "Unable to reach the N-ATLaS server. Check the server or the "
+                "tunnel."
+            ) from exc
+
+        self._log(
+            "POST /v1/audio/chat -> %d (%.1fs)"
+            % (response.status_code, time.monotonic() - started)
+        )
+
+        if response.status_code != 200:
+            raise self._raise_from_http(response)
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ServerFailure("The server sent a reply that was not JSON.") from exc
+
+        choices = body.get("choices") or []
+        if not choices:
+            raise EmptyResponse("The model returned no choices for the voice note.")
+
+        content = (choices[0].get("message") or {}).get("content") or ""
+        if not str(content).strip():
+            raise EmptyResponse("The model returned an empty response.")
+
+        from .render import strip_template_artifacts
+
+        reply = strip_template_artifacts(content)
+        transcript = str((body.get("transcript") if isinstance(body, dict) else "") or "").strip()
+        return reply, transcript
+
+    async def voice_chat_with_retry(
+        self,
+        audio_bytes: bytes,
+        messages: list[dict] | None = None,
+        language: str | None = None,
+    ) -> tuple[str, str]:
+        """`voice_chat()` plus bounded retry on transient failures only.
+
+        The same policy as `chat_with_retry`: 401/403/404/400/422 are never
+        retried, and backoff is capped at 4s because a WhatsApp user is watching
+        a bubble.
+        """
+        attempts = 0
+        max_attempts = self.cfg.max_retries + 1
+        last_error: NAtlasError | None = None
+
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                return await self.voice_chat(
+                    audio_bytes, messages=messages, language=language
+                )
+            except NAtlasError as exc:
+                last_error = exc
+                if exc.kind != TRANSIENT or attempts >= max_attempts:
+                    raise
+                delay = min(0.5 * (2 ** (attempts - 1)), 4.0)
+                self._log(
+                    "retry %d/%d in %.1fs: %s" % (attempts + 1, max_attempts, delay, exc)
+                )
+                await asyncio.sleep(delay)
+
+        raise last_error or ConnectionFailure("The N-ATLaS voice request failed.")
 
     # ------------------------------------------------------------------
     def _raise_from_http(self, response: httpx.Response) -> NAtlasError:

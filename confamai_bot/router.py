@@ -38,12 +38,10 @@ ingredients nobody put in the database.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any
 
 from . import framing, languages, render
-from .audio import transcriber
 from .config import Config, normalize_phone
 from .natlas import (
     FATAL,
@@ -82,11 +80,9 @@ class Router:
         # restart gives an opted-out user a clean slate rather than a permanent
         # ban they cannot see or undo.
         self.opted_out: set[str] = set()
-        # Voice notes are transcribed server-first, through the same N-ATLaS
-        # client the chat path uses, so the bot needs no local model. The
-        # transcriber's local NCAIR1 fallback stays available for a deployment
-        # that points no server at voice or loses one (see audio.py).
-        transcriber.bind(natlas)
+        # Voice notes are answered by the server's `/v1/audio/chat` through the
+        # same N-ATLaS client the chat path uses, so this process needs no ASR
+        # model, no torch and no GPU. There is no local transcription path.
         self.stats = {
             "text": 0,
             "local": 0,
@@ -339,16 +335,23 @@ class Router:
     async def handle_non_text(self, item: dict) -> str:
         """A photo, document, sticker or voice note.
 
-        A voice note is the one non-text message this bot understands:
-        it is downloaded, transcribed with the model for the user's
-        language, and the resulting text is fed through the ordinary
-        text path — so a spoken "stop" opts out and a spoken NAFDAC
-        number is verified exactly as if it had been typed.
+        A voice note is the one non-text message this bot understands, and it
+        is answered **voice-first**: the note is downloaded and POSTed to the
+        server's `/v1/audio/chat`, which transcribes it with the NCAIR1 models
+        and runs the chat model on the result, returning the reply in one
+        request. Nothing is transcribed on this side.
 
-        Everything else gets the local "I can only read text" answer.
-        A photograph of a medicine pack is the most likely thing a real
-        person sends, and silence would read as a broken bot, but OCR
-        is a separate feature.
+        That also means there is no local text turn to pre-screen. A **spoken
+        language is detected by the server from the audio**, so no language pin
+        is sent for a voice note; the reply comes back in the spoken language.
+        The trade is deliberate: a spoken "stop" is no longer recognised as an
+        opt-out before the model runs (a typed STOP still is, and the note is
+        answered like any other question). See confamai_bot/README.md.
+
+        Everything else gets the local "I can only read text" answer. A
+        photograph of a medicine pack is the most likely thing a real person
+        sends, and silence would read as a broken bot, but OCR is a separate
+        feature.
         """
         phone = normalize_phone(item.get("from", ""))
         if not phone or phone in self.opted_out or not self.cfg.is_allowed(phone):
@@ -372,33 +375,75 @@ class Router:
 
         try:
             audio_bytes = await self.whatsapp.download_media(audio_id)
-            # Transcription is CPU/GPU-bound and can take tens of
-            # seconds; off the event loop, so every other user's
-            # webhook keeps flowing while this one note is heard.
-            transcribed = await asyncio.to_thread(
-                transcriber.transcribe, audio_bytes, lang
-            )
         except Exception as exc:
             self.stats["errors"] += 1
-            print("[router] voice note failed: %r" % (exc,), flush=True)
+            print("[router] voice note download failed: %r" % (exc,), flush=True)
             return await self._send(phone, languages.message("voice_failed", lang))
 
-        if not transcribed:
-            return await self._send(phone, languages.message("blank", lang))
+        return await self._ask_voice(phone, session, audio_bytes, lang)
 
-        print("[router] transcribed voice note: %s" % transcribed, flush=True)
+    async def _ask_voice(self, phone: str, session, audio_bytes: bytes, lang: str) -> str:
+        """Send one voice note to the server and send back the answer.
 
-        # The transcription becomes an ordinary text message, so it takes
-        # the whole text path: opt-out words, language commands, the
-        # verification frame, the model. The id is prefixed because the
-        # dedupe table already holds this note's own id from the
-        # mark_seen above — reusing it would make handle_text treat the
-        # turn as a Meta retry and drop it.
-        mock_text_item = dict(item)
-        mock_text_item["id"] = "audio-%s" % item.get("id", "")
-        mock_text_item["type"] = "text"
-        mock_text_item["text"] = transcribed
-        return await self.handle_text(mock_text_item)
+        The voice-first path. One request to `/v1/audio/chat` carries the clip
+        and the conversation so far, and the server transcribes and answers it.
+        No `language` is sent: the spoken language is what the reply should be
+        in, and only the server's ASR step knows it.
+        """
+        history = session.messages(self.cfg)
+        started = time.monotonic()
+
+        async def call():
+            return await self.natlas.voice_chat_with_retry(
+                audio_bytes, messages=history
+            )
+
+        try:
+            reply_text, transcript = await self.concurrency.run(phone, call)
+        except UserBusy:
+            self.stats["errors"] += 1
+            return await self._send(phone, languages.message("busy", lang))
+        except QueueTimeout:
+            self.stats["errors"] += 1
+            return await self._send(phone, languages.message("busy", lang))
+        except NAtlasError as exc:
+            self.stats["errors"] += 1
+            fatal = exc.kind == FATAL
+            print(
+                "[router] N-ATLaS voice %s after %.1fs: %s"
+                % ("fatal" if fatal else "transient", time.monotonic() - started, exc),
+                flush=True,
+            )
+            if isinstance(exc, EmptyResponse):
+                return await self._send(phone, languages.message("blank", lang))
+            return await self._send(phone, languages.message("voice_failed", lang))
+
+        self.stats["text"] += 1
+        elapsed = time.monotonic() - started
+        print("[router] voice note answered in %.1fs" % elapsed, flush=True)
+
+        # Store the exchange for the next turn. The transcript is what the user
+        # actually said and is what the model was answered from, so it is stored
+        # as the user turn rather than an empty placeholder.
+        session.history = list(history) + [
+            {"role": "user", "content": transcript or "[voice note]"},
+            {"role": "assistant", "content": reply_text},
+        ]
+        await self.store.save(session)
+
+        cleaned = render.clean(reply_text)
+        parts = render.chunk(cleaned)
+        if len(parts) > 1:
+            print(
+                "[router] voice reply of %d chars split into %d messages"
+                % (len(cleaned), len(parts)),
+                flush=True,
+            )
+
+        sent = ""
+        for part in parts:
+            sent = await self._send(phone, part)
+        return sent
 
     # ------------------------------------------------------------------
     async def _send(self, phone: str, body: str) -> str:

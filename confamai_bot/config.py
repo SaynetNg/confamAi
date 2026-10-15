@@ -147,6 +147,15 @@ class Config:
     def transcribe_url(self) -> str:
         return self.base_url.rstrip("/") + "/audio/transcriptions"
 
+    def voice_chat_url(self) -> str:
+        """The voice-first endpoint: transcribe a clip and answer it in one call.
+
+        This is what the router uses for a voice note, so the server's NCAIR1
+        models and its chat model both run behind one request and the bot needs
+        no local speech-to-text.
+        """
+        return self.base_url.rstrip("/") + "/audio/chat"
+
     def graph_base(self) -> str:
         return "https://graph.facebook.com/%s/%s/messages" % (
             self.graph_version,

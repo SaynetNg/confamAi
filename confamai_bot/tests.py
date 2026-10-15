@@ -29,7 +29,6 @@ import time
 from pathlib import Path
 
 from .assay import LEAK_MARKERS, evaluate
-from .audio import transcriber as real_transcriber
 from .config import Config, normalize_phone
 from .languages import (
     confirm,
@@ -103,6 +102,23 @@ class StubNAtlas(NAtlasClient):
         if self.error:
             raise self.error
         return self.reply
+
+    async def voice_chat_with_retry(self, audio_bytes, messages=None, language=None):
+        """The voice-first call: the stub is the server, so it returns a reply.
+
+        Recorded under the same `calls` list as chat, with `voice=True` and the
+        clip, so a test can assert the note reached the server and that no
+        language was pinned (the server detects it from the audio).
+        """
+        self.calls.append({
+            "messages": messages,
+            "language": language,
+            "voice": True,
+            "audio": audio_bytes,
+        })
+        if self.error:
+            raise self.error
+        return self.reply, "Is A4-100160 genuine?"
 
 
 class RecordingWhatsApp:
@@ -619,76 +635,57 @@ async def test_router(tmp):
     check("the image answer asks for the number",
           "A4-100160" in whatsapp.bodies()[0], whatsapp.bodies()[0])
 
-    section("router — a voice note is transcribed and answered")
-    from . import router as router_module
+    section("router — a voice note is answered by the server voice-first")
     _cfg10, natlas, whatsapp, _store10, router = await build(
         tmp, reply="It is registered."
     )
+    voice = {
+        "id": "vn1", "from": "2348012345678", "type": "audio",
+        "audio": {"id": "media-audio-1"},
+    }
+    await router.handle_non_text(voice)
 
-    class StubTranscriber:
-        """Stands in for the NCAIR1 models: no torch, no GPU."""
-
-        def __init__(self):
-            self.calls: list[tuple[bytes, str]] = []
-
-        def transcribe(self, audio_bytes, language_code="en"):
-            self.calls.append((audio_bytes, language_code))
-            return "Is A4-100160 genuine?"
-
-    stub = StubTranscriber()
-    router_module.transcriber = stub
-    try:
-        voice = {
-            "id": "vn1", "from": "2348012345678", "type": "audio",
-            "audio": {"id": "media-audio-1"},
-        }
-        await router.handle_non_text(voice)
-    finally:
-        router_module.transcriber = real_transcriber
-
+    voice_calls = [c for c in natlas.calls if c.get("voice")]
     check("a voice note says it is listening",
           "Listening" in whatsapp.bodies()[0], whatsapp.bodies()[0])
-    check("a voice note is downloaded once", len(stub.calls) == 1)
-    check("the downloaded bytes reach the transcriber",
-          stub.calls[0][0] == b"stub-ogg-audio")
-    check("the user's language reaches the transcriber",
-          stub.calls[0][1] == "en")
-    check("a voice note costs one model call", len(natlas.calls) == 1)
-    # The transcription takes the ordinary text path, so the
-    # verification frame is attached to it — the user's own
-    # words are still what the model sees.
-    check("the transcription is what the model sees",
-          "Is A4-100160 genuine?" in natlas.calls[0]["messages"][-1]["content"],
-          str(natlas.calls[0]["messages"][-1]["content"])[:80])
+    check("a voice note is downloaded once and reaches the server",
+          len(voice_calls) == 1 and voice_calls[0]["audio"] == b"stub-ogg-audio",
+          str(voice_calls))
+    # No local transcription and no language pin: the server detects the spoken
+    # language from the audio itself.
+    check("a voice note pins no language",
+          voice_calls and voice_calls[0]["language"] is None)
+    check("a voice note costs exactly one model call",
+          len(natlas.calls) == 1, str(len(natlas.calls)))
     check("a voice note is answered",
           whatsapp.bodies()[-1] == "It is registered.", whatsapp.bodies()[-1])
 
-    # A Meta retry of the same note must not transcribe or reply twice.
+    # A Meta retry of the same note must not call the server or reply twice.
     await router.handle_non_text(dict(voice))
-    check("a replayed voice note is ignored", len(stub.calls) == 1)
+    check("a replayed voice note is ignored", len(natlas.calls) == 1)
     check("a replayed voice note sends nothing more", len(whatsapp.sent) == 2)
 
-    section("router — a voice note that cannot be transcribed is reported")
-    _cfg10b, natlas_b, whatsapp_b, _store10b, router_b = await build(tmp)
+    # The transcript the server heard is what is stored, so the next turn has
+    # the real conversation rather than a placeholder.
+    stored = await _store10.get("+2348012345678")
+    check("the transcript is stored as the user turn",
+          any(m["role"] == "user" and "A4-100160" in m["content"]
+              for m in stored.history),
+          str(stored.history))
 
-    class FailingTranscriber:
-        def transcribe(self, audio_bytes, language_code="en"):
-            raise RuntimeError("model not installed")
-
-    router_module.transcriber = FailingTranscriber()
-    try:
-        await router_b.handle_non_text({
-            "id": "vn2", "from": "2348012345678", "type": "audio",
-            "audio": {"id": "media-audio-2"},
-        })
-    finally:
-        router_module.transcriber = real_transcriber
+    section("router — a voice note the server cannot answer is reported")
+    _cfg10b, natlas_b, whatsapp_b, _store10b, router_b = await build(
+        tmp, error=NAtlasError("down")
+    )
+    await router_b.handle_non_text({
+        "id": "vn2", "from": "2348012345678", "type": "audio",
+        "audio": {"id": "media-audio-2"},
+    })
 
     bodies_b = whatsapp_b.bodies()
-    check("a failed transcription still replies", len(bodies_b) == 2, str(bodies_b))
-    check("a failed transcription says it could not hear",
+    check("a failed voice note still replies", len(bodies_b) == 2, str(bodies_b))
+    check("a failed voice note says it could not hear",
           "could not hear" in bodies_b[-1].lower(), bodies_b[-1])
-    check("a failed transcription costs no model call", len(natlas_b.calls) == 0)
 
     section("router — the allowlist refuses without a model call")
     _cfg9, natlas, whatsapp, _store10, router = await build(
@@ -1082,80 +1079,91 @@ async def test_voice():
     except ValidationFailure:
         check("an empty note is refused", True)
 
-    section("the transcriber is server-first and falls back to the local model")
+    section("N-ATLaS client — voice-first request shape (/v1/audio/chat)")
 
-    from .audio import VoiceTranscriber, VoiceTranscriptionError
+    natlas._client = FakeClient(FakeResponse(200, {
+        "object": "chat.completion",
+        "transcript": "Is A4-100160 genuine?",
+        "choices": [{"message": {"role": "assistant", "content": "It is registered."}}],
+    }))
+    reply, transcript = await natlas.voice_chat(
+        b"ogg-bytes",
+        messages=[{"role": "user", "content": "hello"}],
+        language="ha",
+    )
+    check("the reply is the assistant's answer", reply == "It is registered.")
+    check("the transcript is returned beside the reply",
+          transcript == "Is A4-100160 genuine?")
+    check("the URL ends in /audio/chat", captured["url"].endswith("/audio/chat"))
+    check("the URL keeps the /v1 prefix", "/v1/audio/chat" in captured["url"])
+    check("the clip is sent as multipart under `file`",
+          captured["files"]["file"][1] == b"ogg-bytes")
+    check("history is sent as a JSON message list",
+          captured["data"].get("messages")
+          and "hello" in captured["data"]["messages"])
+    check("a pinned language is sent", captured["data"]["language"] == "ha")
 
-    class ServerClient:
-        def __init__(self, error=None):
-            self.calls: list[tuple[bytes, str]] = []
-            self.error = error
+    await natlas.voice_chat(b"ogg-bytes")
+    check("no language field when the spoken language should decide",
+          "language" not in captured["data"])
+    check("no messages field when there is no history",
+          "messages" not in captured["data"])
 
-        async def transcribe(self, audio_bytes, language=None):
-            self.calls.append((audio_bytes, language))
-            if self.error:
-                raise self.error
-            return "server transcript"
-
-    class LocalStub:
-        def __init__(self):
-            self.calls = []
-
-        def __call__(self, audio_bytes, **kwargs):
-            self.calls.append((audio_bytes, kwargs))
-            return {"text": "local transcript"}
-
-    # auto: the server answers, so the local model is never touched. The router
-    # always calls transcribe() through asyncio.to_thread (it is blocking), so
-    # the same is done here — _server_transcribe uses asyncio.run(), which needs
-    # a thread with no running loop.
-    server = ServerClient()
-    transcriber = VoiceTranscriber().bind(server)
-    answer = await asyncio.to_thread(transcriber.transcribe, b"ogg", "yo")
-    check("auto uses the server when it can", answer == "server transcript")
-    check("the server gets the pinned language", server.calls == [(b"ogg", "yo")])
-
-    # auto: the server fails, so the local model answers.
-    failing = VoiceTranscriber().bind(ServerClient(error=NAtlasError("down")))
-    local = LocalStub()
-    failing._pipeline = lambda code: local
-    answer = await asyncio.to_thread(failing.transcribe, b"ogg", "ha")
-    check("auto falls back to the local model", answer == "local transcript")
-    check("the local model gets raw bytes, not a file object",
-          local.calls and local.calls[0][0] == b"ogg")
-
-    # The local path retries long-form when the single pass refuses.
-    class LongFormStub:
-        def __init__(self):
-            self.kwargs = None
-
-        def __call__(self, audio_bytes, **kwargs):
-            if not kwargs.get("chunk_length_s"):
-                raise ValueError("more than 3000 mel input features (> 30 seconds)")
-            self.kwargs = kwargs
-            return {"text": "long-form transcript"}
-
-    long_stub = LongFormStub()
-    lf = VoiceTranscriber()
-    lf._pipeline = lambda code: long_stub
-    answer = await asyncio.to_thread(lf.transcribe, b"ogg", "ha")
-    check("a >30s clip is retried with long-form chunking",
-          answer == "long-form transcript" and long_stub.kwargs.get("chunk_length_s") == 30)
-
-    # server-only mode must not silently fall back.
-    import os as _os
-
-    _os.environ["WHATSAPP_VOICE_TRANSCRIPTION"] = "server"
+    # An empty reply or an undecodable clip must be told apart.
+    natlas._client = FakeClient(FakeResponse(200, {
+        "transcript": "x", "choices": [{"message": {"content": "  "}}],
+    }))
     try:
-        only = VoiceTranscriber().bind(ServerClient(error=NAtlasError("down")))
-        only._pipeline = lambda code: LocalStub()
-        try:
-            await asyncio.to_thread(only.transcribe, b"ogg", "en")
-            check("server-only mode does not fall back", False, "no error raised")
-        except VoiceTranscriptionError:
-            check("server-only mode does not fall back", True)
-    finally:
-        _os.environ.pop("WHATSAPP_VOICE_TRANSCRIPTION", None)
+        await natlas.voice_chat(b"ogg-bytes")
+        check("an empty voice reply raises", False, "no error raised")
+    except EmptyResponse:
+        check("an empty voice reply raises", True)
+
+    natlas._client = FakeClient(FakeResponse(400, {"error": {"message": "bad clip"}}))
+    try:
+        await natlas.voice_chat(b"ogg-bytes")
+        check("a 400 on the voice route is a validation failure", False, "no error")
+    except ValidationFailure:
+        check("a 400 on the voice route is a validation failure", True)
+
+    try:
+        await natlas.voice_chat(b"")
+        check("an empty voice note is refused", False, "no error raised")
+    except ValidationFailure:
+        check("an empty voice note is refused", True)
+
+    # Retry policy: a transient failure is retried, a fatal one is not.
+    class FlakyVoiceClient:
+        def __init__(self, fail_times: int, status: int):
+            self.fail_times = fail_times
+            self.status = status
+            self.calls = 0
+
+        async def post(self, url, headers=None, files=None, data=None, json=None):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                return FakeResponse(self.status, {"error": {"message": "busy"}})
+            return FakeResponse(200, {
+                "transcript": "x",
+                "choices": [{"message": {"content": "recovered"}}],
+            })
+
+        async def aclose(self):
+            return None
+
+    retrying = NAtlasClient(cfg)
+    retrying._client = FlakyVoiceClient(fail_times=1, status=503)
+    reply, _ = await retrying.voice_chat_with_retry(b"ogg")
+    check("a transient voice failure is retried", reply == "recovered")
+    check("the retry cost two POSTs", retrying._client.calls == 2)
+
+    fatal = NAtlasClient(cfg)
+    fatal._client = FlakyVoiceClient(fail_times=1, status=401)
+    try:
+        await fatal.voice_chat_with_retry(b"ogg")
+        check("a fatal voice failure is not retried", False, "no error raised")
+    except NAtlasError:
+        check("a fatal voice failure is not retried", fatal._client.calls == 1)
 
 
 def test_reply_contract():

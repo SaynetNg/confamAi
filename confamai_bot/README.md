@@ -132,28 +132,33 @@ nothing. Only `START` revokes it. NDPA 2023 requires this.
 
 ## 6. Voice notes
 
-A voice note is downloaded from Meta and transcribed to text, then takes the
-ordinary text path — so a spoken "stop" opts out and a spoken NAFDAC number is
-verified exactly as if it had been typed.
+A voice note is answered **voice-first**. It is downloaded from Meta and POSTed
+to the server's `/v1/audio/chat`, which transcribes it with the four preloaded
+NCAIR1 models and runs the chat model on the result, returning the reply — and
+the transcript — in one request. This bot does no transcription at all: no
+torch, no model download, no GPU. The same request carries the conversation so
+far, so a spoken follow-up has the earlier turns.
 
-By default the note is transcribed by the **server**, POSTed to
-`/v1/audio/transcriptions` — the same OpenAI-compatible endpoint the website's
-microphone uses. The four NCAIR1 models already run there, preloaded on the
-server's GPU, so this bot needs no torch, no model download and no GPU. That is
-the whole point of the server endpoint.
+That also means the reply language is **the spoken language**: the server
+detects it from the audio and writes the answer in it, so the bot sends no
+language pin and a Hausa voice note is answered in Hausa without the user
+switching anything. A typed `/hausa` still pins the language for the following
+*text* turns, but a voice note is always answered in whatever it was spoken in.
 
-`WHATSAPP_VOICE_TRANSCRIPTION` selects the path:
+Two consequences are deliberate and worth knowing:
 
-| Value | Behaviour |
-|---|---|
-| `auto` (default) | try the server, fall back to the local model if it is unreachable |
-| `server` | server only — no local fallback, so a server outage is reported rather than silently served by a local model |
-| `local` | load the NCAIR1 models in this process (needs `pip install torch transformers`) |
+- **A spoken "STOP" is not a local opt-out.** Because the note goes straight to
+  the server, it is answered as a question like any other; only a *typed* STOP
+  deletes the session and opts the number out. If a spoken opt-out is needed,
+  the transcript comes back in the response and could be screened before the
+  reply is sent — see `router.py:_ask_voice`.
+- **A spoken language command is likewise not local.** `/hausa` typed still
+  pins the language instantly at zero GPU cost; spoken, it is just answered.
 
-Both paths handle the two traps a WhatsApp voice note hits: the clip is passed
-as **raw bytes** (never a file object, which the pipeline rejects), and a note
-over **30 seconds** is retried with long-form chunking, because Whisper refuses
-a single pass that long and a real voice note usually is.
+Earlier versions transcribed locally or via `/v1/audio/transcriptions` first.
+That path was removed so the server owns speech end to end: the bot no longer
+keeps a second, drifting speech stack, and a spoken NAFDAC number is verified by
+the same server code that verifies a typed one.
 
 ## 7. A server defect this bot works around
 
@@ -263,19 +268,18 @@ documented.
 python -m confamai_bot --test
 ```
 
-324 checks, no network, no WhatsApp account, no GPU. Three halves:
+334 checks, no network, no WhatsApp account, no GPU. Three halves:
 
 - **Payload replay.** Realistic webhook bodies through the router with a stubbed
   N-ATLaS. Asserts a retry sends nothing, a system message is never built,
   `language` travels only when pinned, `/hausa` never reaches the model, an
   opted-out number gets silence, a photo costs no model call, a voice note is
-  transcribed then answered as text, and a server failure is reported rather
-  than guessed.
-- **Voice request shape.** The multipart `file` upload to
-  `/v1/audio/transcriptions`, the pinned language, and the error split: an empty
-  transcript and an undecodable clip are told apart. Plus the transcriber being
-  server-first and only falling back to the local NCAIR1 model, and the local
-  path retrying long-form for a clip over 30 seconds.
+  answered voice-first with no language pin, and a server failure is reported
+  rather than guessed.
+- **Voice request shape.** The multipart `file` upload to `/v1/audio/chat`, the
+  conversation history sent with it, and the error split: an empty reply and an
+  undecodable clip are told apart. Plus retry policy — a transient failure is
+  retried, a fatal one is not.
 - **Reply contract.** The safety rules are not stylistic. A reply calling an
   unregistered product counterfeit is the failure this project exists to
   prevent, so the same assertions the live assay uses are applied to fixtures
@@ -303,9 +307,8 @@ have shipped:
 |---|---|
 | `webhook.py` | FastAPI app: handshake, inbound, `/healthz` (liveness), `/readyz` (readiness) |
 | `router.py` | orchestration — local commands vs the model |
-| `natlas.py` | the N-ATLaS client; the only module that talks upstream (chat and voice transcription) |
+| `natlas.py` | the N-ATLaS client; the only module that talks upstream (chat and voice-first `/v1/audio/chat`) |
 | `whatsapp.py` | Graph API sender and webhook parsing |
-| `audio.py` | speech-to-text for voice notes — server-first, local NCAIR1 fallback |
 | `sessions.py` | per-phone history, SQLite or Supabase, TTL sweeper |
 | `languages.py` | language commands and the opt-out keyword |
 | `render.py` | WhatsApp-safe text, chunking, acknowledgement language |

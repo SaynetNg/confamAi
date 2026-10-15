@@ -29,19 +29,9 @@ python-dotenv>=1.0.0
 psycopg[binary]>=3.1
 
 # ---------------------------------------------------------------------------
-# Optional: local voice transcription (fallback only).
+# Voice notes need nothing extra here.
 #
-# A voice note is transcribed by the N-ATLaS server's
-# /v1/audio/transcriptions endpoint by default, so this process needs no
-# torch and no model — the four NCAIR1 models run on the server's GPU.
-# See confamai_bot/audio.py and WHATSAPP_VOICE_TRANSCRIPTION.
-#
-# The local path (WHATSAPP_VOICE_TRANSCRIPTION=local, or the automatic
-# fallback when the server is unreachable) does load the models here, and
-# only then are these needed:
-#
-#     pip install torch transformers
-#
-# torch is multi-gigabyte and needs a matching CUDA build for GPU
-# transcription, which is why it is not a hard dependency of a process
-# whose job is receiving webhooks.
+# A voice note is answered by the N-ATLaS server's /v1/audio/chat endpoint:
+# the server transcribes the clip with its four NCAIR1 models and runs the chat
+# model on the result, so this process carries no torch, no model and no GPU.
+# See README section 6.

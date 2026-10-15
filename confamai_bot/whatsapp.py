@@ -192,7 +192,7 @@ class WhatsAppClient:
         Two hops, both needing the bearer token: the media id resolves
         to a short-lived URL, and that URL serves the raw bytes. Voice
         notes arrive as .ogg/opus; the bytes pass through untouched,
-        because decoding them is the transcriber's job.
+        because decoding them is the server's job.
         """
         if not media_id:
             raise WhatsAppError("Refusing to download media without an id.")

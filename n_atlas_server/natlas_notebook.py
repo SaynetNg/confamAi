@@ -350,7 +350,7 @@ class Settings:
     repetition_penalty: float = _env_float("N_ATLAS_REPETITION_PENALTY", 1.10)
 
     max_new_tokens: int = _env_int("N_ATLAS_MAX_NEW_TOKENS", 200)
-    default_max_new_tokens: int = _env_int("N_ATLAS_DEFAULT_MAX_TOKENS", 512)
+    default_max_new_tokens: int = _env_int("N_ATLAS_DEFAULT_MAX_TOKENS", 200)
     min_max_new_tokens: int = 1
     # Measured on a Tesla T4 with this model: VRAM grows ~1.6 MB per prompt token
     # (large-vocab logits tensor + KV cache). At 4-bit a ~1400-token prompt peaks
@@ -370,11 +370,12 @@ class Settings:
     log_content: bool = _env_flag("N_ATLAS_LOG_CONTENT", False)
     language_tagging: bool = False
 
-    # Voice: the browser mic at confamai.saynet.ng/ai.html records audio and
-    # POSTs it to /v1/audio/transcriptions. The route needs python-multipart to
-    # parse multipart/form-data (Cell 3 installs it), and the NCAIR1 ASR models
-    # to transcribe. Cell 6 loads them lazily on the first note; the chat engine
-    # is never affected when voice is switched off.
+    # Voice: the browser mic at confamai.saynet.ng/ai.html and the WhatsApp bot
+    # record or receive audio and POST it to /v1/audio/chat (transcribe and
+    # answer in one request); /v1/audio/transcriptions returns the text alone.
+    # Both routes need python-multipart to parse multipart/form-data (Cell 3
+    # installs it) and the NCAIR1 ASR models to transcribe. Cell 4 preloads them
+    # at boot; the chat engine is never affected when voice is switched off.
     voice_enabled: bool = _env_flag("N_ATLAS_VOICE_ENABLED", True)
     # "cuda" by default: the NCAIR1 ASR models are small (Whisper-small, ~1 GB in
     # fp16) and a 70-second clip takes ~200 s on CPU but only a few seconds on the
@@ -385,7 +386,7 @@ class Settings:
     voice_device: str = os.environ.get("N_ATLAS_VOICE_DEVICE", "cuda").strip().lower() or "cuda"
     # A recorded clip, as raw multipart, is far larger than a chat body. The
     # browser refuses anything over 10 MB, so this is the cap that applies to
-    # /v1/audio/transcriptions instead of max_request_bytes.
+    # /v1/audio/chat and /v1/audio/transcriptions instead of max_request_bytes.
     voice_max_bytes: int = _env_int("N_ATLAS_VOICE_MAX_BYTES", 10 * 1024 * 1024)
 
     strict_gpu: bool = _env_flag("N_ATLAS_STRICT_GPU", True)
@@ -899,9 +900,11 @@ print("=" * 70)
 # ---------------------------------------------------------------------------
 # Voice transcription engine — the NCAIR1 speech-to-text models
 # ---------------------------------------------------------------------------
-# The Confam browser chat (confamweb/js/ai-chat.js) records audio with
-# MediaRecorder and POSTs it to /v1/audio/transcriptions. Cell 10 owns that
-# route; this is the model it calls. One NCAIR1 ASR pipeline per language.
+# The Confam browser chat (confamweb/js/ai-chat.js) and the WhatsApp bot record
+# or receive audio and POST it to /v1/audio/chat, which transcribes it and then
+# answers it with the chat model; /v1/audio/transcriptions returns just the
+# text. Cell 10 owns both routes; this is the model they call. One NCAIR1 ASR
+# pipeline per language.
 #
 # All four are loaded here, in Cell 4, not lazily on the first note: the models
 # are needed for language transcription and a first request must not pay the
@@ -1035,13 +1038,15 @@ def _load_voice_model(code: str):
             ) from exc
 
 
-def transcribe_audio(audio_bytes: bytes, language: str = "auto") -> str:
-    """Transcribe one audio clip. The single entry point the route calls.
+def transcribe_audio_detailed(audio_bytes: bytes, language: str = "auto") -> Tuple[str, str]:
+    """Transcribe one clip and report which ASR model produced the text.
 
-    `audio_bytes` is whatever the browser recorded — webm/opus, ogg/opus, wav
-    or mp3. The ASR pipeline decodes it with ffmpeg, so the container does not
-    have to be declared. `language` is an en/ha/yo/ig code, or "auto" to try
-    each model in turn and keep the longest result.
+    Returns `(text, code)` where `code` is the en/ha/yo/ig model that was used.
+    `/v1/audio/chat` needs the code, not just the text: the spoken language is
+    the one the reply has to be written in, and re-detecting it from the
+    transcript is a second, weaker guess at something the ASR step already
+    knows. `language` is an en/ha/yo/ig code, or "auto" to try each model in
+    turn and keep the longest result.
     """
     if not CONFIG.voice_enabled:
         raise ModelUnavailable("voice transcription is disabled on this server.")
@@ -1053,7 +1058,8 @@ def transcribe_audio(audio_bytes: bytes, language: str = "auto") -> str:
         requested = "auto"
 
     if requested != "auto":
-        return _run_voice_pipeline(_load_voice_model(requested), audio_bytes, requested)
+        text = _run_voice_pipeline(_load_voice_model(requested), audio_bytes, requested)
+        return text, requested
 
     # Auto: run every model that loads and keep the longest transcript. The
     # transcriptions are not language-tagged, so transcribing a Yoruba clip with
@@ -1078,7 +1084,17 @@ def transcribe_audio(audio_bytes: bytes, language: str = "auto") -> str:
         )
     if best_code:
         logger.info("voice auto: chose %s (%d chars)", best_code, len(best_text))
-    return best_text
+    return best_text, best_code
+
+
+def transcribe_audio(audio_bytes: bytes, language: str = "auto") -> str:
+    """Transcribe one audio clip. The single entry point the route calls.
+
+    `audio_bytes` is whatever the browser recorded — webm/opus, ogg/opus, wav
+    or mp3. The ASR pipeline decodes it with ffmpeg, so the container does not
+    have to be declared.
+    """
+    return transcribe_audio_detailed(audio_bytes, language)[0]
 
 
 def _run_voice_pipeline(asr, audio_bytes: bytes, code: str) -> str:
@@ -2411,6 +2427,7 @@ import hmac
 from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -2524,9 +2541,13 @@ SERVER_START_TIME = time.time()
 async def guard_request(request: Request, call_next):
     request_id = get_request_id(request)
     started = time.perf_counter()
-    # Audio uploads are legitimately larger than a chat body, so the audio route
-    # gets its own, higher cap rather than being refused by the chat limit.
-    is_audio_upload = request.url.path.rstrip("/").endswith("/v1/audio/transcriptions")
+    # Audio uploads are legitimately larger than a chat body, so the audio routes
+    # get their own, higher cap rather than being refused by the chat limit.
+    # `/v1/audio/chat` carries a clip as well, so it needs the same cap; leaving
+    # it out would reject every voice note at the much smaller chat limit.
+    _audio_paths = ("/v1/audio/transcriptions", "/v1/audio/chat")
+    _path = request.url.path.rstrip("/")
+    is_audio_upload = any(_path.endswith(path) for path in _audio_paths)
     max_bytes = CONFIG.voice_max_bytes if is_audio_upload else CONFIG.max_request_bytes
     content_length = request.headers.get("content-length")
     if content_length:
@@ -2715,6 +2736,11 @@ def health():
         "voice": {
             "enabled": CONFIG.voice_enabled,
             "endpoint": "/v1/audio/transcriptions",
+            # The voice-first endpoint: transcribe the clip and answer it with
+            # the chat model in one request. The browser mic and the WhatsApp
+            # bot both use this, so it is advertised beside the transcript-only
+            # route rather than replacing it.
+            "chat_endpoint": "/v1/audio/chat",
             # The resolved device, not the configured one: a cuda default on a
             # host with no GPU reports "cpu" here, which is what actually runs.
             "device": _voice_device() if CONFIG.voice_enabled else CONFIG.voice_device,
@@ -2848,35 +2874,23 @@ async def audio_transcriptions(
 STREAMING_SUPPORTED = False
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
-def chat_completions(payload: ChatCompletionRequest, request: Request):
-    request_id = get_request_id(request)
-    if payload.stream and not STREAMING_SUPPORTED:
-        raise InvalidRequest(
-            "Streaming is not supported by this server. Send stream=false."
-        )
-    if payload.n != 1:
-        raise InvalidRequest("Only n=1 is supported.")
+def run_chat_turn(
+    client_messages: List[Dict[str, str]],
+    language: Optional[str],
+    max_new_tokens: int,
+    request_id: str,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
+) -> GenerationResult:
+    """One chat turn: build the prompt, attach verified data, generate.
 
-    served_name = resolve_model_name(payload.model)
-
-    client_messages = [{"role": m.role, "content": m.content} for m in payload.messages]
-    max_new_tokens = clamp_int(
-        payload.requested_max_tokens()
-        if payload.requested_max_tokens() is not None
-        else CONFIG.default_max_new_tokens,
-        CONFIG.min_max_new_tokens,
-        CONFIG.max_new_tokens,
-    )
-    if payload.requested_max_tokens() is not None and payload.requested_max_tokens() > CONFIG.max_new_tokens:
-        logger.warning(
-            "request_id=%s clamped max_tokens %s -> %s",
-            request_id,
-            payload.requested_max_tokens(),
-            CONFIG.max_new_tokens,
-        )
-
-    prepared = build_prompt_messages(client_messages, language=payload.language)
+    Shared by `/v1/chat/completions` and `/v1/audio/chat` so the two cannot
+    drift. Both paths must attach the greenbook block the same way and answer in
+    the same language; a second copy of this logic in the voice route is exactly
+    how a spoken NAFDAC number would end up unverified while a typed one was.
+    """
+    prepared = build_prompt_messages(client_messages, language=language)
 
     # The greenbook data is attached here, as its own system message, after the
     # prompt is built. It has to come after the language directive so the
@@ -2910,23 +2924,18 @@ def chat_completions(payload: ChatCompletionRequest, request: Request):
             nafdac_context.get("confidence"),
         )
 
-    result = generate(
+    return generate(
         prepared,
         max_new_tokens=max_new_tokens,
-        temperature=payload.temperature,
-        top_p=payload.top_p,
-        repetition_penalty=payload.repetition_penalty,
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
         request_id=request_id,
     )
 
-    log_fields = result.to_log_fields()
-    logger.info(
-        "request_id=%s model=%s %s",
-        request_id,
-        served_name,
-        " ".join(f"{k}={v}" for k, v in log_fields.items()),
-    )
 
+def chat_completion_body(result: GenerationResult, served_name: str) -> Dict[str, Any]:
+    """The OpenAI-compatible response envelope for one generation."""
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -2951,6 +2960,180 @@ def chat_completions(payload: ChatCompletionRequest, request: Request):
             "total_tokens": result.input_tokens + result.output_tokens,
         },
     }
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+def chat_completions(payload: ChatCompletionRequest, request: Request):
+    request_id = get_request_id(request)
+    if payload.stream and not STREAMING_SUPPORTED:
+        raise InvalidRequest(
+            "Streaming is not supported by this server. Send stream=false."
+        )
+    if payload.n != 1:
+        raise InvalidRequest("Only n=1 is supported.")
+
+    served_name = resolve_model_name(payload.model)
+
+    client_messages = [{"role": m.role, "content": m.content} for m in payload.messages]
+    max_new_tokens = clamp_int(
+        payload.requested_max_tokens()
+        if payload.requested_max_tokens() is not None
+        else CONFIG.default_max_new_tokens,
+        CONFIG.min_max_new_tokens,
+        CONFIG.max_new_tokens,
+    )
+    if payload.requested_max_tokens() is not None and payload.requested_max_tokens() > CONFIG.max_new_tokens:
+        logger.warning(
+            "request_id=%s clamped max_tokens %s -> %s",
+            request_id,
+            payload.requested_max_tokens(),
+            CONFIG.max_new_tokens,
+        )
+
+    result = run_chat_turn(
+        client_messages,
+        language=payload.language,
+        max_new_tokens=max_new_tokens,
+        request_id=request_id,
+        temperature=payload.temperature,
+        top_p=payload.top_p,
+        repetition_penalty=payload.repetition_penalty,
+    )
+
+    log_fields = result.to_log_fields()
+    logger.info(
+        "request_id=%s model=%s %s",
+        request_id,
+        served_name,
+        " ".join(f"{k}={v}" for k, v in log_fields.items()),
+    )
+
+    return chat_completion_body(result, served_name)
+
+
+@app.post("/v1/audio/chat", dependencies=[Depends(verify_api_key)])
+async def audio_chat(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form(default=""),
+    language: str = Form(default="auto"),
+    messages: str = Form(default=""),
+    temperature: Optional[float] = Form(default=None),
+):
+    """Answer one spoken message. Backs the browser mic and the WhatsApp bot.
+
+    Voice-first, not transcription-first: the clip is transcribed and then
+    answered by the chat model in a single request, so a caller gets the
+    assistant's reply rather than a transcript it would have to send back. The
+    transcript-only `/v1/audio/transcriptions` is unchanged beside it.
+
+    OpenAI-compatible in spirit: multipart `file` plus optional `model`. The
+    extras are `language` (en/ha/yo/ig, default "auto"), an optional `messages`
+    JSON array of prior turns, and `temperature`. `messages` is accepted as a
+    JSON string because a multipart form has no nested fields.
+
+    The reply language follows the clip: the ASR step reports which language
+    model produced the transcript, and that pins the answer, because a spoken
+    Yoruba question deserves a Yoruba answer and the transcript alone would
+    leave the detector to guess again. An explicit `language` in the form wins.
+    """
+    if not CONFIG.voice_enabled:
+        raise ModelUnavailable("voice transcription is disabled on this server.")
+
+    request_id = get_request_id(request)
+    audio_bytes = await file.read()
+    await file.close()
+    if not audio_bytes:
+        raise InvalidRequest("The audio file is empty.")
+    if len(audio_bytes) > CONFIG.voice_max_bytes:
+        raise InvalidRequest(
+            "The audio file is too large. Record a shorter clip."
+        )
+
+    served_name = resolve_model_name(model)
+
+    requested = (language or "auto").strip().lower()
+    if requested not in VOICE_MODELS and requested != "auto":
+        requested = "auto"
+
+    # ASR and generation are both blocking and both run on one shared device.
+    # This route is `async` only to read the upload, so those two calls are
+    # pushed to a worker thread: on the event loop they would stall every other
+    # request, including the health checks, for the length of a transcription
+    # plus a generation. That is the same reason /v1/chat/completions is a plain
+    # `def` route, which FastAPI already runs in the threadpool.
+    started = time.perf_counter()
+    transcript, spoken_code = await run_in_threadpool(
+        transcribe_audio_detailed, audio_bytes, requested
+    )
+    transcribe_seconds = time.perf_counter() - started
+    if not transcript:
+        raise InvalidRequest(
+            "The audio could not be transcribed. Send a webm, ogg, wav or mp3 clip."
+        )
+
+    # Prior turns, as a JSON array of {role, content}. A malformed or absent
+    # value is a single-turn question, not a 400: the clip is the request, and
+    # a client that cannot encode history should still be answered.
+    client_messages: List[Dict[str, str]] = []
+    if messages.strip():
+        try:
+            parsed = json.loads(messages)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed[: CONFIG.max_messages]:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                if role not in ("user", "assistant"):
+                    continue
+                content = normalize_content(item.get("content"))
+                if content:
+                    client_messages.append({"role": role, "content": content})
+
+    # The spoken turn is the last user message, always. A client cannot inject
+    # one ahead of it by putting a user turn in `messages`.
+    client_messages.append({"role": "user", "content": transcript})
+
+    # Spoken language pins the reply unless the caller pinned one explicitly.
+    reply_language = requested if requested != "auto" else None
+    if reply_language is None and spoken_code in LANGUAGE_NAMES:
+        reply_language = spoken_code
+
+    max_new_tokens = clamp_int(
+        CONFIG.default_max_new_tokens,
+        CONFIG.min_max_new_tokens,
+        CONFIG.max_new_tokens,
+    )
+    result = await run_in_threadpool(
+        run_chat_turn,
+        client_messages,
+        reply_language,
+        max_new_tokens,
+        request_id,
+        temperature,
+    )
+
+    logger.info(
+        "request_id=%s audio/chat bytes=%d asr=%s language=%s transcript_chars=%d "
+        "transcribe_seconds=%.2f %s",
+        request_id,
+        len(audio_bytes),
+        spoken_code or "none",
+        reply_language or "auto",
+        len(transcript),
+        transcribe_seconds,
+        " ".join(f"{k}={v}" for k, v in result.to_log_fields().items()),
+    )
+
+    body = chat_completion_body(result, served_name)
+    # Additive fields: a client reading only the OpenAI shape ignores them, and
+    # a client that wants to show what was heard can use `transcript`.
+    body["transcript"] = transcript
+    body["language"] = reply_language or LAST_LANGUAGE_DETECTION.get("language", "en")
+    body["asr"] = {"language": spoken_code or None, "seconds": round(transcribe_seconds, 2)}
+    return body
 
 
 @app.post("/v1/completions", dependencies=[Depends(verify_api_key)])

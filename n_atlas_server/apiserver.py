@@ -18,7 +18,8 @@ Configure the bearer key before exposing it:
 
 Health:  GET  http://127.0.0.1:8000/health
 Chat:    POST http://127.0.0.1:8000/v1/chat/completions
-Voice:   POST http://127.0.0.1:8000/v1/audio/transcriptions   (multipart `file`)
+Voice:   POST http://127.0.0.1:8000/v1/audio/chat             (multipart `file`; answers it)
+         POST http://127.0.0.1:8000/v1/audio/transcriptions   (multipart `file`; text only)
 Docs:    GET  http://127.0.0.1:8000/docs
 
 Note: no API key is hard-coded here. If N_ATLAS_API_KEY is unset, a random

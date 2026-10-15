@@ -239,9 +239,9 @@ with `python build_kaggle_dataset.py`, re-upload it, and re-run the cells.
 | `N_ATLAS_LOG_CONTENT` | `0` | `1` logs message text (off by default). |
 | `N_ATLAS_LANGUAGE_TAGGING` | `1` | `0` disables the deterministic language directive. |
 | `N_ATLAS_STRICT_GPU` | `1` | `0` permits CPU (dev only). |
-| `N_ATLAS_VOICE_ENABLED` | `1` | `0` removes `/v1/audio/transcriptions`, skips the ASR models and `python-multipart`, and leaves chat untouched. |
+| `N_ATLAS_VOICE_ENABLED` | `1` | `0` removes `/v1/audio/transcriptions` and `/v1/audio/chat`, skips the ASR models and `python-multipart`, and leaves chat untouched. |
 | `N_ATLAS_VOICE_DEVICE` | `cuda` | Where the NCAIR1 ASR models run. On GPU they load in **fp16** to halve their VRAM. Falls back to CPU automatically when no GPU is present; set `cpu` to keep the T4 entirely for chat. |
-| `N_ATLAS_VOICE_MAX_BYTES` | `10485760` | Upload cap for `/v1/audio/transcriptions` (10 MB, matching the browser's own limit). The chat cap `N_ATLAS_MAX_REQUEST_BYTES` is unaffected. |
+| `N_ATLAS_VOICE_MAX_BYTES` | `10485760` | Upload cap for both audio routes (10 MB, matching the browser's own limit). The chat cap `N_ATLAS_MAX_REQUEST_BYTES` is unaffected. |
 | `N_ATLAS_HOST` / `N_ATLAS_PORT` | `0.0.0.0` / `8000` | Bind address. |
 
 `PYTORCH_ALLOC_CONF` is set to `expandable_segments:True` in Cell 2 before CUDA
@@ -388,19 +388,50 @@ print(reply.choices[0].message.content)
 | `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status, voice. |
 | `GET /v1/models` | bearer | OpenAI-compatible model list. |
 | `POST /v1/chat/completions` | bearer | Chat completion. Full message history. |
-| `POST /v1/audio/transcriptions` | bearer | Transcribe one recorded clip (multipart). Backs the browser mic. |
+| `POST /v1/audio/transcriptions` | bearer | Transcribe one recorded clip (multipart). |
+| `POST /v1/audio/chat` | bearer | Transcribe a clip **and** answer it (voice-first). Backs the browser mic and the WhatsApp bot. |
 | `POST /v1/nafdac/verify` | bearer | Check one NAFDAC number against the greenbook. |
 | `POST /v1/nafdac/search` | bearer | Free-text product search. |
 | `GET /v1/nafdac/sources` | bearer | Which greenbook sources are reachable. |
 
 Streaming (`stream=true`) is **not** supported and returns `400`.
 
+### Voice chat — speak, get an answer (Cell 10, engine in Cell 6)
+
+`POST /v1/audio/chat` is the voice-first route. It transcribes the clip **and**
+runs the chat model on the transcript, returning the assistant's reply and the
+transcript in one request, so a caller never has to send the text back. Both the
+browser mic on `confamai.saynet.ng/ai.html` and the WhatsApp bot use it.
+
+```bash
+curl -X POST https://YOUR-TUNNEL/v1/audio/chat \
+  -H "Authorization: Bearer $N_ATLAS_API_KEY" \
+  -F "file=@clip.webm" \
+  -F 'messages=[{"role":"user","content":"What is my name?"},{"role":"assistant","content":"Your name is Ahmed."}]'
+# -> { "choices": [{"message": {"content": "..."}}], "transcript": "...", "language": "en", "asr": {"language": "en", ...} }
+```
+
+- **Input** — multipart `file` (webm/opus, ogg/opus, wav or mp3), plus optional
+  `model`, `language`, `temperature`, and `messages` (a JSON array of prior
+  user/assistant turns; the spoken turn is appended as the final user message).
+- **Answer shape** — the ordinary OpenAI chat completion (`choices[0].message`),
+  with additive `transcript`, `asr` and `language` fields. A client reading only
+  the OpenAI shape is unaffected.
+- **Reply language** — follows the clip. The ASR step reports which NCAIR1 model
+  produced the transcript, and that pins the answer, because a spoken Yoruba
+  question deserves a Yoruba answer; an explicit `language` field wins.
+- **Verified data** — the same `_nafdac_enrich` block is attached as for
+  `/v1/chat/completions` (both go through `run_chat_turn`), so a spoken NAFDAC
+  number is verified exactly as a typed one. A client-supplied system turn in
+  `messages` is dropped, so the voice path is not a way to assert a verdict.
+- **Blocking work** — ASR and generation run on a worker thread, so a long
+  transcription does not stall every other request on the event loop.
+
 ### Voice transcription (Cell 10, engine in Cell 6)
 
-`POST /v1/audio/transcriptions` is what the microphone on
-`confamai.saynet.ng/ai.html` uploads to. It is deliberately
-OpenAI-compatible, so the browser's existing `js/ai-chat.js` recorder needs no
-change:
+`POST /v1/audio/transcriptions` is the transcript-only route, kept for callers
+that want just the text. It is deliberately OpenAI-compatible, so the browser's
+existing `js/ai-chat.js` recorder needs no change:
 
 ```bash
 curl -X POST https://YOUR-TUNNEL/v1/audio/transcriptions \
