@@ -266,7 +266,7 @@ def create_bridge_app() -> FastAPI:
         await openwa_client.start()
         await store.setup()
         sweeper.start()
-        print("[bridge] Confam AI ↔ open-wa bridge ready", flush=True)
+        print("[bridge] Confam AI <-> open-wa bridge ready", flush=True)
         print(f"[bridge] open-wa API: {OPENWA_API_URL}", flush=True)
         print("[bridge] Listening for webhooks on POST /openwa", flush=True)
         try:
@@ -278,7 +278,7 @@ def create_bridge_app() -> FastAPI:
             await store.close()
 
     app = FastAPI(
-        title="Confam AI ↔ open-wa Bridge",
+        title="Confam AI <-> open-wa Bridge",
         description="Bridges open-wa webhooks to confamai_bot router",
         version="1.0.0",
         lifespan=lifespan,
@@ -341,6 +341,6 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("BRIDGE_PORT", "8000"))
-    print(f"[bridge] Starting Confam AI ↔ open-wa bridge on port {port}", flush=True)
+    print(f"[bridge] Starting Confam AI <-> open-wa bridge on port {port}", flush=True)
     bridge_app = create_bridge_app()
     uvicorn.run(bridge_app, host="0.0.0.0", port=port)
