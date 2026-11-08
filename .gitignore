@@ -30,3 +30,8 @@ conversations/
 # about 40 seconds to read the workbook; with it, 1.5.
 nafdac_greenbook.xlsx.nafdac_rows.csv
 nafdac_greenbook.xlsx.nafdac_rows.csv.stamp
+
+# Node & WhatsApp Web
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
