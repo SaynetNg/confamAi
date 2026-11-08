@@ -1,0 +1,21 @@
+# Dependencies for the NAFDAC weekly refresh web service.
+#
+# Used by the Render web service whose start command is:
+#     uvicorn nafdac_refresh_service:app --host 0.0.0.0 --port $PORT
+#
+# This is a self-contained set: the service, the scraper and the loader. It
+# intentionally does not reuse the bot's requirements.txt, which carries the
+# WhatsApp stack the refresh service has no use for.
+
+# Web service
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# Scraper (nafdac_scraper)
+requests>=2.31,<3
+pandas>=2.0
+openpyxl>=3.1
+
+# Loader (nafdac_source.load_postgres)
+psycopg[binary]>=3.1
+python-dotenv>=1.0.0

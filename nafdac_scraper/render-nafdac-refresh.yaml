@@ -1,0 +1,56 @@
+# Render Blueprint for the NAFDAC Greenbook weekly refresh — as a WEB SERVICE.
+#
+# The service stays running, serves /healthz and /status, and an in-process
+# scheduler runs the scrape + PostgreSQL load once a week. POST /run triggers
+# the same job on demand. This is not a Render Cron Job.
+#
+# Create it one of two ways:
+#
+#   Blueprint:  Render dashboard -> New -> Blueprint -> select this repo and set
+#               the Blueprint path to `nafdac_scraper/render-nafdac-refresh.yaml`.
+#   Dashboard:  New -> Web Service, then copy the values below.
+#
+# IMPORTANT: use a paid instance type (Starter or higher). A free Render web
+# service spins down after inactivity, which would stop the in-process
+# scheduler and silently miss the weekly run.
+#
+# Run a single worker. `uvicorn` is started without --workers; do not add it,
+# or each worker would schedule the job.
+
+services:
+  - type: web
+    name: nafdac-weekly-refresh
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r nafdac_scraper/requirements-refresh.txt
+    startCommand: uvicorn nafdac_refresh_service:app --app-dir nafdac_scraper --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+      # The hosted PostgreSQL DSN. Set the real value in the Render dashboard
+      # as a Secret; it is read by nafdac_source.load_postgres and never logged.
+      - key: NAFDAC_DATABASE_URL
+        sync: false
+
+      # Bearer token required by POST /run and GET /logs. Generate a long
+      # random value (for example `python -c "import secrets;print(secrets.token_urlsafe(32))"`).
+      - key: NAFDAC_REFRESH_API_KEY
+        sync: false
+
+      # Weekly slot: Sunday 03:00 UTC (04:00 WAT).
+      - key: NAFDAC_REFRESH_DOW
+        value: "sun"
+      - key: NAFDAC_REFRESH_HOUR
+        value: "3"
+      - key: NAFDAC_REFRESH_MINUTE
+        value: "0"
+      - key: NAFDAC_REFRESH_TIMEZONE
+        value: "UTC"
+
+      # NAFDAC's certificate expired 2026-11-06. While it is expired, uncomment
+      # the next two lines to let the scrape run; REMOVE them once NAFDAC renews
+      # the certificate. See nafdac_scraper/README.md.
+      # - key: NAFDAC_SCRAPER_INSECURE_TLS
+      #   value: "1"

@@ -34,8 +34,9 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-SCRAPER_DIR = ROOT / "nafdac_scraper"
+HERE = Path(__file__).resolve().parent          # nafdac_scraper/
+REPO_ROOT = HERE.parent                          # repository root
+SCRAPER_DIR = HERE
 
 
 def _step(label: str, command: list, cwd: Path) -> int:
@@ -161,7 +162,7 @@ def main(argv=None) -> int:
     if args.dry_run_load:
         load_cmd.append("--dry-run")
 
-    code = _step("load", load_cmd, ROOT)
+    code = _step("load", load_cmd, REPO_ROOT)
     if code != 0:
         print(f"[weekly-refresh] load failed (exit {code}).", file=sys.stderr, flush=True)
         return 1

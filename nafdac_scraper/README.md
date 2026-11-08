@@ -371,34 +371,53 @@ If you don't need Manufacturer Name, Manufacturer Country or Marketing Category,
 `--no-details` gets you the full dataset in about 60 seconds with 19 requests.
 That's a public-sector site — keep `--detail-delay` at 0.4 s or higher.
 
-## Weekly refresh on a server (Render Cron Job)
+## Weekly refresh as a FastAPI web service (Render)
 
-The scraper and the PostgreSQL loader share one entry point so a scheduler runs
-both in order from the repository root:
+The scraper and the PostgreSQL loader are driven by a long-running FastAPI
+service, `nafdac_scraper/nafdac_refresh_service.py`. The service stays up,
+exposes health/status endpoints, and an in-process scheduler runs the job once a
+week. It is **not** a Render Cron Job.
+
+The service delegates the work to `nafdac_scraper/weekly_nafdac_refresh.py`,
+which runs the scraper and then `nafdac_source.load_postgres` (upsert into
+`nafdac_products`, archive rows that left the export into
+`nafdac_product_history`). A scrape failure stops the job before it touches the
+database.
 
 ```bash
-python weekly_nafdac_refresh.py
+# local, from the repository root
+uvicorn nafdac_refresh_service:app --app-dir nafdac_scraper --host 0.0.0.0 --port 8000
 ```
 
-It runs `nafdac_scraper/scraper.py` (full crawl, CSV only — no XLSX, because the
-database is the target), then `python -m nafdac_source.load_postgres`, which
-upserts into `nafdac_products` and archives rows that have left the export into
-`nafdac_product_history`. Each step runs as a subprocess, so a scrape failure
-stops the job before it touches the database.
+| Endpoint | Purpose |
+|---|---|
+| `GET /healthz` | Render health check |
+| `GET /status` | running flag, last run, next scheduled run |
+| `POST /run` | trigger a refresh now (requires `NAFDAC_REFRESH_API_KEY`) |
+| `GET /logs` | recent runner output (requires `NAFDAC_REFRESH_API_KEY`) |
 
-`render-cron.yaml` at the repository root is a Render Blueprint for the weekly
-job (Sundays 03:00 UTC). Import it, or create a Cron Job in the dashboard with:
+Render web service settings (also in `nafdac_scraper/render-nafdac-refresh.yaml`):
 
 | Setting | Value |
 |---|---|
-| Start command | `python weekly_nafdac_refresh.py` |
-| Build command | `pip install -r nafdac_scraper/requirements.txt -r nafdac_source/requirements.txt` |
-| Schedule | `0 3 * * 0` |
-| Environment | `NAFDAC_DATABASE_URL` = the hosted PostgreSQL DSN (as a Secret) |
+| Start command | `uvicorn nafdac_refresh_service:app --app-dir nafdac_scraper --host 0.0.0.0 --port $PORT` |
+| Build command | `pip install -r nafdac_scraper/requirements-refresh.txt` |
+| Health check | `/healthz` |
+| Instance | **paid** (Starter+); a free instance spins down and misses the schedule |
+| Workers | 1 only (the scheduler is in-process) |
+| Environment | `NAFDAC_DATABASE_URL` (Secret), `NAFDAC_REFRESH_API_KEY` (Secret) |
 
-The DSN is never printed; the loader logs only the host and database name.
+Weekly slot is configured by `NAFDAC_REFRESH_DOW` / `_HOUR` / `_MINUTE` /
+`_TIMEZONE`; defaults are Sunday 03:00 UTC. The DSN is never printed — the
+loader logs only the host and database name.
 
-Useful flags:
+The standalone runner can also be used directly, which is what the service
+calls:
+
+```bash
+# from the repository root
+python nafdac_scraper/weekly_nafdac_refresh.py
+```
 
 | Flag | Effect |
 |---|---|
