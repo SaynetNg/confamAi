@@ -286,25 +286,38 @@ let client = null;
 function initClient() {
     console.log('[INITIALIZING] Launching WhatsApp Web client...');
 
+    const isWindows = process.platform === 'win32';
+    const chromePath = process.env.PUPPETEER_EXECUTABLE_PATH || (
+        isWindows
+            ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+            : (fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome'
+               : (fs.existsSync('/usr/bin/chromium-browser') ? '/usr/bin/chromium-browser'
+               : (fs.existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined)))
+    );
+
+    const puppeteerConfig = {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+            // Anti-sleep and anti-throttling flags:
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding'
+        ]
+    };
+    if (chromePath) {
+        puppeteerConfig.executablePath = chromePath;
+    }
+
     client = new Client({
         authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-        puppeteer: {
-            executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                // Anti-sleep and anti-throttling flags:
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding'
-            ]
-        }
+        puppeteer: puppeteerConfig
     });
 
     client.on('qr', (qr) => {
