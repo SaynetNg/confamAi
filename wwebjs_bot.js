@@ -5,20 +5,22 @@ const http = require('http');
 const fs = require('fs');
 
 const NATLAS_URL = process.env.N_ATLAS_BASE_URL || 'https://ai.saynet.ng/v1/chat/completions';
+const NATLAS_VOICE_URL = process.env.N_ATLAS_VOICE_URL || 'https://ai.saynet.ng/v1/audio/chat';
 const NATLAS_API_KEY = process.env.N_ATLAS_API_KEY || 'KgRRl_6vEp7YRCY6agQ9HjH0RFk6T6hr9KYQq7YTRfRrKeWQIyFs_biogXFvK_Lo';
 const NATLAS_MODEL = process.env.N_ATLAS_MODEL || 'n-atlas';
 const HTTP_PORT = 3000;
 
 console.log('====================================================');
-console.log(' Confam AI - WhatsApp Bot (Direct N-ATLaS Engine)');
-console.log(' N-ATLaS Endpoint:', NATLAS_URL);
-console.log(' Model:', NATLAS_MODEL);
-console.log(' Web Dashboard:', `http://localhost:${HTTP_PORT}`);
+console.log(' Confam AI - WhatsApp Bot (Voice + Text N-ATLaS)');
+console.log(' Text Endpoint: ', NATLAS_URL);
+console.log(' Voice Endpoint:', NATLAS_VOICE_URL);
+console.log(' Model:         ', NATLAS_MODEL);
+console.log(' Web Dashboard: ', `http://localhost:${HTTP_PORT}`);
 console.log('====================================================\n');
 
 // State tracking for the web UI
 let botState = {
-    status: 'initializing', // 'initializing' | 'qr' | 'authenticated' | 'ready'
+    status: 'initializing',
     qr: null,
     phone: '2349060970339'
 };
@@ -59,7 +61,6 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Serve HTML dashboard
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(`<!DOCTYPE html>
 <html lang="en">
@@ -184,13 +185,12 @@ const server = http.createServer((req, res) => {
     <div id="success-section" class="success-box">
       <div class="success-icon">🎉</div>
       <h1 style="color: #075e54;">WhatsApp Connected!</h1>
-      <p>Confam AI is actively online. Send any product name or NAFDAC number to <strong>+234 906 097 0339</strong> to verify it.</p>
+      <p>Confam AI is actively online. Send any voice note or text message to <strong>+234 906 097 0339</strong> to verify products.</p>
     </div>
   </div>
 
   <script>
     let currentQr = null;
-    let qrRenderer = null;
 
     async function poll() {
       try {
@@ -203,7 +203,7 @@ const server = http.createServer((req, res) => {
 
         if (data.status === 'ready' || data.status === 'authenticated') {
           badge.className = 'badge connected';
-          badge.innerHTML = '● Online & Active';
+          badge.innerHTML = '● Online & Active (Voice + Text)';
           qrSec.style.display = 'none';
           succSec.style.display = 'block';
         } else if (data.status === 'qr' && data.qr) {
@@ -266,7 +266,6 @@ client.on('qr', (qr) => {
     botState.qr = qr;
 
     try {
-        // Also keep desktop file updated as a static fallback
         fs.writeFileSync('C:\\Users\\USER\\Desktop\\whatsapp_qr.html', `<meta http-equiv="refresh" content="0; url=http://localhost:${HTTP_PORT}">`, 'utf8');
     } catch (e) {}
 });
@@ -283,33 +282,129 @@ client.on('auth_failure', (msg) => {
 
 client.on('ready', () => {
     console.log('\n========================================================');
-    console.log(' >>> CONFAM AI BOT IS ONLINE AND ACTIVELY RESPONDING <<<');
+    console.log(' >>> CONFAM AI BOT IS ONLINE (VOICE + TEXT READY) <<<');
     console.log('========================================================\n');
     botState.status = 'ready';
 });
 
 client.on('message', async (msg) => {
+    // Ignore group chats, status broadcasts, and bot's own messages
     if (msg.from.includes('@g.us') || msg.from === 'status@broadcast' || msg.fromMe) {
         return;
     }
 
     const sender = msg.from.replace('@c.us', '');
     const userText = (msg.body || '').trim();
+    const isVoice = msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio');
+    const isImage = msg.hasMedia && msg.type === 'image';
 
-    console.log(`[INCOMING] From +${sender}: "${userText || '[' + msg.type + ']'}"`);
+    console.log(`[INCOMING] From ${sender}: "${userText || '[' + msg.type + ']'}"`);
 
-    if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio')) {
-        await msg.reply("I received your voice note! For the fastest and most accurate NAFDAC verification, please type the product name or NAFDAC registration number (e.g. 04-1234 or A4-5678).");
+    const session = getSession(sender);
+
+    // ----------------------------------------------------
+    // VOICE NOTE PROCESSING (Same as Browser /v1/audio/chat)
+    // ----------------------------------------------------
+    if (isVoice) {
+        console.log(`[VOICE NOTE] Receiving voice note from ${sender}...`);
+        try {
+            const media = await msg.downloadMedia();
+            if (!media || !media.data) {
+                console.error('[VOICE NOTE] Empty or failed media download');
+                await msg.reply("I couldn't download your voice note. Please speak again or send your question as text.");
+                return;
+            }
+
+            const audioBuffer = Buffer.from(media.data, 'base64');
+            const mime = media.mimetype || 'audio/ogg';
+            let ext = 'ogg';
+            if (mime.includes('mp4')) ext = 'mp4';
+            else if (mime.includes('wav')) ext = 'wav';
+            else if (mime.includes('webm')) ext = 'webm';
+
+            console.log(`[VOICE NOTE] Uploading ${audioBuffer.length} bytes to ${NATLAS_VOICE_URL}...`);
+
+            const form = new FormData();
+            const blob = new Blob([audioBuffer], { type: mime });
+            form.append('file', blob, `voice-note.${ext}`);
+            form.append('model', NATLAS_MODEL);
+            form.append('language', 'auto');
+
+            const prior = session.messages.filter(m => m.role === 'user' || m.role === 'assistant').slice(-8);
+            if (prior.length > 0) {
+                form.append('messages', JSON.stringify(prior));
+            }
+
+            const res = await fetch(NATLAS_VOICE_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${NATLAS_API_KEY}`,
+                    'User-Agent': 'confamai-bot/1.0 (+https://ai.saynet.ng)'
+                },
+                body: form
+            });
+
+            if (!res.ok) {
+                const errBody = await res.text();
+                console.error(`[VOICE ERROR] HTTP ${res.status}:`, errBody);
+                throw new Error(`Voice endpoint returned HTTP ${res.status}`);
+            }
+
+            const data = await res.json();
+            let aiReply = '';
+            if (Array.isArray(data.choices) && data.choices[0] && data.choices[0].message) {
+                aiReply = data.choices[0].message.content || '';
+            }
+            if (!aiReply) {
+                aiReply = data.reply || data.answer || data.message || '';
+            }
+            const transcript = (data.transcript || data.text || data.transcription || '').trim();
+
+            console.log(`[VOICE TRANSCRIPT] "${transcript}"`);
+
+            aiReply = cleanAiResponse(aiReply);
+            if (!aiReply) {
+                aiReply = "I heard your voice note, but could not find a product match. Please mention the specific product name or NAFDAC registration number.";
+            }
+
+            // Save conversation turn
+            session.messages.push({ role: 'user', content: transcript || '[Voice Note]' });
+            session.messages.push({ role: 'assistant', content: aiReply });
+            if (session.messages.length > 8) session.messages = session.messages.slice(-8);
+
+            // Send reply with transcript quote
+            let finalReply = aiReply;
+            if (transcript) {
+                finalReply = `🎤 _"${transcript}"_\n\n${aiReply}`;
+            }
+
+            console.log(`[OUTGOING VOICE REPLY] To ${sender}: "${aiReply.substring(0, 80)}..."`);
+            await msg.reply(finalReply);
+            return;
+
+        } catch (err) {
+            console.error('[VOICE ERROR] Failed to process voice note:', err.message);
+            await msg.reply("I had trouble transcribing that voice note. Please speak clearly, or send the product name or NAFDAC number as text.");
+            return;
+        }
+    }
+
+    // ----------------------------------------------------
+    // IMAGE PROCESSING GUIDANCE
+    // ----------------------------------------------------
+    if (isImage) {
+        await msg.reply("I received your product photo! To verify it against the NAFDAC database, please also type the product name or the NAFDAC registration number (e.g. 04-1234 or A4-5678) visible on the pack.");
         return;
     }
 
+    // ----------------------------------------------------
+    // TEXT MESSAGE PROCESSING
+    // ----------------------------------------------------
     if (!userText) {
         return;
     }
 
-    const session = getSession(sender);
     session.messages.push({ role: 'user', content: userText });
-
     if (session.messages.length > 8) {
         session.messages = session.messages.slice(-8);
     }
@@ -348,11 +443,11 @@ client.on('message', async (msg) => {
 
         session.messages.push({ role: 'assistant', content: aiReply });
 
-        console.log(`[OUTGOING] To +${sender}: "${aiReply.substring(0, 80)}..."`);
+        console.log(`[OUTGOING] To ${sender}: "${aiReply.substring(0, 80)}..."`);
         await msg.reply(aiReply);
 
     } catch (err) {
-        console.error(`[ERROR] AI call failed for +${sender}:`, err.response?.data || err.message);
+        console.error(`[ERROR] AI call failed for ${sender}:`, err.response?.data || err.message);
         await msg.reply("Confam AI is currently experiencing high verification traffic. Please send the product name or NAFDAC number again in a moment.");
     }
 });
