@@ -308,10 +308,23 @@ client.on('message', async (msg) => {
     if (isVoice) {
         console.log(`[VOICE NOTE] Receiving voice note from ${sender}...`);
         try {
-            const media = await msg.downloadMedia();
+            // Give WhatsApp Web 800ms to resolve media stage before first download attempt
+            await new Promise(res => setTimeout(res, 800));
+
+            let media = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    media = await msg.downloadMedia();
+                    if (media && media.data) break;
+                } catch (dmErr) {
+                    console.warn(`[VOICE NOTE] Attempt ${attempt} failed: ${dmErr ? (dmErr.message || dmErr.toString()) : 'unknown'}`);
+                    if (attempt < 3) await new Promise(res => setTimeout(res, 1200));
+                }
+            }
+
             if (!media || !media.data) {
-                console.error('[VOICE NOTE] Empty or failed media download');
-                await msg.reply("I couldn't download your voice note. Please speak again or send your question as text.");
+                console.error('[VOICE NOTE] Empty or failed media download after retries');
+                await msg.reply("I couldn't load your voice note. Please speak clearly, or send the product name or NAFDAC number as text.");
                 return;
             }
 
