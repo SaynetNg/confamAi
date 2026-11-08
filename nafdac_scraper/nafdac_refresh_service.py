@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Deque, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 
 HERE = Path(__file__).resolve().parent          # nafdac_scraper/
 REPO_ROOT = HERE.parent                          # repository root
@@ -387,6 +387,16 @@ def root() -> dict:
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
+
+
+@app.head("/healthz", include_in_schema=False)
+def healthz_head() -> Response:
+    """HEAD support for uptime monitors (UptimeRobot sends HEAD by default).
+
+    The GET route does not implicitly accept HEAD here, so without this a
+    monitor would receive 405 and report the service as down.
+    """
+    return Response(status_code=200)
 
 
 @app.get("/status")
