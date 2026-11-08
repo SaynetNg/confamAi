@@ -15,6 +15,17 @@ Every tunable value lives here.
 
 from __future__ import annotations
 
+import os
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable (1/true/yes/on)."""
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
 # --------------------------------------------------------------------------
 # Site
 # --------------------------------------------------------------------------
@@ -43,6 +54,17 @@ AJAX_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Accept": "application/json, text/javascript, */*; q=0.01",
 }
+
+# --------------------------------------------------------------------------
+# TLS
+# --------------------------------------------------------------------------
+# Verify the NAFDAC certificate by default. NAFDAC has let the
+# *.nafdac.gov.ng certificate lapse before (it expired 2026-11-06), which stops
+# every host from scraping until they renew it. The site is public and
+# read-only and the scraper sends no credentials, so an operator can opt out of
+# verification for that window with NAFDAC_SCRAPER_INSECURE_TLS=1. The scraper
+# logs a warning while it is disabled; unset it once the certificate is renewed.
+VERIFY_TLS = not _env_flag("NAFDAC_SCRAPER_INSECURE_TLS")
 
 # --------------------------------------------------------------------------
 # Reliability

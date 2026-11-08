@@ -930,6 +930,21 @@ VOICE_LOAD_ERRORS: Dict[str, str] = {}
 VOICE_LOAD_SECONDS: Dict[str, float] = {}
 VOICE_LOAD_LOCK = threading.Lock()
 
+# Answer-language telemetry, reported on /health. `checked` counts spoken
+# replies whose language was verified against the language the clip was spoken
+# in; `mismatched` those the detector read as a different language; `repaired`
+# those a second, harder-pinned generation fixed; `unrepaired` those it did not.
+# A rising `unrepaired` is the signal that the model, not the plumbing, needs
+# work for that language.
+VOICE_LANGUAGE_CHECKS: Dict[str, Any] = {
+    "checked": 0,
+    "mismatched": 0,
+    "repaired": 0,
+    "unrepaired": 0,
+    "repair_errors": 0,
+    "by_language": {},
+}
+
 
 def _voice_device() -> str:
     """Where to run ASR.
@@ -1045,8 +1060,9 @@ def transcribe_audio_detailed(audio_bytes: bytes, language: str = "auto") -> Tup
     `/v1/audio/chat` needs the code, not just the text: the spoken language is
     the one the reply has to be written in, and re-detecting it from the
     transcript is a second, weaker guess at something the ASR step already
-    knows. `language` is an en/ha/yo/ig code, or "auto" to try each model in
-    turn and keep the longest result.
+    knows. `language` is an en/ha/yo/ig code, or "auto" to try each model and
+    let the text detector vote for the winner, falling back to the longest
+    transcript when the detector has no opinion.
     """
     if not CONFIG.voice_enabled:
         raise ModelUnavailable("voice transcription is disabled on this server.")
@@ -1061,12 +1077,13 @@ def transcribe_audio_detailed(audio_bytes: bytes, language: str = "auto") -> Tup
         text = _run_voice_pipeline(_load_voice_model(requested), audio_bytes, requested)
         return text, requested
 
-    # Auto: run every model that loads and keep the longest transcript. The
-    # transcriptions are not language-tagged, so transcribing a Yoruba clip with
-    # the English model still returns *something*, and that noise is always
-    # shorter than the correct model's output.
-    best_text = ""
-    best_code = ""
+    # Auto: transcribe with every model that loads, then choose. Length alone is
+    # a proxy and wrong-model noise can occasionally be longer, so the text
+    # detector is asked to vote: a model whose own transcript the detector reads
+    # back as that language wins over a longer one from a different model. Length
+    # is only the fallback, which is the behaviour before this existed, so a
+    # detector with no opinion changes nothing.
+    candidates: List[Tuple[str, str]] = []
     errors: List[str] = []
     for code in ("en", "ha", "yo", "ig"):
         try:
@@ -1074,17 +1091,115 @@ def transcribe_audio_detailed(audio_bytes: bytes, language: str = "auto") -> Tup
         except ModelUnavailable as exc:
             errors.append(f"{code}: {exc.log_detail}")
             continue
-        if len(text) > len(best_text):
-            best_text = text
-            best_code = code
-    if not best_text and errors:
+        if text:
+            candidates.append((code, text))
+    if not candidates:
         raise ModelUnavailable(
             "no speech-to-text model could be loaded",
             log_detail="; ".join(errors)[:400],
         )
-    if best_code:
-        logger.info("voice auto: chose %s (%d chars)", best_code, len(best_text))
+    best_code, best_text, agreed = _choose_voice_candidate(candidates)
+    logger.info(
+        "voice auto: chose %s (detector_agreed=%s, %d chars, %d candidates)",
+        best_code,
+        agreed,
+        len(best_text),
+        len(candidates),
+    )
     return best_text, best_code
+
+
+# detect_language reports these confidences. "low" is the no-real-evidence case
+# and is deliberately absent, so it never wins the vote below.
+_VOICE_CONFIDENCE_RANK = {"high": 3, "explicit": 3, "medium": 2, "pidgin": 2}
+
+
+def _resolve_detector():
+    """detect_language lives in a later cell; resolve it at call time."""
+    return globals().get("detect_language")
+
+
+def _choose_voice_candidate(
+    candidates: List[Tuple[str, str]],
+) -> Tuple[str, str, bool]:
+    """Pick the (code, text) an auto transcription should return.
+
+    Each candidate is the transcript one ASR model produced. The text detector
+    is asked to read each one back: a model whose transcript the detector
+    classifies as that same language, at medium confidence or better, wins over
+    a longer transcript from another model. That is the tie length cannot
+    break, because the wrong model's noise is not always shorter.
+
+    Returns `(code, text, agreed)`. `agreed` is True only when the detector
+    picked the winner, so a caller can log whether the vote fired. Falls back to
+    the single longest transcript when no candidate agrees, which is exactly the
+    behaviour before the vote existed.
+    """
+    detector = _resolve_detector()
+    best: Optional[Tuple[Tuple[int, float, int], str, str]] = None
+    if callable(detector):
+        for code, text in candidates:
+            try:
+                read = detector(text) or {}
+            except Exception as exc:  # noqa: BLE001 - a detector fault must not fail a clip
+                logger.warning(
+                    "voice auto: detector failed on %s transcript: %r", code, exc
+                )
+                continue
+            if read.get("language") != code:
+                continue
+            rank = _VOICE_CONFIDENCE_RANK.get(str(read.get("confidence") or "low"))
+            if not rank:
+                continue
+            # Among models that agree with the detector, the one whose own
+            # transcript carries the most evidence for that language wins; the
+            # raw marker score discriminates where length does not. Length is
+            # the final tie-break.
+            scores = read.get("scores") or {}
+            try:
+                own_score = float(scores.get(code, 0.0))
+            except (TypeError, ValueError):
+                own_score = 0.0
+            key = (rank, own_score, len(text))
+            if best is None or key > best[0]:
+                best = (key, code, text)
+        if best is not None:
+            return best[1], best[2], True
+
+    best_code, best_text = "", ""
+    for code, text in candidates:
+        if len(text) > len(best_text):
+            best_code, best_text = code, text
+    return best_code, best_text, False
+
+
+def _reply_language_mismatch(reply: str, target: str) -> bool:
+    """Whether a reply clearly failed to use `target`, so one repair is justified.
+
+    Deliberately one-sided. When the model mishandles a Nigerian target it
+    answers in its English default, and the detector reports that with
+    confidence, so `ha`/`yo`/`ig` accept a medium-confidence disagreement. The
+    English target is held to a higher bar: the detector carries a deliberate
+    bias toward the Nigerian languages, so only a high-confidence Nigerian
+    reading counts as "this reply is not English". That keeps a correct English
+    reply that happens to use a loanword from being regenerated.
+    """
+    if target not in ("en", "ha", "yo", "ig"):
+        return False
+    detector = _resolve_detector()
+    if not callable(detector):
+        return False
+    try:
+        detected = detector(reply) or {}
+    except Exception:  # noqa: BLE001 - a detector fault must not fail a request
+        return False
+    got = detected.get("language")
+    confidence = detected.get("confidence")
+    if got == target or confidence in (None, "low"):
+        return False
+    if target == "en":
+        return confidence == "high" and got in ("ha", "yo", "ig")
+    return confidence in ("high", "medium")
 
 
 def transcribe_audio(audio_bytes: bytes, language: str = "auto") -> str:
@@ -2083,6 +2198,26 @@ def build_pinned_directive(code: str) -> str:
     return PINNED_DIRECTIVE.format(name=LANGUAGE_NAMES[code], others=others)
 
 
+def build_repair_directive(code: str) -> str:
+    """A second, harder instruction after a reply missed the pinned language.
+
+    `build_pinned_directive` states the choice once; this restates it as a
+    correction, because the first statement was not followed. It does not refer
+    to the earlier reply (the model never sees it) and instead removes the room
+    the model fell back on: every sentence, and the whole reply, must be in the
+    target language, and it must begin in it.
+    """
+    name = LANGUAGE_NAMES[code]
+    others = ", ".join(
+        other_name for other, other_name in LANGUAGE_NAMES.items() if other != code
+    )
+    return (
+        f"[language] CORRECTION. The reply must be written entirely in {name}. "
+        f"Not one sentence may be in {others}. Begin the reply in {name} and "
+        f"keep every sentence in {name}."
+    )
+
+
 def apply_language_directive(
     prompt_messages: List[Dict[str, str]],
     pinned: Optional[str] = None,
@@ -2703,7 +2838,27 @@ class NafdacSearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
 
 
-@app.get("/health")
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    """Liveness probe for the bare hostname.
+
+    The public tunnel (e.g. ai.saynet.ng) is pointed at this server, and an
+    uptime monitor pings the bare URL rather than an explicit path. Without a
+    route here every such probe was a 404, which a monitor reports as "down".
+    Monitors send HEAD as often as GET, and FastAPI's `@app.get` answers GET
+    only — a HEAD to it is a 405, equally a "down" — so both verbs are declared
+    here. Deliberately unauthenticated and does not touch the model: it only
+    says the process is serving.
+    """
+    return {
+        "status": "ok",
+        "service": CONFIG.served_model_name,
+        "health": "/health",
+        "docs": "/docs",
+    }
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     loaded = MODEL is not None
     return {
@@ -2745,6 +2900,13 @@ def health():
             # host with no GPU reports "cpu" here, which is what actually runs.
             "device": _voice_device() if CONFIG.voice_enabled else CONFIG.voice_device,
             "languages": sorted(VOICE_MODELS) if CONFIG.voice_enabled else [],
+            # Whether spoken answers actually came back in the language they
+            # were spoken in. `unrepaired` rising is the tell that the model,
+            # not the plumbing, needs work for a language.
+            "language_checks": {
+                **VOICE_LANGUAGE_CHECKS,
+                "by_language": dict(VOICE_LANGUAGE_CHECKS["by_language"]),
+            },
         },
         "nafdac": (
             NAFDAC_HOOKS["status"]()
@@ -2882,6 +3044,7 @@ def run_chat_turn(
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     repetition_penalty: Optional[float] = None,
+    strict_language: bool = False,
 ) -> GenerationResult:
     """One chat turn: build the prompt, attach verified data, generate.
 
@@ -2889,8 +3052,22 @@ def run_chat_turn(
     drift. Both paths must attach the greenbook block the same way and answer in
     the same language; a second copy of this logic in the voice route is exactly
     how a spoken NAFDAC number would end up unverified while a typed one was.
+
+    `strict_language` is the repair pass: the pin is stated a second time,
+    harder, on the same system message it already landed on. Only the audio
+    route sets it, and only after it has read the first reply and found it in
+    the wrong language.
     """
     prepared = build_prompt_messages(client_messages, language=language)
+
+    if strict_language and language in LANGUAGE_NAMES:
+        prepared = [dict(message) for message in prepared]
+        for message in prepared:
+            if message["role"] == "system":
+                message["content"] = (
+                    f"{message['content']}\n\n{build_repair_directive(language)}"
+                )
+                break
 
     # The greenbook data is attached here, as its own system message, after the
     # prompt is built. It has to come after the language directive so the
@@ -3114,6 +3291,57 @@ async def audio_chat(
         request_id,
         temperature,
     )
+
+    # Verify the reply used the language the clip was spoken in, and repair it
+    # once when it did not. This is the second half of "answer in the user's
+    # language": the clip is transcribed and its language pinned above, but the
+    # model is the part that historically ignored the instruction and answered
+    # in its English default. A single repair pass restates the pin harder. The
+    # first reply is kept if the repair also misses, so a bad repair cannot make
+    # the answer worse than it already was.
+    if reply_language in LANGUAGE_NAMES:
+        VOICE_LANGUAGE_CHECKS["checked"] += 1
+        if _reply_language_mismatch(result.text, reply_language):
+            VOICE_LANGUAGE_CHECKS["mismatched"] += 1
+            # The repair must never cost a reply that already works. The second
+            # prompt is longer (it carries the correction directive), so on a
+            # conversation already at the context ceiling the repair genuinely
+            # cannot run; the first reply is returned in that case rather than
+            # the request failing with a 400.
+            try:
+                repaired = await run_in_threadpool(
+                    run_chat_turn,
+                    client_messages,
+                    reply_language,
+                    max_new_tokens,
+                    request_id,
+                    temperature,
+                    strict_language=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - a repair fault is not a request fault
+                repaired = None
+                VOICE_LANGUAGE_CHECKS["repair_errors"] += 1
+                logger.warning(
+                    "request_id=%s voice language repair could not run: %r",
+                    request_id,
+                    exc,
+                )
+            repaired_ok = repaired is not None and not _reply_language_mismatch(
+                repaired.text, reply_language
+            )
+            if repaired_ok:
+                result = repaired
+                VOICE_LANGUAGE_CHECKS["repaired"] += 1
+                by_language = VOICE_LANGUAGE_CHECKS["by_language"]
+                by_language[reply_language] = by_language.get(reply_language, 0) + 1
+            else:
+                VOICE_LANGUAGE_CHECKS["unrepaired"] += 1
+            logger.warning(
+                "request_id=%s voice reply was not in %s; repair applied=%s",
+                request_id,
+                reply_language,
+                repaired_ok,
+            )
 
     logger.info(
         "request_id=%s audio/chat bytes=%d asr=%s language=%s transcript_chars=%d "

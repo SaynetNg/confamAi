@@ -164,6 +164,20 @@ class GreenbookClient:
         self.page_size = page_size
         self.delay = delay
         self.draw = 0
+        self.verify = config.VERIFY_TLS
+
+        if not self.verify:
+            log.warning(
+                "TLS verification is DISABLED (NAFDAC_SCRAPER_INSECURE_TLS). "
+                "Only use this while the NAFDAC certificate is expired; unset it "
+                "once the certificate is renewed."
+            )
+            try:
+                import urllib3
+
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
 
         self.session = requests.Session()
         self.session.headers.update(config.AJAX_HEADERS)
@@ -188,6 +202,7 @@ class GreenbookClient:
                     params=params,
                     headers=headers,
                     timeout=self.timeout,
+                    verify=self.verify,
                 )
                 if response.status_code in config.RETRY_STATUS_CODES:
                     raise requests.HTTPError(

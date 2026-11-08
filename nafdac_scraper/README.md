@@ -371,6 +371,57 @@ If you don't need Manufacturer Name, Manufacturer Country or Marketing Category,
 `--no-details` gets you the full dataset in about 60 seconds with 19 requests.
 That's a public-sector site — keep `--detail-delay` at 0.4 s or higher.
 
+## Weekly refresh on a server (Render Cron Job)
+
+The scraper and the PostgreSQL loader share one entry point so a scheduler runs
+both in order from the repository root:
+
+```bash
+python weekly_nafdac_refresh.py
+```
+
+It runs `nafdac_scraper/scraper.py` (full crawl, CSV only — no XLSX, because the
+database is the target), then `python -m nafdac_source.load_postgres`, which
+upserts into `nafdac_products` and archives rows that have left the export into
+`nafdac_product_history`. Each step runs as a subprocess, so a scrape failure
+stops the job before it touches the database.
+
+`render-cron.yaml` at the repository root is a Render Blueprint for the weekly
+job (Sundays 03:00 UTC). Import it, or create a Cron Job in the dashboard with:
+
+| Setting | Value |
+|---|---|
+| Start command | `python weekly_nafdac_refresh.py` |
+| Build command | `pip install -r nafdac_scraper/requirements.txt -r nafdac_source/requirements.txt` |
+| Schedule | `0 3 * * 0` |
+| Environment | `NAFDAC_DATABASE_URL` = the hosted PostgreSQL DSN (as a Secret) |
+
+The DSN is never printed; the loader logs only the host and database name.
+
+Useful flags:
+
+| Flag | Effect |
+|---|---|
+| `--skip-scrape` | load the existing CSV without scraping |
+| `--skip-load` | scrape only, do not touch the database |
+| `--no-details` | skip the ~8.9k detail pages (fast; 3 columns stay empty) |
+| `--dry-run-load` | validate the CSV without writing |
+| `--with-xlsx` | also write the Excel workbook |
+| `--limit N` | scrape only the first N products |
+
+### Expired TLS certificate
+
+NAFDAC let the `*.nafdac.gov.ng` certificate expire on **2026-11-06**, which
+fails every scrape until they renew it. Because the site is public, read-only
+and credential-free, the weekly job can be unblocked for that window with:
+
+```bash
+NAFDAC_SCRAPER_INSECURE_TLS=1
+```
+
+The scraper logs a prominent warning while verification is off. Unset it once
+the certificate is renewed — TLS verification is on by default.
+
 ## Known limitations
 
 - **Statuses other than Active/Inactive are unreachable.** The backend filters to

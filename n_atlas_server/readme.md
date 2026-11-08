@@ -385,7 +385,8 @@ print(reply.choices[0].message.content)
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status, voice. |
+| `GET /` · `HEAD /` | none | Liveness for the bare hostname (uptime monitors). Does not touch the model. |
+| `GET /health` · `HEAD /health` | none | Readiness. GPU, quantization, load time, model_loaded, nafdac status, voice. |
 | `GET /v1/models` | bearer | OpenAI-compatible model list. |
 | `POST /v1/chat/completions` | bearer | Chat completion. Full message history. |
 | `POST /v1/audio/transcriptions` | bearer | Transcribe one recorded clip (multipart). |
@@ -417,9 +418,21 @@ curl -X POST https://YOUR-TUNNEL/v1/audio/chat \
 - **Answer shape** — the ordinary OpenAI chat completion (`choices[0].message`),
   with additive `transcript`, `asr` and `language` fields. A client reading only
   the OpenAI shape is unaffected.
-- **Reply language** — follows the clip. The ASR step reports which NCAIR1 model
-  produced the transcript, and that pins the answer, because a spoken Yoruba
-  question deserves a Yoruba answer; an explicit `language` field wins.
+- **Reply language** — follows the clip. With `language=auto` (the default) every
+  ASR model transcribes the note and the **text detector votes**: a model whose
+  own transcript `detect_language` reads back as that same language, at medium
+  confidence or better, wins over a longer transcript from another model;
+  longest-wins is only the fallback when nobody agrees. The winning code pins the
+  answer, because a spoken Yoruba question deserves a Yoruba answer. An explicit
+  `language` field wins over both.
+- **Repair pass** — the reply is then verified against the pinned language with
+  `detect_language`, and if the model answered in the wrong one it is regenerated
+  **once** with a harder correction directive (`strict_language=True` on
+  `run_chat_turn`). The first reply is kept if the repair also misses or cannot
+  run (e.g. the context budget), so a repair never makes an answer worse. Counts
+  are on `/health` under `voice.language_checks` (`checked`, `mismatched`,
+  `repaired`, `unrepaired`, `repair_errors`, `by_language`); a rising
+  `unrepaired` means the model, not the plumbing, needs work for that language.
 - **Verified data** — the same `_nafdac_enrich` block is attached as for
   `/v1/chat/completions` (both go through `run_chat_turn`), so a spoken NAFDAC
   number is verified exactly as a typed one. A client-supplied system turn in

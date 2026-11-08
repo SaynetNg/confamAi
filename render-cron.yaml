@@ -1,0 +1,41 @@
+# Render Blueprint for the weekly NAFDAC Greenbook refresh (cron job).
+#
+# This is separate from the bot's `render.yaml` (which documents the web
+# service). Create the cron job one of two ways:
+#
+#   Blueprint:  Render dashboard -> New -> Blueprint -> point it at this repo
+#               and set the Blueprint path to `render-cron.yaml`.
+#   Dashboard:  New -> Cron Job, then copy the values below.
+#
+# It runs once a week: `0 3 * * 0` is Sunday 03:00 UTC (04:00 WAT). The job
+# scrapes the live greenbook, writes nafdac_scraper/nafdac_greenbook.csv, then
+# upserts it into the PostgreSQL database behind nafdac_source.
+#
+# The scheduler must never see the connection string in a log: it is provided
+# only as an environment variable, and the loader prints host + database name
+# alone.
+
+services:
+  - type: cron
+    name: nafdac-weekly-refresh
+    runtime: python
+    schedule: "0 3 * * 0"
+    # The repo root holds both packages, so build from there and install the
+    # scraper's and the loader's dependencies. The bot's requirements.txt is
+    # not needed (no FastAPI here).
+    buildCommand: pip install -r nafdac_scraper/requirements.txt -r nafdac_source/requirements.txt
+    startCommand: python weekly_nafdac_refresh.py
+    # Render's default region is fine; the job only talks outbound to NAFDAC and
+    # to the hosted PostgreSQL.
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # Set the real value in the Render dashboard (Secret). `sync: false` keeps
+      # it out of the blueprint file.
+      - key: NAFDAC_DATABASE_URL
+        sync: false
+      # NAFDAC's certificate was expired on 2026-11-06. While it is expired,
+      # uncomment the next two lines to let the scrape run; REMOVE them once
+      # NAFDAC renews the certificate. See nafdac_scraper/README.md.
+      # - key: NAFDAC_SCRAPER_INSECURE_TLS
+      #   value: "1"
