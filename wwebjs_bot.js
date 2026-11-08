@@ -1,18 +1,27 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const axios = require('axios');
+const http = require('http');
 const fs = require('fs');
-const path = require('path');
 
 const NATLAS_URL = process.env.N_ATLAS_BASE_URL || 'https://ai.saynet.ng/v1/chat/completions';
 const NATLAS_API_KEY = process.env.N_ATLAS_API_KEY || 'KgRRl_6vEp7YRCY6agQ9HjH0RFk6T6hr9KYQq7YTRfRrKeWQIyFs_biogXFvK_Lo';
 const NATLAS_MODEL = process.env.N_ATLAS_MODEL || 'n-atlas';
+const HTTP_PORT = 3000;
 
 console.log('====================================================');
 console.log(' Confam AI - WhatsApp Bot (Direct N-ATLaS Engine)');
 console.log(' N-ATLaS Endpoint:', NATLAS_URL);
 console.log(' Model:', NATLAS_MODEL);
+console.log(' Web Dashboard:', `http://localhost:${HTTP_PORT}`);
 console.log('====================================================\n');
+
+// State tracking for the web UI
+let botState = {
+    status: 'initializing', // 'initializing' | 'qr' | 'authenticated' | 'ready'
+    qr: null,
+    phone: '2349060970339'
+};
 
 // In-memory conversation session store (phone -> { messages, lastActive })
 const sessions = new Map();
@@ -29,7 +38,6 @@ function getSession(phone) {
     return session;
 }
 
-// Strip token artifacts that might leak from raw LLM outputs
 function cleanAiResponse(text) {
     if (!text) return '';
     return text
@@ -41,6 +49,198 @@ function cleanAiResponse(text) {
         .trim();
 }
 
+// ----------------------------------------------------
+// Live HTTP Web Dashboard for pairing & monitoring
+// ----------------------------------------------------
+const server = http.createServer((req, res) => {
+    if (req.url === '/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify(botState));
+        return;
+    }
+
+    // Serve HTML dashboard
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Confam AI - WhatsApp Link</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f0f2f5;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #ffffff;
+      border-radius: 16px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+      max-width: 440px;
+      width: 100%;
+      padding: 36px 28px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .badge.scanning { background: #e8f5e9; color: #1b5e20; }
+    .badge.connected { background: #dcf8c6; color: #075e54; }
+    .badge.init { background: #e0f2fe; color: #0369a1; }
+    h1 {
+      font-size: 24px;
+      color: #111b21;
+      margin: 0 0 8px;
+    }
+    p {
+      color: #667781;
+      font-size: 14px;
+      line-height: 1.5;
+      margin: 0 0 24px;
+    }
+    #qrcode {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 256px;
+      margin: 16px 0;
+    }
+    .success-box {
+      display: none;
+      padding: 24px 16px;
+    }
+    .success-icon {
+      font-size: 64px;
+      margin-bottom: 12px;
+    }
+    .instructions {
+      text-align: left;
+      background: #f8fafc;
+      border-radius: 10px;
+      padding: 14px 18px;
+      font-size: 13px;
+      color: #334155;
+      margin-top: 20px;
+    }
+    .instructions ol {
+      margin: 6px 0 0 18px;
+      padding: 0;
+    }
+    .instructions li {
+      margin-bottom: 4px;
+    }
+    .pulse-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      margin-right: 6px;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 0.4; }
+      50% { opacity: 1; }
+      100% { opacity: 0.4; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="badge-container">
+      <span class="badge init" id="status-badge"><span class="pulse-dot"></span>Connecting...</span>
+    </div>
+    
+    <div id="qr-section">
+      <h1>Link Confam AI</h1>
+      <p>Scan with WhatsApp on <strong>+234 906 097 0339</strong> to activate the bot.</p>
+      
+      <div id="qrcode">Loading fresh QR code...</div>
+      
+      <div class="instructions">
+        <strong>How to link:</strong>
+        <ol>
+          <li>Open WhatsApp on your phone</li>
+          <li>Tap <strong>Settings</strong> (or <strong>⋮</strong>) &rarr; <strong>Linked devices</strong></li>
+          <li>Tap <strong>Link a device</strong></li>
+          <li>Point your phone at this screen</li>
+        </ol>
+      </div>
+    </div>
+
+    <div id="success-section" class="success-box">
+      <div class="success-icon">🎉</div>
+      <h1 style="color: #075e54;">WhatsApp Connected!</h1>
+      <p>Confam AI is actively online. Send any product name or NAFDAC number to <strong>+234 906 097 0339</strong> to verify it.</p>
+    </div>
+  </div>
+
+  <script>
+    let currentQr = null;
+    let qrRenderer = null;
+
+    async function poll() {
+      try {
+        const res = await fetch('/status');
+        const data = await res.json();
+        
+        const badge = document.getElementById('status-badge');
+        const qrSec = document.getElementById('qr-section');
+        const succSec = document.getElementById('success-section');
+
+        if (data.status === 'ready' || data.status === 'authenticated') {
+          badge.className = 'badge connected';
+          badge.innerHTML = '● Online & Active';
+          qrSec.style.display = 'none';
+          succSec.style.display = 'block';
+        } else if (data.status === 'qr' && data.qr) {
+          badge.className = 'badge scanning';
+          badge.innerHTML = '<span class="pulse-dot"></span>Live QR (Auto-refreshing)';
+          qrSec.style.display = 'block';
+          succSec.style.display = 'none';
+
+          if (data.qr !== currentQr) {
+            currentQr = data.qr;
+            const container = document.getElementById('qrcode');
+            container.innerHTML = '';
+            new QRCode(container, {
+              text: currentQr,
+              width: 256,
+              height: 256,
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+        }
+      } catch (e) {}
+    }
+
+    setInterval(poll, 1500);
+    poll();
+  </script>
+</body>
+</html>`);
+});
+
+server.listen(HTTP_PORT, () => {
+    console.log(`[DASHBOARD] Live pairing dashboard available at http://localhost:${HTTP_PORT}`);
+});
+
+// ----------------------------------------------------
+// WhatsApp Client setup
+// ----------------------------------------------------
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
     puppeteer: {
@@ -59,58 +259,36 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => {
-    console.log('\n[QR CODE] WhatsApp needs pairing. Scan this QR code:\n');
+    console.log('\n[QR CODE] New live QR generated. Scan from terminal or http://localhost:' + HTTP_PORT + ':\n');
     qrcode.generate(qr, { small: true });
 
+    botState.status = 'qr';
+    botState.qr = qr;
+
     try {
-        const html = `<!DOCTYPE html>
-<html>
-<head>
-  <title>Confam AI - WhatsApp QR Code</title>
-  <meta charset="utf-8">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-  <style>
-    body { font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; margin: 0; }
-    .card { background: #fff; padding: 32px; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.1); text-align: center; }
-    h2 { color: #075e54; margin: 0 0 16px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Confam AI WhatsApp Link</h2>
-    <p>Scan to link: <strong>+234 906 097 0339</strong></p>
-    <div id="qrcode" style="display:flex;justify-content:center;margin:20px 0;"></div>
-    <p style="color:#666;font-size:14px;">WhatsApp -> Linked Devices -> Link a Device</p>
-  </div>
-  <script>
-    new QRCode(document.getElementById("qrcode"), {
-      text: ${JSON.stringify(qr)},
-      width: 256,
-      height: 256
-    });
-  </script>
-</body>
-</html>`;
-        fs.writeFileSync('C:\\Users\\USER\\Desktop\\whatsapp_qr.html', html, 'utf8');
+        // Also keep desktop file updated as a static fallback
+        fs.writeFileSync('C:\\Users\\USER\\Desktop\\whatsapp_qr.html', `<meta http-equiv="refresh" content="0; url=http://localhost:${HTTP_PORT}">`, 'utf8');
     } catch (e) {}
 });
 
 client.on('authenticated', () => {
     console.log('[STATUS] WhatsApp authenticated successfully!');
+    botState.status = 'authenticated';
 });
 
 client.on('auth_failure', (msg) => {
     console.error('[STATUS] WhatsApp authentication failure:', msg);
+    botState.status = 'auth_failure';
 });
 
 client.on('ready', () => {
     console.log('\n========================================================');
     console.log(' >>> CONFAM AI BOT IS ONLINE AND ACTIVELY RESPONDING <<<');
     console.log('========================================================\n');
+    botState.status = 'ready';
 });
 
 client.on('message', async (msg) => {
-    // Ignore group chats, status broadcasts, and messages from bot itself
     if (msg.from.includes('@g.us') || msg.from === 'status@broadcast' || msg.fromMe) {
         return;
     }
@@ -120,7 +298,6 @@ client.on('message', async (msg) => {
 
     console.log(`[INCOMING] From +${sender}: "${userText || '[' + msg.type + ']'}"`);
 
-    // Handle voice notes / media gracefully
     if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio')) {
         await msg.reply("I received your voice note! For the fastest and most accurate NAFDAC verification, please type the product name or NAFDAC registration number (e.g. 04-1234 or A4-5678).");
         return;
@@ -133,7 +310,6 @@ client.on('message', async (msg) => {
     const session = getSession(sender);
     session.messages.push({ role: 'user', content: userText });
 
-    // Keep session context window bounded to last 8 messages (4 turns)
     if (session.messages.length > 8) {
         session.messages = session.messages.slice(-8);
     }
@@ -170,7 +346,6 @@ client.on('message', async (msg) => {
             aiReply = "I could not process that request. Please send a product name or NAFDAC number to verify.";
         }
 
-        // Save AI response in session history
         session.messages.push({ role: 'assistant', content: aiReply });
 
         console.log(`[OUTGOING] To +${sender}: "${aiReply.substring(0, 80)}..."`);
