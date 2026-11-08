@@ -11,7 +11,7 @@ const NATLAS_MODEL = process.env.N_ATLAS_MODEL || 'n-atlas';
 const HTTP_PORT = 3000;
 
 console.log('====================================================');
-console.log(' Confam AI - WhatsApp Bot (Voice + Text N-ATLaS)');
+console.log(' Confam AI - WhatsApp Bot (Voice + Text + Realtime Typing)');
 console.log(' Text Endpoint: ', NATLAS_URL);
 console.log(' Voice Endpoint:', NATLAS_VOICE_URL);
 console.log(' Model:         ', NATLAS_MODEL);
@@ -25,7 +25,7 @@ let botState = {
     phone: '2349060970339'
 };
 
-// In-memory conversation session store (phone -> { messages, lastActive })
+// In-memory conversation session store (phone -> { messages, lastActive, preferredLang })
 const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -33,11 +33,40 @@ function getSession(phone) {
     const now = Date.now();
     let session = sessions.get(phone);
     if (!session || (now - session.lastActive > SESSION_TTL_MS)) {
-        session = { messages: [], lastActive: now };
+        session = { messages: [], lastActive: now, preferredLang: 'en' };
         sessions.set(phone, session);
     }
     session.lastActive = now;
     return session;
+}
+
+// Intelligent language detection defaulting to English ('en')
+function detectMessageLanguage(text, currentLang = 'en') {
+    if (!text) return currentLang;
+    const lower = text.toLowerCase().trim();
+
+    // Explicit requests for English
+    if (/in english|speak english|english please|reply in english|switch to english/i.test(lower)) {
+        return 'en';
+    }
+
+    // Hausa detection (common greetings / vocabulary)
+    if (/\b(sannu|ina kwana|yaya kake|yaya dai|barka|lafiya|nagode|don allah|yau|wannan|ba ni da|turanci|hausa)\b/i.test(lower)) {
+        return 'ha';
+    }
+
+    // Yoruba detection
+    if (/\b(bawo|e kaaro|e ku|eku|kilo nsele|nje|o ti|bẹẹni|jọwọ|yoruba)\b/i.test(lower)) {
+        return 'yo';
+    }
+
+    // Igbo detection
+    if (/\b(kedu|ndewo|daalu|kedụ|ị nọ|biko|igbo)\b/i.test(lower)) {
+        return 'ig';
+    }
+
+    // Default to English whenever English words or standard NAFDAC queries appear
+    return 'en';
 }
 
 function cleanAiResponse(text) {
@@ -303,27 +332,50 @@ client.on('message', async (msg) => {
     const session = getSession(sender);
 
     // ----------------------------------------------------
-    // VOICE NOTE PROCESSING (Same as Browser /v1/audio/chat)
+    // REAL-TIME TYPING / RECORDING INDICATOR
+    // ----------------------------------------------------
+    let chat = null;
+    try {
+        chat = await msg.getChat();
+        if (isVoice) {
+            await chat.sendStateRecording();
+        } else {
+            await chat.sendStateTyping();
+        }
+    } catch (e) {
+        // Non-critical if chat state simulation encounters an error
+    }
+
+    // Helper to clear typing status
+    const clearTyping = async () => {
+        try {
+            if (chat) await chat.clearState();
+        } catch (e) {}
+    };
+
+    // ----------------------------------------------------
+    // VOICE NOTE PROCESSING
     // ----------------------------------------------------
     if (isVoice) {
         console.log(`[VOICE NOTE] Receiving voice note from ${sender}...`);
         try {
-            // Give WhatsApp Web 800ms to resolve media stage before first download attempt
-            await new Promise(res => setTimeout(res, 800));
+            // Buffer delay allowing WhatsApp Web to cache the audio blob
+            await new Promise(res => setTimeout(res, 1200));
 
             let media = null;
-            for (let attempt = 1; attempt <= 3; attempt++) {
+            for (let attempt = 1; attempt <= 4; attempt++) {
                 try {
                     media = await msg.downloadMedia();
                     if (media && media.data) break;
                 } catch (dmErr) {
-                    console.warn(`[VOICE NOTE] Attempt ${attempt} failed: ${dmErr ? (dmErr.message || dmErr.toString()) : 'unknown'}`);
-                    if (attempt < 3) await new Promise(res => setTimeout(res, 1200));
+                    console.warn(`[VOICE NOTE] Attempt ${attempt} failed: ${dmErr?.message || dmErr}`);
                 }
+                if (attempt < 4) await new Promise(res => setTimeout(res, 1200));
             }
 
             if (!media || !media.data) {
                 console.error('[VOICE NOTE] Empty or failed media download after retries');
+                await clearTyping();
                 await msg.reply("I couldn't load your voice note. Please speak clearly, or send the product name or NAFDAC number as text.");
                 return;
             }
@@ -380,23 +432,23 @@ client.on('message', async (msg) => {
                 aiReply = "I heard your voice note, but could not find a product match. Please mention the specific product name or NAFDAC registration number.";
             }
 
-            // Save conversation turn
             session.messages.push({ role: 'user', content: transcript || '[Voice Note]' });
             session.messages.push({ role: 'assistant', content: aiReply });
             if (session.messages.length > 8) session.messages = session.messages.slice(-8);
 
-            // Send reply with transcript quote
             let finalReply = aiReply;
             if (transcript) {
                 finalReply = `🎤 _"${transcript}"_\n\n${aiReply}`;
             }
 
             console.log(`[OUTGOING VOICE REPLY] To ${sender}: "${aiReply.substring(0, 80)}..."`);
+            await clearTyping();
             await msg.reply(finalReply);
             return;
 
         } catch (err) {
             console.error('[VOICE ERROR] Failed to process voice note:', err.message);
+            await clearTyping();
             await msg.reply("I had trouble transcribing that voice note. Please speak clearly, or send the product name or NAFDAC number as text.");
             return;
         }
@@ -406,6 +458,7 @@ client.on('message', async (msg) => {
     // IMAGE PROCESSING GUIDANCE
     // ----------------------------------------------------
     if (isImage) {
+        await clearTyping();
         await msg.reply("I received your product photo! To verify it against the NAFDAC database, please also type the product name or the NAFDAC registration number (e.g. 04-1234 or A4-5678) visible on the pack.");
         return;
     }
@@ -414,7 +467,17 @@ client.on('message', async (msg) => {
     // TEXT MESSAGE PROCESSING
     // ----------------------------------------------------
     if (!userText) {
+        await clearTyping();
         return;
+    }
+
+    // Detect language and update preference
+    const targetLang = detectMessageLanguage(userText, session.preferredLang);
+    session.preferredLang = targetLang;
+
+    // If user specifically requested English ("In English"), clear any previous Hausa turns that might bias the LLM
+    if (targetLang === 'en' && /in english|speak english|english please/i.test(userText)) {
+        session.messages = [];
     }
 
     session.messages.push({ role: 'user', content: userText });
@@ -423,11 +486,13 @@ client.on('message', async (msg) => {
     }
 
     try {
+        console.log(`[AI CALL] Querying N-ATLaS (lang=${targetLang})...`);
         const response = await axios.post(
             NATLAS_URL,
             {
                 model: NATLAS_MODEL,
                 messages: session.messages,
+                language: targetLang, // Explicitly pin language (en, ha, yo, ig)
                 max_tokens: 512,
                 temperature: 0.2,
                 stream: false
@@ -456,11 +521,13 @@ client.on('message', async (msg) => {
 
         session.messages.push({ role: 'assistant', content: aiReply });
 
-        console.log(`[OUTGOING] To ${sender}: "${aiReply.substring(0, 80)}..."`);
+        console.log(`[OUTGOING] To ${sender} (${targetLang}): "${aiReply.substring(0, 80)}..."`);
+        await clearTyping();
         await msg.reply(aiReply);
 
     } catch (err) {
         console.error(`[ERROR] AI call failed for ${sender}:`, err.response?.data || err.message);
+        await clearTyping();
         await msg.reply("Confam AI is currently experiencing high verification traffic. Please send the product name or NAFDAC number again in a moment.");
     }
 });
