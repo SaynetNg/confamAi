@@ -49,6 +49,23 @@ HERE = Path(__file__).resolve().parent          # nafdac_scraper/
 REPO_ROOT = HERE.parent                          # repository root
 RUNNER = HERE / "weekly_nafdac_refresh.py"
 
+
+def _load_dotenv() -> None:
+    """Read `.env` files so a local run sees nafdac_scraper/.env.
+
+    The host's real environment variables always win. python-dotenv is optional;
+    without it this is a no-op. Loaded once at import, before any env is read.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(HERE / ".env", override=False)
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
+
+_load_dotenv()
+
 log = logging.getLogger("nafdac.refresh")
 logging.basicConfig(
     level=logging.INFO,

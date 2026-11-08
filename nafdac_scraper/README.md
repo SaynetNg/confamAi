@@ -389,6 +389,11 @@ database.
 uvicorn nafdac_refresh_service:app --app-dir nafdac_scraper --host 0.0.0.0 --port 8000
 ```
 
+For a local run, copy `.env.example` in this folder to `.env` and fill in
+`NAFDAC_DATABASE_URL` and `NAFDAC_REFRESH_API_KEY` (see `nafdac_scraper/.env.example`
+for every key). Both the service and the runner read `nafdac_scraper/.env`; real
+environment variables always win.
+
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz` | Render health check |
@@ -408,8 +413,9 @@ Render web service settings (also in `nafdac_scraper/render-nafdac-refresh.yaml`
 | Environment | `NAFDAC_DATABASE_URL` (Secret), `NAFDAC_REFRESH_API_KEY` (Secret) |
 
 Weekly slot is configured by `NAFDAC_REFRESH_DOW` / `_HOUR` / `_MINUTE` /
-`_TIMEZONE`; defaults are Sunday 03:00 UTC. The DSN is never printed — the
-loader logs only the host and database name.
+`_TIMEZONE`; the defaults run every **Sunday at 00:00 WAT (midnight Nigeria
+time)**. The DSN is never printed — the loader logs only the host and database
+name.
 
 The standalone runner can also be used directly, which is what the service
 calls:

@@ -39,6 +39,25 @@ REPO_ROOT = HERE.parent                          # repository root
 SCRAPER_DIR = HERE
 
 
+def _load_dotenv() -> None:
+    """Read `.env` files into the environment, without overriding real vars.
+
+    Loads this folder's `.env` and the repository root's, so a local run picks
+    up NAFDAC_DATABASE_URL from nafdac_scraper/.env. Values set in the shell or
+    by the host always win. python-dotenv is optional; without it this is a
+    no-op and only real environment variables are used.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(HERE / ".env", override=False)
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
+
+_load_dotenv()
+
+
 def _step(label: str, command: list, cwd: Path) -> int:
     """Run one step, streaming its output. Returns the process exit code."""
     line = "=" * 74

@@ -5564,23 +5564,72 @@ TUNNEL_TOKEN = _resolve_secret(
 
 TUNNEL_TARGET = f"http://127.0.0.1:{CONFIG.port}"
 
-subprocess.run(
-    ["wget", "-q", CLOUDFLARED_DEB_URL, "-O", str(CLOUDFLARED_DEB)],
-    check=True,
-)
-_dpkg = subprocess.run(
-    ["dpkg", "-i", str(CLOUDFLARED_DEB)],
-    capture_output=True,
-    text=True,
-)
-if _dpkg.returncode != 0:
-    # dpkg refuses to install when a dependency is missing. The standalone
-    # binary has none, so fall back to it rather than dying on a warning.
-    print(f"[tunnel] dpkg -i failed, falling back to the standalone binary: {_dpkg.stderr.strip()}")
-    subprocess.run(
-        ["wget", "-q", CLOUDFLARED_RAW_URL, "-O", str(CLOUDFLARED_FALLBACK)],
-        check=True,
+def _download(url: str, dest: Path, attempts: int = 3) -> bool:
+    """Fetch `url` to `dest` with retries, trying curl then wget then urllib.
+
+    A one-shot wget kills the whole tunnel cell on a transient network blip
+    (wget exit 4 is a network failure) — which is what happens when the Kaggle
+    Internet toggle is off or GitHub is briefly unreachable. `curl -fL` and
+    `wget --tries` both retry, and urllib is the last resort, so a missing tool
+    or a flaky first attempt is not fatal. Returns True only once a non-empty
+    file has landed at `dest`.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    commands = [
+        [
+            "curl", "-fL", "--retry", "3", "--retry-delay", "2",
+            "--connect-timeout", "20", "-o", str(dest), url,
+        ],
+        [
+            "wget", "--tries=3", "--waitretry=2", "--timeout=30",
+            "-O", str(dest), url,
+        ],
+    ]
+    for command in commands:
+        try:
+            for _ in range(attempts):
+                result = subprocess.run(command, capture_output=True, text=True)
+                if result.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+                    return True
+        except FileNotFoundError:
+            continue
+    try:
+        import urllib.request
+
+        urllib.request.urlretrieve(url, dest)
+        return dest.exists() and dest.stat().st_size > 0
+    except Exception as exc:  # noqa: BLE001 - the caller reports it
+        print(f"[tunnel] download failed for {url}: {type(exc).__name__}: {exc}")
+        return False
+
+
+# The .deb first (it wires up /usr/bin/cloudflared); the standalone binary needs
+# no install at all, so it is the fallback for both a failed download and a
+# failed dpkg.
+cloudflared_installed = False
+if _download(CLOUDFLARED_DEB_URL, CLOUDFLARED_DEB):
+    _dpkg = subprocess.run(
+        ["dpkg", "-i", str(CLOUDFLARED_DEB)],
+        capture_output=True,
+        text=True,
     )
+    cloudflared_installed = _dpkg.returncode == 0
+    if not cloudflared_installed:
+        # dpkg refuses to install when a dependency is missing. The standalone
+        # binary has none, so fall back to it rather than dying on a warning.
+        print(
+            "[tunnel] dpkg -i failed, falling back to the standalone binary: "
+            f"{_dpkg.stderr.strip()}"
+        )
+else:
+    print("[tunnel] the .deb could not be downloaded; trying the standalone binary")
+
+if not cloudflared_installed:
+    if not _download(CLOUDFLARED_RAW_URL, CLOUDFLARED_FALLBACK):
+        raise RuntimeError(
+            "Could not download cloudflared. Check that Internet is enabled for "
+            "this Kaggle notebook (Settings -> Internet: On), then re-run Cell 19."
+        )
     os.chmod(CLOUDFLARED_FALLBACK, 0o755)
 
 CLOUDFLARED_BINARY = Path("/usr/bin/cloudflared")

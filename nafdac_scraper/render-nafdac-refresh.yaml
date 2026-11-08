@@ -39,15 +39,15 @@ services:
       - key: NAFDAC_REFRESH_API_KEY
         sync: false
 
-      # Weekly slot: Sunday 03:00 UTC (04:00 WAT).
+      # Weekly slot: Sunday 00:00 WAT — midnight Nigeria time.
       - key: NAFDAC_REFRESH_DOW
         value: "sun"
       - key: NAFDAC_REFRESH_HOUR
-        value: "3"
+        value: "0"
       - key: NAFDAC_REFRESH_MINUTE
         value: "0"
       - key: NAFDAC_REFRESH_TIMEZONE
-        value: "UTC"
+        value: "Africa/Lagos"
 
       # NAFDAC's certificate expired 2026-11-06. While it is expired, uncomment
       # the next two lines to let the scrape run; REMOVE them once NAFDAC renews
