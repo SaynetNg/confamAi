@@ -8,7 +8,7 @@ const NATLAS_URL = process.env.N_ATLAS_BASE_URL || 'https://ai.saynet.ng/v1/chat
 const NATLAS_VOICE_URL = process.env.N_ATLAS_VOICE_URL || 'https://ai.saynet.ng/v1/audio/chat';
 const NATLAS_API_KEY = process.env.N_ATLAS_API_KEY || 'KgRRl_6vEp7YRCY6agQ9HjH0RFk6T6hr9KYQq7YTRfRrKeWQIyFs_biogXFvK_Lo';
 const NATLAS_MODEL = process.env.N_ATLAS_MODEL || 'n-atlas';
-const HTTP_PORT = 3000;
+const HTTP_PORT = process.env.PORT || 3000;
 
 console.log('====================================================');
 console.log(' Confam AI - WhatsApp Bot (High-Availability Engine)');
@@ -290,9 +290,10 @@ function initClient() {
     const chromePath = process.env.PUPPETEER_EXECUTABLE_PATH || (
         isWindows
             ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-            : (fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome'
+            : (fs.existsSync('/usr/bin/google-chrome-stable') ? '/usr/bin/google-chrome-stable'
+               : (fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome'
                : (fs.existsSync('/usr/bin/chromium-browser') ? '/usr/bin/chromium-browser'
-               : (fs.existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined)))
+               : (fs.existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined))))
     );
 
     const puppeteerConfig = {
